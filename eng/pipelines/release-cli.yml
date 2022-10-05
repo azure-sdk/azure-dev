@@ -579,32 +579,74 @@ stages:
         )
       )
     jobs:
-      - deployment: Publish_Release
+      - deployment: Increment_Version
+        condition: >-
+          and(
+            succeeded(),
+            ne('true', variables['Skip.IncrementVersion'])
+          )
         environment: azure-dev
 
         pool:
           name: azsdk-pool-mms-ubuntu-2004-general
           OSVmImage: MMSUbuntu20.04
 
+        # TODO: Should this have a dependsOn and only increment on successful
+        # tag and release?
+
         strategy:
           runOnce:
             deploy:
               steps:
                 - checkout: self
+
                 - task: PowerShell@2
                   inputs:
                     pwsh: true
                     targetType: filePath
-                    filePath: eng/scripts/Set-CliVersionVariable.ps1
-                  displayName: Set CLI_VERSION
+                    filePath: eng/scripts/Update-CliVersion.ps1
+                  displayName: Increment CLI version
 
-                - template: /eng/pipelines/templates/steps/publish-cli.yml
+                - template: /eng/common/pipelines/templates/steps/create-pull-request.yml
                   parameters:
-                    CreateGitHubRelease: true
-                    PublishUploadLocations: release/$(CLI_VERSION);release/latest
-                    PublishShield: true
-                    DockerImageTags: $(CLI_VERSION);latest
-                    ReleaseSyndicatedDockerContainer: true
+                    PRBranchName: cli-version-increment-$(Build.BuildId)
+                    CommitMsg: Increment CLI version after release
+                    PRTitle: Increment CLI version after release
+                    # TODO: Remove before merge
+                    OpenAsDraft: true
+
+      # TODO: Re-enable before merge
+      # - deployment: Publish_Release
+      #   condition: >-
+      #     and(
+      #       succeeded(),
+      #       ne('true', variables['Skip.Publish'])
+      #     )
+      #   environment: azure-dev
+
+      #   pool:
+      #     name: azsdk-pool-mms-ubuntu-2004-general
+      #     OSVmImage: MMSUbuntu20.04
+
+      #   strategy:
+      #     runOnce:
+      #       deploy:
+      #         steps:
+      #           - checkout: self
+      #           - task: PowerShell@2
+      #             inputs:
+      #               pwsh: true
+      #               targetType: filePath
+      #               filePath: eng/scripts/Set-CliVersionVariable.ps1
+      #             displayName: Set CLI_VERSION
+
+      #           - template: /eng/pipelines/templates/steps/publish-cli.yml
+      #             parameters:
+      #               CreateGitHubRelease: true
+      #               PublishUploadLocations: release/$(CLI_VERSION);release/latest
+      #               PublishShield: true
+      #               DockerImageTags: $(CLI_VERSION);latest
+      #               ReleaseSyndicatedDockerContainer: true
 
   - stage: PublishIntegration
     dependsOn: Sign
