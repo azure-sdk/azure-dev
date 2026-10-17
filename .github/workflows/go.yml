@@ -26,6 +26,8 @@ jobs:
 
     - name: Build azd binary
       run: go build -o cli/azd/azd ./cli/azd
+      run: go build -v -o azd
+      working-directory: cli/azd
 
     - name: Test
       run: go test -v ./...
