@@ -257,7 +257,10 @@ func ensureEnvironmentInitialized(ctx context.Context, envSpec environmentSpec, 
 func getSubscriptionOptions(ctx context.Context) ([]string, string, error) {
 	azCli := azcli.GetAzCli(ctx)
 	subscriptionInfos, err := azCli.ListAccounts(ctx)
-	if err != nil {
+	if errors.Is(err, azcli.ErrAzCliNotLoggedIn) {
+		// If not logged in, fall back to manual entry only.
+		return []string{manualSubscriptionEntryOption}, "", nil
+	} else if err != nil {
 		return nil, "", fmt.Errorf("listing accounts: %w", err)
 	}
 
