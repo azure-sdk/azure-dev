@@ -2,13 +2,12 @@
 // Licensed under the MIT License.
 
 //go:build windows
-// +build windows
 
 package exec
 
 import (
 	"fmt"
-	"os"
+	"log"
 	"os/exec"
 	"syscall"
 	"unsafe"
@@ -23,11 +22,6 @@ type CmdTree struct {
 	CmdTreeOptions
 	*exec.Cmd
 	jobObject windows.Handle
-}
-
-type winProcess struct {
-	_    uint32 //pid
-	hndl windows.Handle
 }
 
 func (o *CmdTree) Start() error {
@@ -55,16 +49,28 @@ func (o *CmdTree) Start() error {
 	_, err = windows.SetInformationJobObject(
 		handle,
 		windows.JobObjectExtendedLimitInformation,
+		// #nosec G103
 		uintptr(unsafe.Pointer(&info)),
+		// #nosec G103
 		uint32(unsafe.Sizeof(info)))
 
 	if err != nil {
 		return fmt.Errorf("failed to set job object info: %w", err)
 	}
 
-	err = windows.AssignProcessToJobObject(
-		o.jobObject,
-		(*winProcess)(unsafe.Pointer(o.Process)).hndl)
+	//nolint:gosec // G115: integer overflow conversion int -> uint32
+	process, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(o.Process.Pid))
+	if err != nil {
+		return fmt.Errorf("failed to open process: %w", err)
+	}
+	defer func() {
+		err := windows.CloseHandle(process)
+		if err != nil {
+			log.Printf("failed to close process handle: %s\n", err)
+		}
+	}()
+
+	err = windows.AssignProcessToJobObject(o.jobObject, process)
 
 	if err != nil {
 		return fmt.Errorf("failed to assign process to job object: %w", err)
@@ -74,8 +80,8 @@ func (o *CmdTree) Start() error {
 }
 
 func (o *CmdTree) Kill() {
-	err := windows.TerminateJobObject(windows.Handle(o.jobObject), 0)
+	err := windows.TerminateJobObject(o.jobObject, 0)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to terminate job object %d: %s\n", o.jobObject, err)
+		log.Printf("failed to terminate job object %d: %s\n", o.jobObject, err)
 	}
 }

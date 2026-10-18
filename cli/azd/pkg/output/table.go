@@ -40,7 +40,7 @@ func (f *TableFormatter) Kind() Format {
 	return TableFormat
 }
 
-func (f *TableFormatter) Format(obj interface{}, writer io.Writer, opts interface{}) error {
+func (f *TableFormatter) Format(obj any, writer io.Writer, opts any) error {
 	options, ok := opts.(TableFormatterOptions)
 	if !ok {
 		return errors.New("invalid formatter options, TableFormatterOptions expected")
@@ -119,14 +119,14 @@ func (f *TableFormatter) Format(obj interface{}, writer io.Writer, opts interfac
 	return nil
 }
 
-func convertToSlice(obj interface{}) ([]interface{}, error) {
+func convertToSlice(obj any) ([]any, error) {
 	// We use reflection here because we're building a table and thus need to handle both scalars (structs)
 	// and slices/arrays of structs.
-	var vv []interface{}
+	var vv []any
 	v := reflect.ValueOf(obj)
 
 	// Follow pointers at the top level
-	for v.Kind() == reflect.Ptr {
+	for v.Kind() == reflect.Pointer {
 		if v.IsNil() {
 			return nil, fmt.Errorf("value is nil")
 		}
@@ -147,6 +147,24 @@ func convertToSlice(obj interface{}) ([]interface{}, error) {
 	}
 
 	return vv, nil
+}
+
+// TabAlign transforms translates tab-separated columns in input into properly aligned text
+// with the given padding for separation.
+// For more information, refer to the tabwriter package.
+func TabAlign(selections []string, padding int) ([]string, error) {
+	tabbed := strings.Builder{}
+	tabW := tabwriter.NewWriter(&tabbed, 0, 0, padding, ' ', 0)
+	_, err := tabW.Write([]byte(strings.Join(selections, "\n")))
+	if err != nil {
+		return nil, err
+	}
+	err = tabW.Flush()
+	if err != nil {
+		return nil, err
+	}
+
+	return strings.Split(tabbed.String(), "\n"), nil
 }
 
 var _ Formatter = (*TableFormatter)(nil)

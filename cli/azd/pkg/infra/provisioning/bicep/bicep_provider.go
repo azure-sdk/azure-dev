@@ -5,61 +5,285 @@ package bicep
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"math"
-	"net/url"
+	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/azure/azure-dev/cli/azd/pkg/async"
-	"github.com/azure/azure-dev/cli/azd/pkg/cmdsubst"
-	"github.com/azure/azure-dev/cli/azd/pkg/environment"
-	"github.com/azure/azure-dev/cli/azd/pkg/infra"
-	. "github.com/azure/azure-dev/cli/azd/pkg/infra/provisioning"
-	"github.com/azure/azure-dev/cli/azd/pkg/input"
-	"github.com/azure/azure-dev/cli/azd/pkg/osutil"
-	"github.com/azure/azure-dev/cli/azd/pkg/output"
-	"github.com/azure/azure-dev/cli/azd/pkg/tools"
-	"github.com/azure/azure-dev/cli/azd/pkg/tools/azcli"
-	"github.com/azure/azure-dev/cli/azd/pkg/tools/bicep"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/cognitiveservices/armcognitiveservices/v2"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	"github.com/drone/envsubst"
+
+	"github.com/azure/azure-dev/cli/azd/internal/tracing"
+	"github.com/azure/azure-dev/cli/azd/internal/tracing/events"
+	"github.com/azure/azure-dev/cli/azd/internal/tracing/fields"
+	"github.com/azure/azure-dev/cli/azd/pkg/account"
+	"github.com/azure/azure-dev/cli/azd/pkg/ai"
+	"github.com/azure/azure-dev/cli/azd/pkg/async"
+	"github.com/azure/azure-dev/cli/azd/pkg/azapi"
+	"github.com/azure/azure-dev/cli/azd/pkg/azdext"
+	"github.com/azure/azure-dev/cli/azd/pkg/azure"
+	"github.com/azure/azure-dev/cli/azd/pkg/azureutil"
+	"github.com/azure/azure-dev/cli/azd/pkg/cloud"
+	"github.com/azure/azure-dev/cli/azd/pkg/cmdsubst"
+	"github.com/azure/azure-dev/cli/azd/pkg/config"
+	"github.com/azure/azure-dev/cli/azd/pkg/convert"
+	"github.com/azure/azure-dev/cli/azd/pkg/environment"
+	"github.com/azure/azure-dev/cli/azd/pkg/errorhandler"
+	"github.com/azure/azure-dev/cli/azd/pkg/infra"
+	"github.com/azure/azure-dev/cli/azd/pkg/infra/provisioning"
+	"github.com/azure/azure-dev/cli/azd/pkg/input"
+	"github.com/azure/azure-dev/cli/azd/pkg/ioc"
+	"github.com/azure/azure-dev/cli/azd/pkg/keyvault"
+	"github.com/azure/azure-dev/cli/azd/pkg/output"
+	"github.com/azure/azure-dev/cli/azd/pkg/output/ux"
+	"github.com/azure/azure-dev/cli/azd/pkg/password"
+	"github.com/azure/azure-dev/cli/azd/pkg/prompt"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools/bicep"
+	"golang.org/x/sync/errgroup"
 )
 
-type BicepTemplate struct {
-	Schema         string                          `json:"$schema"`
-	ContentVersion string                          `json:"contentVersion"`
-	Parameters     map[string]BicepInputParameter  `json:"parameters"`
-	Outputs        map[string]BicepOutputParameter `json:"outputs"`
+type bicepFileMode int
+
+const (
+	bicepMode bicepFileMode = iota
+	bicepparamMode
+)
+
+const (
+	// apiVersion for checking if a resource group exists
+	apiVersionResourceGroupExistence = "2025-03-01"
+)
+
+// extensionValidationTimeout bounds how long core validation waits for
+// extension-provided validation checks to complete. If an extension's check
+// blocks or never responds, dispatch is abandoned once this deadline elapses
+// and validation continues with the core results. This preserves the guarantee
+// that extensions cannot hang core validation.
+const extensionValidationTimeout = 60 * time.Second
+
+// Azure reserved resource name words.
+// See https://learn.microsoft.com/azure/azure-resource-manager/templates/error-reserved-resource-name
+var azureReservedResourceNameExactMatches = map[string]struct{}{
+	"ACCESS":              {},
+	"APP_BROWSERS":        {},
+	"APP_CODE":            {},
+	"APP_DATA":            {},
+	"APP_GLOBALRESOURCES": {},
+	"APP_LOCALRESOURCES":  {},
+	"APP_THEMES":          {},
+	"APP_WEBREFERENCES":   {},
+	"AZURE":               {},
+	"BING":                {},
+	"BIZSPARK":            {},
+	"BIZTALK":             {},
+	"CORTANA":             {},
+	"DIRECTX":             {},
+	"DOTNET":              {},
+	"DYNAMICS":            {},
+	"EXCEL":               {},
+	"EXCHANGE":            {},
+	"FOREFRONT":           {},
+	"GROOVE":              {},
+	"HOLOLENS":            {},
+	"HYPERV":              {},
+	"KINECT":              {},
+	"LYNC":                {},
+	"MSDN":                {},
+	"O365":                {},
+	"OFFICE":              {},
+	"OFFICE365":           {},
+	"ONEDRIVE":            {},
+	"ONENOTE":             {},
+	"OUTLOOK":             {},
+	"POWERPOINT":          {},
+	"SHAREPOINT":          {},
+	"SKYPE":               {},
+	"VISIO":               {},
+	"VISUALSTUDIO":        {},
+	"WEB.CONFIG":          {},
+	"XBOX":                {},
 }
 
-type BicepInputParameter struct {
-	Type         string      `json:"type"`
-	DefaultValue interface{} `json:"defaultValue"`
-	Value        interface{} `json:"value"`
+var azureReservedResourceNameContainsMatches = []string{
+	"MICROSOFT",
+	"WINDOWS",
 }
 
-type BicepOutputParameter struct {
-	Type  string      `json:"type"`
-	Value interface{} `json:"value"`
+const azureReservedResourceNamePrefixMatch = "LOGIN"
+
+// azureReservedResourceNameExemptTypes lists resource type prefixes for which
+// the reserved-word check is skipped. ARM does not enforce the reserved-word
+// rule on these types — either because they have no public endpoint, or because
+// their names are FQDN/convention-shaped by design (e.g. DNS zones, VM
+// extensions named "Publisher.Type").
+//
+// Each entry matches the exact type or any descendant child type
+// (case-insensitive). One entry like "Microsoft.Network/privateDnsZones"
+// covers the parent zone plus every record/link child without enumerating them.
+var azureReservedResourceNameExemptTypes = []string{
+	// FQDN-shaped names.
+	"Microsoft.Network/privateDnsZones",
+	"Microsoft.Network/dnsZones",
+	"Microsoft.Network/dnsForwardingRulesets",
+	"Microsoft.Network/dnsResolvers",
+	"Microsoft.Network/firewallPolicies",
+
+	// Internal-only names (no public endpoint).
+	"Microsoft.Resources/resourceGroups",
+	"Microsoft.Resources/deployments",
+	"Microsoft.Resources/deploymentScripts",
+	"Microsoft.Authorization/roleAssignments",
+	"Microsoft.Authorization/roleDefinitions",
+	"Microsoft.Authorization/policyAssignments",
+	"Microsoft.Authorization/policyDefinitions",
+	"Microsoft.Authorization/policySetDefinitions",
+	"Microsoft.Authorization/locks",
+	"Microsoft.Insights/diagnosticSettings",
+
+	// User-labeled child resources (e.g. NSG rule "AllowMicrosoftContainerRegistryOutbound").
+	"Microsoft.Network/networkSecurityGroups",
+	"Microsoft.KeyVault/vaults/secrets",
+	"Microsoft.KeyVault/vaults/keys",
+	"Microsoft.KeyVault/vaults/certificates",
+	"Microsoft.KeyVault/vaults/accessPolicies",
+	"Microsoft.OperationalInsights/workspaces/dataSources",
+
+	// Convention-named resources (names mirror a publisher, connector, or service tag).
+	"Microsoft.Compute/virtualMachines/extensions", // e.g. "Microsoft.Insights.LogAnalyticsAgent"
+	"Microsoft.Compute/virtualMachineScaleSets/extensions",
+	"Microsoft.Web/connections",                             // e.g. "office365", "sharepointonline"
+	"Microsoft.Network/virtualNetworks/subnets/delegations", // e.g. "Microsoft.Web/serverFarms"
+
+	// Service-mandated names (the resource name is fixed by the service, not user-chosen).
+	"Microsoft.Chaos/targets", // e.g. "microsoft-azurekubernetesservicechaosmesh"
 }
 
-type BicepDeploymentDetails struct {
-	ParameterFilePath string
+// isReservedNameCheckExempt reports whether the reserved-word check should be
+// skipped for the given resource type. Matching is case-insensitive and applies
+// to the type itself or any descendant child type.
+func isReservedNameCheckExempt(resourceType string) bool {
+	normalized := strings.ToLower(resourceType)
+	for _, exempt := range azureReservedResourceNameExemptTypes {
+		exemptLower := strings.ToLower(exempt)
+		if normalized == exemptLower || strings.HasPrefix(normalized, exemptLower+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// adaptivePoller implements exponential backoff for deployment polling.
+// It starts at a fast interval and backs off when the deployment state is unchanged,
+// resetting to fast polling when new resources complete or fail.
+// It also detects ARM throttling (HTTP 429) and increases polling intervals accordingly.
+type adaptivePoller struct {
+	minInterval          time.Duration
+	maxInterval          time.Duration
+	currentInterval      time.Duration
+	backoffFactor        float64
+	lastResourceCount    int
+	consecutiveThrottles int
+}
+
+func newAdaptivePoller() *adaptivePoller {
+	return &adaptivePoller{
+		minInterval:       1 * time.Second,
+		maxInterval:       10 * time.Second,
+		currentInterval:   1 * time.Second,
+		backoffFactor:     2.0,
+		lastResourceCount: -1,
+	}
+}
+
+// nextInterval returns the next polling interval based on whether the deployment state has changed.
+// When resourceCount changes (new resources completed/failed), the interval resets to the minimum.
+// When unchanged, the interval increases exponentially up to the maximum.
+func (ap *adaptivePoller) nextInterval(resourceCount int) time.Duration {
+	if resourceCount != ap.lastResourceCount {
+		// State changed — reset to fast polling
+		ap.currentInterval = ap.minInterval
+		ap.lastResourceCount = resourceCount
+	} else {
+		// State unchanged — back off
+		next := min(time.Duration(float64(ap.currentInterval)*ap.backoffFactor), ap.maxInterval)
+		ap.currentInterval = next
+	}
+	return ap.currentInterval
+}
+
+// throttleThreshold is the number of consecutive throttle responses after which a visible
+// warning is emitted to the user.
+const throttleThreshold = 5
+
+// recordThrottle records a throttle event and returns true when a visible warning should be
+// emitted (after throttleThreshold consecutive throttles).
+func (ap *adaptivePoller) recordThrottle() bool {
+	ap.consecutiveThrottles++
+	// Force the interval to maximum when throttled.
+	ap.currentInterval = ap.maxInterval
+	return ap.consecutiveThrottles == throttleThreshold
+}
+
+// clearThrottle resets the consecutive throttle counter after a successful response.
+func (ap *adaptivePoller) clearThrottle() {
+	ap.consecutiveThrottles = 0
+}
+
+// isThrottleError checks if an error is an ARM throttling response (HTTP 429).
+func isThrottleError(err error) bool {
+	if respErr, ok := errors.AsType[*azcore.ResponseError](err); ok {
+		return respErr.StatusCode == http.StatusTooManyRequests
+	}
+	return false
 }
 
 // BicepProvider exposes infrastructure provisioning using Azure Bicep templates
 type BicepProvider struct {
-	env         *environment.Environment
-	projectPath string
-	options     Options
-	console     input.Console
-	bicepCli    bicep.BicepCli
-	azCli       azcli.AzCli
+	// Options that are available after Initialize()
+	options               provisioning.Options
+	projectPath           string
+	projectName           string
+	path                  string
+	layer                 string
+	mode                  bicepFileMode
+	ignoreDeploymentState bool
+
+	// Dependencies
+	envManager          environment.Manager
+	env                 *environment.Environment
+	console             input.Console
+	bicepCli            *bicep.Cli
+	azapi               *azapi.AzureClient
+	resourceService     *azapi.ResourceService
+	resourceManager     infra.ResourceManager
+	deploymentManager   *infra.DeploymentManager
+	prompters           prompt.Prompter
+	curPrincipal        provisioning.CurrentPrincipalIdProvider
+	portalUrlBase       string
+	keyvaultService     keyvault.KeyVaultService
+	subscriptionManager *account.SubscriptionsManager
+	aiModelService      *ai.AiModelService
+	serviceLocator      ioc.ServiceLocator
+
+	// Internal state
+	// compileBicepResult is cached to avoid recompiling the same bicep file multiple times in the same azd run.
+	compileBicepMemoryCache *compileBicepResult
 }
 
 // Name gets the name of the infra provider
@@ -67,290 +291,1511 @@ func (p *BicepProvider) Name() string {
 	return "Bicep"
 }
 
-func (p *BicepProvider) RequiredExternalTools() []tools.ExternalTool {
-	return []tools.ExternalTool{p.bicepCli, p.azCli}
-}
-
-// Gets the latest deployment details for the specified scope
-func (p *BicepProvider) GetDeployment(ctx context.Context, scope infra.Scope) *async.InteractiveTaskWithProgress[*DeployResult, *DeployProgress] {
-	return async.RunInteractiveTaskWithProgress(
-		func(asyncContext *async.InteractiveTaskContextWithProgress[*DeployResult, *DeployProgress]) {
-			asyncContext.SetProgress(&DeployProgress{Message: "Loading Bicep template", Timestamp: time.Now()})
-			modulePath := p.modulePath()
-			deployment, err := p.createDeployment(ctx, modulePath)
-			if err != nil {
-				asyncContext.SetError(fmt.Errorf("compiling bicep template: %w", err))
-				return
-			}
-
-			asyncContext.SetProgress(&DeployProgress{Message: "Retrieving Azure deployment", Timestamp: time.Now()})
-			armDeployment, err := scope.GetDeployment(ctx)
-			if err != nil {
-				asyncContext.SetError(fmt.Errorf("retrieving deployment: %w", err))
-				return
-			}
-
-			asyncContext.SetProgress(&DeployProgress{Message: "Normalizing output parameters", Timestamp: time.Now()})
-			deployment.Outputs = p.createOutputParameters(deployment, armDeployment.Properties.Outputs)
-
-			result := DeployResult{
-				Deployment: deployment,
-				Operations: []azcli.AzCliResourceOperation{},
-			}
-
-			asyncContext.SetResult(&result)
-		})
-}
-
-// Plans the infrastructure provisioning
-func (p *BicepProvider) Plan(ctx context.Context) *async.InteractiveTaskWithProgress[*DeploymentPlan, *DeploymentPlanningProgress] {
-	return async.RunInteractiveTaskWithProgress(
-		func(asyncContext *async.InteractiveTaskContextWithProgress[*DeploymentPlan, *DeploymentPlanningProgress]) {
-			asyncContext.SetProgress(&DeploymentPlanningProgress{Message: "Generating Bicep parameters file", Timestamp: time.Now()})
-			bicepTemplate, parameterFilePath, err := p.createParametersFile(ctx, asyncContext)
-			if err != nil {
-				asyncContext.SetError(fmt.Errorf("creating parameters file: %w", err))
-				return
-			}
-
-			modulePath := p.modulePath()
-			asyncContext.SetProgress(&DeploymentPlanningProgress{Message: "Compiling Bicep template", Timestamp: time.Now()})
-			deployment, err := p.createDeployment(ctx, modulePath)
-			if err != nil {
-				asyncContext.SetError(fmt.Errorf("creating template: %w", err))
-				return
-			}
-
-			// Merge parameter values from template
-			for key, param := range deployment.Parameters {
-				if bicepParam, has := bicepTemplate.Parameters[key]; has {
-					param.Value = bicepParam.Value
-					deployment.Parameters[key] = param
-				}
-			}
-
-			updated, err := p.ensureParameters(ctx, deployment)
-			if err != nil {
-				asyncContext.SetError(err)
-				return
-			}
-
-			if updated {
-				if err := p.updateParametersFile(ctx, deployment, parameterFilePath); err != nil {
-					asyncContext.SetError(fmt.Errorf("updating deployment parameters: %w", err))
-					return
-				}
-			}
-
-			result := DeploymentPlan{
-				Deployment: *deployment,
-				Details: BicepDeploymentDetails{
-					ParameterFilePath: parameterFilePath,
-				},
-			}
-
-			asyncContext.SetResult(&result)
-		})
-}
-
-// Provisioning the infrastructure within the specified template
-func (p *BicepProvider) Deploy(ctx context.Context, pd *DeploymentPlan, scope infra.Scope) *async.InteractiveTaskWithProgress[*DeployResult, *DeployProgress] {
-	return async.RunInteractiveTaskWithProgress(
-		func(asyncContext *async.InteractiveTaskContextWithProgress[*DeployResult, *DeployProgress]) {
-			done := make(chan bool)
-			var operations []azcli.AzCliResourceOperation
-
-			deploymentUrl := fmt.Sprintf(output.WithLinkFormat("https://portal.azure.com/#blade/HubsExtension/DeploymentDetailsBlade/overview/id/%s\n"), url.PathEscape(scope.DeploymentUrl()))
-			p.console.Message(ctx, fmt.Sprintf("Provisioning Azure resources can take some time.\n\nYou can view detailed progress in the Azure Portal:\n%s", deploymentUrl))
-
-			// Ensure the done marker channel is sent in all conditions
-			defer func() {
-				done <- true
-			}()
-
-			// Report incremental progress
-			go func() {
-				resourceManager := infra.NewAzureResourceManager(ctx)
-				progressDisplay := NewProvisioningProgressDisplay(resourceManager, p.console, scope)
-
-				for {
-					select {
-					case <-done:
-						return
-					case <-time.After(10 * time.Second):
-						progressReport, err := progressDisplay.ReportProgress(ctx)
-						if err != nil {
-							// We don't want to fail the whole deployment if a progress reporting error occurs
-							log.Printf("error while reporting progress: %s", err.Error())
-							continue
-						}
-
-						operations = progressReport.Operations
-						asyncContext.SetProgress(progressReport)
-					}
-				}
-			}()
-
-			// Start the deployment
-			modulePath := p.modulePath()
-			bicepDeploymentData := pd.Details.(BicepDeploymentDetails)
-			deployResult, err := p.deployModule(ctx, scope, modulePath, bicepDeploymentData.ParameterFilePath)
-
-			if err != nil {
-				asyncContext.SetError(err)
-				return
-			}
-
-			deployment := pd.Deployment
-			if deployResult != nil {
-				deployment.Outputs = p.createOutputParameters(&pd.Deployment, deployResult.Properties.Outputs)
-			}
-
-			result := &DeployResult{
-				Operations: operations,
-				Deployment: &deployment,
-			}
-
-			asyncContext.SetResult(result)
-		})
-}
-
-// Destroys the specified deployment by deleting all azure resources, resource groups & deployments that are referenced.
-func (p *BicepProvider) Destroy(ctx context.Context, deployment *Deployment, options DestroyOptions) *async.InteractiveTaskWithProgress[*DestroyResult, *DestroyProgress] {
-	return async.RunInteractiveTaskWithProgress(
-		func(asyncContext *async.InteractiveTaskContextWithProgress[*DestroyResult, *DestroyProgress]) {
-			asyncContext.SetProgress(&DestroyProgress{Message: "Fetching resource groups", Timestamp: time.Now()})
-			resourceGroups, err := p.getResourceGroups(ctx)
-			if err != nil {
-				asyncContext.SetError(err)
-				return
-			}
-
-			asyncContext.SetProgress(&DestroyProgress{Message: "Fetching resources", Timestamp: time.Now()})
-			allResources, err := p.getAllResources(ctx, resourceGroups)
-			if err != nil {
-				asyncContext.SetError(fmt.Errorf("getting resources to delete: %w", err))
-				return
-			}
-
-			asyncContext.SetProgress(&DestroyProgress{Message: "Getting KeyVaults to purge", Timestamp: time.Now()})
-			keyVaults, err := p.getKeyVaultsToPurge(ctx, allResources)
-			if err != nil {
-				asyncContext.SetError(fmt.Errorf("getting key vaults to purge: %w", err))
-				return
-			}
-
-			if err := p.destroyResourceGroups(ctx, asyncContext, options, resourceGroups, allResources); err != nil {
-				asyncContext.SetError(fmt.Errorf("destroying resource groups: %w", err))
-				return
-			}
-
-			if err := p.purgeKeyVaults(ctx, asyncContext, keyVaults, options); err != nil {
-				asyncContext.SetError(fmt.Errorf("purging key vaults: %w", err))
-				return
-			}
-
-			if err := p.deleteDeployment(ctx, asyncContext); err != nil {
-				asyncContext.SetError(fmt.Errorf("deleting subscription deployment: %w", err))
-				return
-			}
-
-			destroyResult := DestroyResult{
-				Resources: allResources,
-				Outputs:   deployment.Outputs,
-			}
-
-			asyncContext.SetResult(&destroyResult)
-		})
-}
-
-func (p *BicepProvider) getResourceGroups(ctx context.Context) ([]string, error) {
-	resourceManager := infra.NewAzureResourceManager(ctx)
-	resourceGroups, err := resourceManager.GetResourceGroupsForDeployment(ctx, p.env.GetSubscriptionId(), p.env.GetEnvName())
+// Initialize initializes provider state from the options.
+// It also calls EnsureEnv, which ensures the client-side state is ready for provisioning.
+func (p *BicepProvider) Initialize(ctx context.Context, projectPath string, opt provisioning.Options) error {
+	infraOptions, err := opt.GetWithDefaults()
 	if err != nil {
-		return []string{}, err
+		return err
 	}
 
-	return resourceGroups, nil
-}
-
-func (p *BicepProvider) getAllResources(ctx context.Context, resourceGroups []string) ([]azcli.AzCliResource, error) {
-	allResources := []azcli.AzCliResource{}
-
-	for _, resourceGroup := range resourceGroups {
-		resources, err := p.azCli.ListResourceGroupResources(ctx, p.env.GetSubscriptionId(), resourceGroup, nil)
-		if err != nil {
-			return []azcli.AzCliResource{}, nil
-		}
-
-		allResources = append(allResources, resources...)
+	if !filepath.IsAbs(infraOptions.Path) {
+		infraOptions.Path = filepath.Join(projectPath, infraOptions.Path)
 	}
 
-	return allResources, nil
+	bicepparam := infraOptions.Module + ".bicepparam"
+	bicepFile := infraOptions.Module + ".bicep"
+
+	// Check if there's a <moduleName>.bicepparam first. It will be preferred over a <moduleName>.bicep
+	if _, err := os.Stat(filepath.Join(infraOptions.Path, bicepparam)); err == nil {
+		p.path = filepath.Join(infraOptions.Path, bicepparam)
+		p.mode = bicepparamMode
+	} else {
+		p.path = filepath.Join(infraOptions.Path, bicepFile)
+		p.mode = bicepMode
+	}
+
+	p.projectPath = projectPath
+	p.projectName, err = resolveProjectName(projectPath)
+	if err != nil {
+		return fmt.Errorf("resolving project name: %w", err)
+	}
+	p.layer = infraOptions.Name
+	p.options = infraOptions
+	p.ignoreDeploymentState = infraOptions.IgnoreDeploymentState
+
+	if opt.Mode == provisioning.ModeDeploy {
+		// For regular deployments, ensure the environment is in a provision-ready state
+		p.console.ShowSpinner(ctx, "Initialize bicep provider", input.Step)
+		err = p.EnsureEnv(ctx)
+		p.console.StopSpinner(ctx, "", input.Step)
+	}
+
+	return err
 }
 
-// Deletes the azure resources within the deployment
-func (p *BicepProvider) destroyResourceGroups(ctx context.Context, asyncContext *async.InteractiveTaskContextWithProgress[*DestroyResult, *DestroyProgress], options DestroyOptions, resourceGroups []string, allResources []azcli.AzCliResource) error {
-	if !options.Force() {
-		err := asyncContext.Interact(func() error {
-			confirmDestroy, err := p.console.Confirm(ctx, input.ConsoleOptions{
-				Message:      fmt.Sprintf("This will delete %d resources, are you sure you want to continue?", len(allResources)),
-				DefaultValue: false,
-			})
+var ErrEnsureEnvPreReqBicepCompileFailed = errors.New("")
 
-			if err != nil {
-				return fmt.Errorf("prompting for delete confirmation: %w", err)
-			}
-
-			if !confirmDestroy {
-				return errors.New("user denied delete confirmation")
-			}
-
-			return nil
-		})
-
-		if err != nil {
+// EnsureEnv ensures that the environment is in a provision-ready state with required values set, prompting the user if
+// values are unset. This also requires that the Bicep module can be compiled.
+func (p *BicepProvider) EnsureEnv(ctx context.Context) error {
+	// for .bicepparam, we first prompt for environment values before calling compiling bicepparam file
+	// which can reference these values
+	if p.mode == bicepparamMode {
+		if err := provisioning.EnsureSubscriptionAndLocation(
+			ctx, p.envManager, p.env, p.prompters, provisioning.EnsureSubscriptionAndLocationOptions{}); err != nil {
 			return err
 		}
 	}
 
-	for _, resourceGroup := range resourceGroups {
-		message := fmt.Sprintf("%s resource group %s", output.WithErrorFormat("Deleting"), output.WithHighLightFormat(resourceGroup))
-		asyncContext.SetProgress(&DestroyProgress{Message: message, Timestamp: time.Now()})
+	compileResult, compileErr := p.compileBicep(ctx)
+	if compileErr != nil {
+		return fmt.Errorf("%w%w", ErrEnsureEnvPreReqBicepCompileFailed, compileErr)
+	}
 
-		if err := p.azCli.DeleteResourceGroup(ctx, p.env.GetSubscriptionId(), resourceGroup); err != nil {
+	// for .bicep, azd must load a parameters.json file and create the ArmParameters so we know if the are filters
+	// to apply for location (using the allowedValues or the location azd metadata)
+	if p.mode == bicepMode {
+		err := provisioning.EnsureSubscription(
+			ctx, p.envManager, p.env, p.prompters)
+		if err != nil {
 			return err
 		}
 
-		p.console.Message(ctx, fmt.Sprintf("%s resource group %s", output.WithErrorFormat("Deleted"), output.WithHighLightFormat(resourceGroup)))
+		_, err = p.ensureParameters(ctx, compileResult.Template)
+		if err != nil {
+			return err
+		}
+
+	}
+
+	scope, err := compileResult.Template.TargetScope()
+	if err != nil {
+		return err
+	}
+
+	if scope == azure.DeploymentScopeResourceGroup {
+		if err := p.ensureResourceGroup(ctx, p.env); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-func (p *BicepProvider) getKeyVaults(ctx context.Context, resources []azcli.AzCliResource) ([]azcli.AzCliKeyVault, error) {
-	vaults := []azcli.AzCliKeyVault{}
+// ensureResourceGroup ensures that the resource group with AZURE_RESOURCE_GROUP key exists in the environment,
+// prompting the user to create a resource group if it is unset or does not exist.
+func (p *BicepProvider) ensureResourceGroup(ctx context.Context, env *environment.Environment) error {
+	promptAndSave := func(opt prompt.PromptResourceOptions) error {
+		rgName, err := p.prompters.PromptResourceGroup(ctx, opt)
+		if err != nil {
+			return err
+		}
 
-	for _, resource := range resources {
-		if resource.Type == string(infra.AzureResourceTypeKeyVault) {
-			vault, err := p.azCli.GetKeyVault(ctx, p.env.GetSubscriptionId(), resource.Name)
-			if err != nil {
-				return []azcli.AzCliKeyVault{}, fmt.Errorf("listing key vault %s properties: %w", resource.Name, err)
+		p.env.DotenvSet(environment.ResourceGroupEnvVarName, rgName)
+		if err := p.envManager.Save(ctx, p.env); err != nil {
+			return fmt.Errorf("saving resource group name: %w", err)
+		}
+
+		return nil
+	}
+
+	resourceGroup := env.Getenv(environment.ResourceGroupEnvVarName)
+	if resourceGroup == "" {
+		return promptAndSave(prompt.PromptResourceOptions{})
+	}
+
+	resourceId := fmt.Sprintf(
+		"/subscriptions/%s/resourceGroups/%s",
+		p.env.GetSubscriptionId(),
+		resourceGroup)
+
+	resId, err := arm.ParseResourceID(resourceId)
+	if err != nil {
+		return fmt.Errorf("invalid '%s': %w", environment.ResourceGroupEnvVarName, err)
+	}
+
+	exists, err := p.resourceService.CheckExistenceByID(ctx, *resId, apiVersionResourceGroupExistence)
+	if err != nil {
+		return fmt.Errorf("checking if resource group exists: %w", err)
+	}
+
+	if !exists {
+		// Resource group no longer exists, prompt the user to create a new one.
+		// This handles the case where a resource group was deleted.
+		return promptAndSave(prompt.PromptResourceOptions{DefaultName: resourceGroup})
+	}
+
+	return nil
+}
+
+func locationParameterFilterImpl(allowedLocations []string, location account.Location) bool {
+	if allowedLocations == nil {
+		return true
+	}
+	return slices.Contains(allowedLocations, location.Name)
+}
+
+// defaultPromptValue resolves if there is an intention from a location parameter to use a default location.
+//
+// If the parameter has AzdMetadataTypeLocation, with a default location set, the default location is returned.
+// If the parameter has AllowedValues, the first option value is returned.
+// Otherwise, nil is returned to indicate no user-provided default value.
+func defaultPromptValue(locationParam azure.ArmTemplateParameterDefinition) *string {
+	azdMetadata, has := locationParam.AzdMetadata()
+	if has &&
+		azdMetadata.Type != nil && *azdMetadata.Type == azure.AzdMetadataTypeLocation &&
+		azdMetadata.Default != nil {
+		// Metadata using location type and a default location. This is the highest priority.
+		defaultStr := fmt.Sprintf("%v", azdMetadata.Default)
+		return &defaultStr
+	}
+
+	if locationParam.AllowedValues != nil {
+		firstOption, castOk := (*locationParam.AllowedValues)[0].(string)
+		// if cast doesn't work, we don't have a default location
+		if castOk {
+			return &firstOption
+		}
+	}
+	return nil
+}
+
+func (p *BicepProvider) LastDeployment(ctx context.Context) (*azapi.ResourceDeployment, error) {
+	compileResult, err := p.compileBicep(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("compiling bicep template: %w", err)
+	}
+
+	scope, err := p.scopeForTemplate(compileResult.Template)
+	if err != nil {
+		return nil, fmt.Errorf("computing deployment scope: %w", err)
+	}
+
+	return p.latestDeploymentResult(ctx, scope)
+}
+
+func (p *BicepProvider) State(ctx context.Context, options *provisioning.StateOptions) (*provisioning.StateResult, error) {
+	if options == nil {
+		options = &provisioning.StateOptions{}
+	}
+
+	var err error
+	spinnerMessage := "Loading Bicep template"
+	p.console.ShowSpinner(ctx, spinnerMessage, input.Step)
+	defer func() {
+		// Make sure we stop the spinner if an error occurs with the last message.
+		if err != nil {
+			p.console.StopSpinner(ctx, spinnerMessage, input.StepFailed)
+		}
+	}()
+
+	var scope infra.Scope
+	var outputs azure.ArmTemplateOutputs
+	var scopeErr error
+
+	if _, err := os.Stat(p.path); err == nil {
+		compileResult, err := p.compileBicep(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("compiling bicep template: %w", err)
+		}
+
+		scope, err = p.scopeForTemplate(compileResult.Template)
+		if err != nil {
+			return nil, fmt.Errorf("computing deployment scope: %w", err)
+		}
+
+		outputs = compileResult.Template.Outputs
+	} else if errors.Is(err, os.ErrNotExist) {
+		// To support BYOI (bring your own infrastructure)
+		// We need to support the case where there template does not contain an `infra` folder.
+		scope, scopeErr = p.inferScopeFromEnv()
+		if scopeErr != nil {
+			return nil, fmt.Errorf("computing deployment scope: %w", err)
+		}
+
+		outputs = azure.ArmTemplateOutputs{}
+	}
+
+	spinnerMessage = "Retrieving Azure deployment"
+	p.console.ShowSpinner(ctx, spinnerMessage, input.Step)
+
+	var deployment *azapi.ResourceDeployment
+
+	deployments, err := p.deploymentManager.CompletedDeployments(
+		ctx, scope, p.deploymentProjectName(), p.env.Name(), p.layer, options.Hint())
+	p.console.StopSpinner(ctx, "", input.StepDone)
+
+	if err != nil {
+		p.console.StopSpinner(ctx, spinnerMessage, input.StepFailed)
+		return nil, fmt.Errorf("retrieving deployment: %w", err)
+	} else {
+		p.console.StopSpinner(ctx, "", input.StepDone)
+	}
+
+	if len(deployments) > 1 {
+		deploymentOptions := getDeploymentOptions(deployments)
+
+		p.console.Message(ctx, output.WithWarningFormat("WARNING: Multiple matching deployments were found\n"))
+
+		promptConfig := input.ConsoleOptions{
+			Message: "Select a deployment to continue:",
+			Options: deploymentOptions,
+		}
+
+		selectedDeployment, err := p.console.Select(ctx, promptConfig)
+		if err != nil {
+			return nil, err
+		}
+
+		deployment = deployments[selectedDeployment]
+		p.console.Message(ctx, "")
+	} else {
+		deployment = deployments[0]
+	}
+
+	azdDeployment, err := p.createDeploymentFromArmDeployment(scope, deployment.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	p.console.MessageUxItem(ctx, &ux.DoneMessage{
+		Message: fmt.Sprintf("Retrieving Azure deployment (%s)", output.WithHighLightFormat(deployment.Name)),
+	})
+
+	state := provisioning.State{}
+	state.Resources = make([]provisioning.Resource, len(deployment.Resources))
+
+	for idx, res := range deployment.Resources {
+		state.Resources[idx] = provisioning.Resource{
+			Id: *res.ID,
+		}
+	}
+
+	state.Outputs = provisioning.OutputParametersFromArmOutputs(
+		outputs,
+		azapi.CreateDeploymentOutput(deployment.Outputs),
+	)
+
+	p.console.MessageUxItem(ctx, &ux.DoneMessage{
+		Message: fmt.Sprintf("Updated %d environment variables", len(state.Outputs)),
+	})
+
+	outputsUrl, err := azdDeployment.OutputsUrl(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	p.console.Message(ctx, fmt.Sprintf(
+		"\nPopulated environment from Azure infrastructure deployment: %s",
+		output.WithHyperlink(outputsUrl, deployment.Name),
+	))
+
+	return &provisioning.StateResult{
+		State: &state,
+	}, nil
+}
+
+func (p *BicepProvider) createDeploymentFromArmDeployment(
+	scope infra.Scope,
+	deploymentName string,
+) (infra.Deployment, error) {
+	resourceGroupScope, ok := scope.(*infra.ResourceGroupScope)
+	if ok {
+		return p.deploymentManager.ResourceGroupDeployment(resourceGroupScope, deploymentName), nil
+	}
+
+	subscriptionScope, ok := scope.(*infra.SubscriptionScope)
+	if ok {
+		return p.deploymentManager.SubscriptionDeployment(subscriptionScope, deploymentName), nil
+	}
+
+	return nil, errors.New("unsupported deployment scope")
+}
+
+// plan creates an execution plan that can be executed for previewing, or deploying these changes.
+//
+// It ensures that all parameters are filled in and is ready for execution.
+func (p *BicepProvider) plan(ctx context.Context) (*compileBicepResult, error) {
+	p.console.ShowSpinner(ctx, "Creating a deployment plan", input.Step)
+
+	switch p.mode {
+	case bicepMode:
+		compileResult, err := p.compileBicep(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("compiling bicep template: %w", err)
+		}
+
+		// prompt for any missing parameters
+		configuredParameters, err := p.ensureParameters(ctx, compileResult.Template)
+		if err != nil {
+			return nil, err
+		}
+
+		compileResult.Parameters = configuredParameters
+		return compileResult, nil
+
+	case bicepparamMode:
+		// To ensure any compile-time bicepparam parameters such as `readEnvironmentVariable()`
+		// are resolved correctly right before deployment occurs, we clear the cache
+		// and trigger full compilation here.
+		p.compileBicepMemoryCache = nil
+
+		compileResult, err := p.compileBicep(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("compiling bicep template: %w", err)
+		}
+
+		return compileResult, nil
+	}
+
+	return nil, errors.New("unsupported bicep mode")
+}
+
+// generateDeploymentObject generates an [infra.Deployment] object from the given plan with a unique name.
+func (p *BicepProvider) generateDeploymentObject(plan *compileBicepResult) (infra.Deployment, error) {
+	baseName := p.env.Name()
+	if p.layer != "" {
+		baseName += "-" + p.layer
+	}
+	uniqueName := p.deploymentManager.GenerateDeploymentName(baseName)
+	scope, err := plan.Template.TargetScope()
+	if err != nil {
+		return nil, err
+	}
+
+	switch scope {
+	case azure.DeploymentScopeSubscription:
+		scope := p.deploymentManager.SubscriptionScope(p.env.GetSubscriptionId(), p.env.GetLocation())
+		return infra.NewSubscriptionDeployment(
+			scope,
+			uniqueName,
+		), nil
+
+	case azure.DeploymentScopeResourceGroup:
+		scope := p.deploymentManager.ResourceGroupScope(
+			p.env.GetSubscriptionId(),
+			p.env.Getenv(environment.ResourceGroupEnvVarName),
+		)
+		return infra.NewResourceGroupDeployment(scope, uniqueName), nil
+
+	default:
+		return nil, fmt.Errorf("unsupported scope: %s", scope)
+	}
+}
+
+// deploymentState returns the latests deployment if it is the same as the deployment within deploymentData or an error
+// otherwise.
+func (p *BicepProvider) deploymentState(
+	ctx context.Context,
+	planned *compileBicepResult,
+	scope infra.Scope,
+	currentParamsHash string,
+) (*azapi.ResourceDeployment, error) {
+	p.console.ShowSpinner(ctx, "Comparing deployment state", input.Step)
+
+	// Fetch the latest prior deployment first. When there is no prior
+	// deployment (the common cold-start and per-layer initial-deploy paths)
+	// there is no state to compare against, so we can skip the expensive
+	// CalculateTemplateHash ARM call entirely. Under multi-layer fan-out
+	// the unconditional parallel hash call put direct rate-limit pressure
+	// on ARM with zero benefit. The parallel tradeoff is retained only for
+	// the narrow hot path where a comparable prior deployment actually
+	// exists and was successful.
+	prevDeploymentResult, err := p.latestDeploymentResult(ctx, scope)
+	if err != nil {
+		return nil, fmt.Errorf("deployment state error: %w", err)
+	}
+
+	if projectName := p.deploymentProjectName(); projectName != "" {
+		projectTag, hasProjectTag := prevDeploymentResult.Tags[azure.TagKeyAzdProjectName]
+		if !hasProjectTag || projectTag == nil || *projectTag != projectName {
+			return nil, errors.New("previous deployment does not contain matching azd project identity")
+		}
+	}
+
+	// State is invalid if the last deployment was not succeeded.
+	// This is currently safe because we rely on latestDeploymentResult which
+	// relies on findCompletedDeployments which filters to only Failed and Succeeded.
+	if prevDeploymentResult.ProvisioningState != azapi.DeploymentProvisioningStateSucceeded {
+		return nil, fmt.Errorf("last deployment failed.")
+	}
+
+	templateHash, err := p.deploymentManager.CalculateTemplateHash(
+		ctx, p.env.GetSubscriptionId(),
+		planned.RawArmTemplate,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("can't get hash from current template: %w", err)
+	}
+
+	if !prevDeploymentEqualToCurrent(prevDeploymentResult, templateHash, currentParamsHash) {
+		return nil, fmt.Errorf("deployment state has changed")
+	}
+
+	return prevDeploymentResult, nil
+}
+
+// latestDeploymentResult looks and finds a previous deployment for the current azd project.
+func (p *BicepProvider) latestDeploymentResult(
+	ctx context.Context,
+	scope infra.Scope,
+) (*azapi.ResourceDeployment, error) {
+	deployments, err := p.deploymentManager.CompletedDeployments(
+		ctx, scope, p.deploymentProjectName(), p.env.Name(), p.layer, "")
+	// findCompletedDeployments returns error if no deployments are found
+	// No need to check for empty list
+	if err != nil {
+		return nil, err
+	}
+
+	if len(deployments) > 1 {
+		// If more than one deployment found, ignore the prev-deployment
+		return nil, fmt.Errorf("more than one previous deployment match.")
+	}
+
+	return deployments[0], nil
+}
+
+// parametersHash generates a hash from its name and final value.
+// The final value is either the parameter default value or the value from the params input.
+func parametersHash(templateParameters azure.ArmTemplateParameterDefinitions, params azure.ArmParameters) (string, error) {
+	hash256 := sha256.New()
+
+	// Get the parameter name and its final value.
+	// Any other change on the parameter definition would break the template-hash
+	nameAndValueParams := make(map[string]any, len(templateParameters))
+
+	for paramName, paramDefinition := range templateParameters {
+		pValue := paramDefinition.DefaultValue
+		if param, exists := params[paramName]; exists {
+			pValue = param.Value
+		}
+		nameAndValueParams[paramName] = pValue
+	}
+	nameAndValueParamsBytes, err := json.Marshal(nameAndValueParams)
+	if err != nil {
+		return "", err
+	}
+	if _, err := hash256.Write(nameAndValueParamsBytes); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", hash256.Sum(nil)), nil
+}
+
+// prevDeploymentEqualToCurrent compares the template hash from a previous deployment against a current template.
+func prevDeploymentEqualToCurrent(prev *azapi.ResourceDeployment, templateHash, paramsHash string) bool {
+	if prev == nil {
+		logDS("No previous deployment.")
+		return false
+	}
+
+	if prev.Tags == nil {
+		logDS("No previous deployment params tags")
+		return false
+	}
+
+	prevTemplateHash := convert.ToValueWithDefault(prev.TemplateHash, "")
+	if prevTemplateHash != templateHash {
+		logDS("template hash is different from previous deployment")
+		return false
+	}
+
+	prevParamHash, hasTag := prev.Tags[azure.TagKeyAzdDeploymentStateParamHashName]
+	if !hasTag {
+		logDS("no param hash tag on last deployment.")
+		return false
+	}
+
+	if *prevParamHash != paramsHash {
+		logDS("template parameters are different from previous deployment")
+		return false
+	}
+
+	logDS("Previous deployment state is equal to current deployment. Deployment can be skipped.")
+	return true
+}
+
+func logDS(msg string, v ...any) {
+	log.Printf("%s : %s", "deployment-state: ", fmt.Sprintf(msg, v...))
+}
+
+// Provisioning the infrastructure within the specified template
+func (p *BicepProvider) Deploy(ctx context.Context) (*provisioning.DeployResult, error) {
+	if p.ignoreDeploymentState {
+		logDS("Azure Deployment State is disabled by --no-state arg.")
+	}
+
+	planned, err := p.plan(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	deployment, err := p.generateDeploymentObject(planned)
+	if err != nil {
+		return nil, err
+	}
+
+	result := p.convertToDeployment(planned.Template)
+
+	// parameters hash is required for doing deployment state validation check but also to set the hash
+	// after a successful deployment.
+	currentParamsHash, parametersHashErr := parametersHash(planned.Template.Parameters, planned.Parameters)
+	if parametersHashErr != nil {
+		// fail to hash parameters won't stop the operation. It only disables deployment state and recording parameters hash
+		logDS("%s", parametersHashErr.Error())
+	}
+
+	useDeploymentState := p.useDeploymentStateShortcut(parametersHashErr)
+	if !useDeploymentState && !p.ignoreDeploymentState && parametersHashErr == nil {
+		// The only remaining reason the shortcut is disabled here is an active deployment-stacks
+		// configuration; surface it in the deployment-stacks debug log.
+		logDS("deployment stacks configuration present; bypassing deployment-state shortcut")
+	}
+
+	if useDeploymentState {
+		deploymentState, stateErr := p.deploymentState(ctx, planned, deployment, currentParamsHash)
+		if stateErr == nil {
+			// As a heuristic, we also check the existence of all resource groups
+			// created by the deployment to validate the deployment state.
+			// This handles the scenario of resource group(s) being deleted outside of azd,
+			// which is quite common.
+			// Resource group checks run in parallel to reduce wall-clock time.
+			rgGroup, rgCtx := errgroup.WithContext(ctx)
+			rgGroup.SetLimit(10) // bound parallel ARM calls
+			for _, res := range deploymentState.Resources {
+				if res != nil && res.ID != nil {
+					resId, err := arm.ParseResourceID(*res.ID)
+					if err == nil && resId.ResourceType.Type == arm.ResourceGroupResourceType.Type {
+						rgGroup.Go(func() error {
+							exists, checkErr := p.resourceService.CheckExistenceByID(
+								rgCtx, *resId, apiVersionResourceGroupExistence)
+							if checkErr != nil {
+								// Be conservative: if we cannot verify the resource group
+								// still exists (transient ARM failure, throttling, auth
+								// error, etc.), invalidate the cached deployment state so
+								// the caller falls through to a real deployment. Silently
+								// assuming "exists" would skip a deployment that may be
+								// needed to recreate a resource group deleted out-of-band.
+								return fmt.Errorf(
+									"checking resource group %s existence: %w",
+									resId.ResourceGroupName, checkErr)
+							}
+							if !exists {
+								return fmt.Errorf(
+									"resource group %s no longer exists, invalidating deployment state",
+									resId.ResourceGroupName)
+							}
+							return nil
+						})
+					}
+				}
 			}
-			vaults = append(vaults, vault)
+			if rgErr := rgGroup.Wait(); rgErr != nil {
+				stateErr = rgErr
+			}
+		}
+
+		if stateErr == nil {
+			result.Outputs = provisioning.OutputParametersFromArmOutputs(
+				planned.Template.Outputs,
+				azapi.CreateDeploymentOutput(deploymentState.Outputs),
+			)
+
+			return &provisioning.DeployResult{
+				Deployment:    &result,
+				SkippedReason: provisioning.DeploymentStateSkipped,
+			}, nil
+		}
+		logDS("%s", stateErr.Error())
+	}
+
+	deploymentTags := map[string]*string{
+		azure.TagKeyAzdEnvName:   new(p.env.Name()),
+		azure.TagKeyAzdLayerName: &p.layer,
+	}
+	if projectName := p.deploymentProjectName(); projectName != "" {
+		deploymentTags[azure.TagKeyAzdProjectName] = new(projectName)
+	}
+	if parametersHashErr == nil {
+		deploymentTags[azure.TagKeyAzdDeploymentStateParamHashName] = new(currentParamsHash)
+	}
+
+	optionsMap, err := p.deploymentOptionsMap(true)
+	if err != nil {
+		return nil, err
+	}
+
+	// Provision validation runs two independent, config-gated steps:
+	//   - validation.provision=off  → skip azd's local (client-side) provision validation.
+	//   - provision.preflight=off   → skip the server-side ARM provision validation call.
+	skipValidation := false
+	skipArmPreflight := false
+	var valCtx *validationContext
+	var userConfigManager config.UserConfigManager
+	if err := p.serviceLocator.Resolve(&userConfigManager); err == nil {
+		if userConfig, err := userConfigManager.Load(); err == nil {
+			skipValidation, skipArmPreflight = resolveProvisionValidationGates(userConfig)
+		}
+	}
+
+	if !skipValidation || !skipArmPreflight {
+		p.console.ShowSpinner(ctx, "Validating deployment", input.Step)
+		var canceled bool
+		var validationErr error
+		valCtx, canceled, validationErr = p.validateProvision(
+			ctx,
+			deployment,
+			p.path,
+			planned.RawArmTemplate,
+			planned.Parameters,
+			deploymentTags,
+			optionsMap,
+			skipValidation,
+			skipArmPreflight,
+		)
+		if validationErr != nil {
+			p.console.StopSpinner(ctx, "Validating deployment", input.StepFailed)
+			return nil, validationErr
+		}
+		if canceled {
+			// Validation detected issues and provisioning was intentionally canceled.
+			// This is a successful operation (exit code 0), not an internal failure.
+			p.console.StopSpinner(ctx, "Validating deployment", input.StepSkipped)
+			return &provisioning.DeployResult{SkippedReason: provisioning.ProvisionValidationCanceledSkipped}, nil
+		}
+		p.console.StopSpinner(ctx, "", input.StepDone)
+	}
+
+	progressCtx, cancelProgress := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	defer func() {
+		cancelProgress()
+		// Wait for the progress reporting goroutine to exit to guarantee stopping the spinner
+		wg.Wait()
+		// Clean up the spinner fully
+		p.console.StopSpinner(ctx, "", input.StepDone)
+	}()
+
+	go func() {
+		defer wg.Done()
+		// Disable reporting progress if needed
+		if use, err := strconv.ParseBool(os.Getenv("AZD_DEBUG_PROVISION_PROGRESS_DISABLE")); err == nil && use {
+			log.Println("Disabling progress reporting since AZD_DEBUG_PROVISION_PROGRESS_DISABLE was set")
+			<-progressCtx.Done()
+			return
+		}
+
+		// Report incremental progress
+		progressDisplay := p.deploymentManager.ProgressDisplay(deployment)
+		queryStartTime := time.Now()
+
+		poller := newAdaptivePoller()
+		delay := poller.minInterval
+
+		timer := time.NewTimer(delay)
+
+		for {
+			select {
+			case <-progressCtx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+				err := progressDisplay.ReportProgress(progressCtx, &queryStartTime)
+				if err != nil {
+					// We don't want to fail the whole deployment if a progress reporting error occurs
+					log.Printf("error while reporting progress: %v", err)
+
+					// Detect ARM throttling (HTTP 429) and adjust polling accordingly.
+					if isThrottleError(err) {
+						if poller.recordThrottle() {
+							log.Printf(
+								"WARNING: ARM API is throttling requests — "+
+									"deployment progress polling slowed to %s intervals",
+								poller.maxInterval)
+						}
+						delay = poller.maxInterval
+						timer.Reset(delay)
+						continue
+					}
+				}
+
+				if err == nil {
+					poller.clearThrottle()
+				}
+				delay = poller.nextInterval(progressDisplay.DisplayedResourceCount())
+				timer.Reset(delay)
+			}
+		}
+	}()
+
+	// Start the deployment
+	p.console.ShowSpinner(ctx, "Creating/Updating resources", input.Step)
+
+	// If AZD_DEPLOYMENT_ID_FILE is set, expose the ARM deployment ID to the caller now
+	// that we are actually about to start the ARM deployment. Doing this here (rather
+	// than immediately after generating the deployment object) avoids advertising a
+	// deployment ID that never exists in Azure when the run short-circuits via the
+	// deployment-state cache or is canceled by provision validation.
+	writeDeploymentIdFile(deployment, p.layer)
+
+	deployCtx, interruptStarted, interruptCh, markDeployCompleted, interruptCleanup :=
+		p.installDeploymentInterruptHandler(ctx, deployment, cancelProgress)
+	cleanupOnce := sync.OnceFunc(interruptCleanup)
+	defer cleanupOnce()
+
+	deployResult, err := p.deployModule(
+		deployCtx,
+		deployment,
+		planned.RawArmTemplate,
+		planned.Parameters,
+		deploymentTags,
+		optionsMap,
+		valCtx,
+	)
+
+	// Try to atomically claim the "completed" state. If the interrupt
+	// handler already claimed "interrupting", the CAS fails and we must
+	// wait for the handler's outcome so the user's Ctrl+C is never
+	// silently dropped.
+	if !markDeployCompleted() {
+		// Handler has claimed the interrupt — wait for its outcome.
+		<-interruptStarted
+		outcome := <-interruptCh
+		cleanupOnce()
+		tracing.SetUsageAttributes(
+			fields.ProvisionCancellationKey.String(outcome.telemetryValue))
+		return nil, applyInterruptOutcome(outcome, err)
+	}
+
+	// Deploy completed naturally — tear the handler down before
+	// post-processing to avoid resurfacing the cancel/leave prompt over
+	// subsequent output.
+	cleanupOnce()
+
+	if err != nil {
+		tracing.SetUsageAttributes(fields.ProvisionCancellationKey.String("none"))
+		return nil, err
+	}
+
+	tracing.SetUsageAttributes(fields.ProvisionCancellationKey.String("none"))
+
+	result.Outputs = provisioning.OutputParametersFromArmOutputs(
+		planned.Template.Outputs,
+		azapi.CreateDeploymentOutput(deployResult.Outputs),
+	)
+
+	return &provisioning.DeployResult{
+		Deployment: &result,
+	}, nil
+}
+
+// Preview runs deploy using the what-if argument
+func (p *BicepProvider) Preview(ctx context.Context) (*provisioning.DeployPreviewResult, error) {
+	planned, err := p.plan(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	p.console.ShowSpinner(ctx, "Generating infrastructure preview", input.Step)
+
+	deployment, err := p.generateDeploymentObject(planned)
+	if err != nil {
+		return nil, err
+	}
+
+	deployPreviewResult, err := deployment.DeployPreview(
+		ctx,
+		planned.RawArmTemplate,
+		planned.Parameters,
+	)
+	if err != nil {
+		return nil, annotateDeploymentErrorResources(
+			err,
+			nil,
+			planned.RawArmTemplate,
+		)
+	}
+
+	if deployPreviewResult.Error != nil {
+		err := azapi.NewAzureDeploymentErrorFromResponse(
+			deployPreviewResult.Error,
+			azapi.DeploymentOperationPreview,
+		)
+		return nil, annotateDeploymentErrorResources(
+			err,
+			nil,
+			planned.RawArmTemplate,
+		)
+	}
+
+	var changes []*provisioning.DeploymentPreviewChange
+	for _, change := range deployPreviewResult.Properties.Changes {
+		// Use After state if available (e.g., Create, Modify), otherwise use Before state (e.g., Delete).
+		// ARM returns nil for After when a resource is being deleted and nil for Before when created.
+		var resourceState map[string]any
+		if change.After != nil {
+			resourceState, _ = change.After.(map[string]any)
+		}
+		if resourceState == nil && change.Before != nil {
+			resourceState, _ = change.Before.(map[string]any)
+		}
+		if resourceState == nil {
+			// Skip changes with no resource state information
+			continue
+		}
+
+		resourceType, _ := resourceState["type"].(string)
+		resourceName, _ := resourceState["name"].(string)
+
+		// Convert Delta (property-level changes) from Azure SDK format to our format
+		var delta []provisioning.DeploymentPreviewPropertyChange
+		if change.Delta != nil {
+			delta = convertPropertyChanges(change.Delta)
+		}
+
+		changes = append(changes, &provisioning.DeploymentPreviewChange{
+			ChangeType: provisioning.ChangeType(*change.ChangeType),
+			ResourceId: provisioning.Resource{
+				Id: *change.ResourceID,
+			},
+			ResourceType: resourceType,
+			Name:         resourceName,
+			Before:       change.Before,
+			After:        change.After,
+			Delta:        delta,
+		})
+	}
+
+	return &provisioning.DeployPreviewResult{
+		Preview: &provisioning.DeploymentPreview{
+			Status: *deployPreviewResult.Status,
+			Properties: &provisioning.DeploymentPreviewProperties{
+				Changes: changes,
+			},
+		},
+	}, nil
+}
+
+// convertPropertyChanges converts Azure SDK's WhatIfPropertyChange to our DeploymentPreviewPropertyChange
+func convertPropertyChanges(changes []*armresources.WhatIfPropertyChange) []provisioning.DeploymentPreviewPropertyChange {
+	if changes == nil {
+		return nil
+	}
+
+	result := make([]provisioning.DeploymentPreviewPropertyChange, 0, len(changes))
+	for _, change := range changes {
+		if change == nil {
+			continue
+		}
+
+		propertyChange := provisioning.DeploymentPreviewPropertyChange{
+			Path:   convert.ToValueWithDefault(change.Path, ""),
+			Before: change.Before,
+			After:  change.After,
+		}
+
+		// Convert PropertyChangeType
+		if change.PropertyChangeType != nil {
+			propertyChange.ChangeType = provisioning.PropertyChangeType(*change.PropertyChangeType)
+		}
+
+		// Recursively convert children if present
+		if change.Children != nil {
+			propertyChange.Children = convertPropertyChanges(change.Children)
+		}
+
+		result = append(result, propertyChange)
+	}
+
+	return result
+}
+
+type itemToPurge struct {
+	resourceType      string
+	count             int
+	purge             func(skipPurge bool, self *itemToPurge) error
+	cognitiveAccounts []cognitiveAccount
+}
+
+func (p *BicepProvider) scopeForTemplate(t azure.ArmTemplate) (infra.Scope, error) {
+	deploymentScope, err := t.TargetScope()
+	if err != nil {
+		return nil, err
+	}
+
+	if deploymentScope == azure.DeploymentScopeSubscription {
+		return p.deploymentManager.SubscriptionScope(p.env.GetSubscriptionId(), p.env.GetLocation()), nil
+	} else if deploymentScope == azure.DeploymentScopeResourceGroup {
+		return p.deploymentManager.ResourceGroupScope(
+			p.env.GetSubscriptionId(),
+			p.env.Getenv(environment.ResourceGroupEnvVarName),
+		), nil
+	} else {
+		return nil, fmt.Errorf("unsupported deployment scope: %s", deploymentScope)
+	}
+}
+
+func (p *BicepProvider) inferScopeFromEnv() (infra.Scope, error) {
+	if resourceGroup, has := p.env.LookupEnv(environment.ResourceGroupEnvVarName); has {
+		return p.deploymentManager.ResourceGroupScope(p.env.GetSubscriptionId(), resourceGroup), nil
+	} else {
+		return p.deploymentManager.SubscriptionScope(p.env.GetSubscriptionId(), p.env.GetLocation()), nil
+	}
+}
+
+// Destroys the specified deployment by deleting all azure resources, resource groups & deployments that are referenced.
+func (p *BicepProvider) Destroy(
+	ctx context.Context,
+	options provisioning.DestroyOptions,
+) (*provisioning.DestroyResult, error) {
+	p.console.ShowSpinner(ctx, "Discovering resources to delete...", input.Step)
+	defer p.console.StopSpinner(ctx, "", input.StepDone)
+	compileResult, err := p.compileBicep(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("creating template: %w", err)
+	}
+
+	targetScope, err := compileResult.Template.TargetScope()
+	if err != nil {
+		return nil, fmt.Errorf("computing deployment scope: %w", err)
+	}
+
+	switch targetScope {
+	case azure.DeploymentScopeResourceGroup:
+		if p.env.Getenv(environment.ResourceGroupEnvVarName) == "" {
+			return nil, azapi.ErrDeploymentNotFound
+		}
+	case azure.DeploymentScopeSubscription:
+		if p.env.Getenv(environment.SubscriptionIdEnvVarName) == "" || p.env.Getenv(environment.LocationEnvVarName) == "" {
+			return nil, azapi.ErrDeploymentNotFound
+		}
+	}
+
+	scope, err := p.scopeForTemplate(compileResult.Template)
+	if err != nil {
+		return nil, fmt.Errorf("computing deployment scope: %w", err)
+	}
+
+	completedDeployments, err := p.deploymentManager.CompletedDeployments(
+		ctx, scope, p.deploymentProjectName(), p.env.Name(), p.layer, "")
+	if err != nil {
+		return nil, fmt.Errorf("finding completed deployments: %w", err)
+	}
+
+	if len(completedDeployments) == 0 {
+		return nil, fmt.Errorf("no deployments found for environment, '%s'", p.env.Name())
+	}
+
+	mostRecentDeployment := completedDeployments[0]
+	deploymentToDelete := scope.Deployment(mostRecentDeployment.Name)
+
+	resourcesToDelete, err := deploymentToDelete.Resources(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("getting resources to delete: %w", err)
+	}
+
+	groupedResources, err := azapi.GroupByResourceGroup(resourcesToDelete)
+	if err != nil {
+		return nil, fmt.Errorf("mapping resources to resource groups: %w", err)
+	}
+
+	// If no resources found, we still need to void the deployment state.
+	// This can happen when resources have been manually deleted before running azd down.
+	// Voiding the state ensures that subsequent azd provision commands work correctly
+	// by creating a new empty deployment that becomes the last successful deployment.
+	if len(groupedResources) == 0 {
+		p.console.StopSpinner(ctx, "", input.StepDone)
+		// Call deployment.Delete to void the state even though there are no resources to delete
+		if err := p.destroyDeployment(ctx, deploymentToDelete); err != nil {
+			return nil, fmt.Errorf("voiding deployment state: %w", err)
+		}
+	} else {
+		keyVaults, err := p.getKeyVaultsToPurge(ctx, groupedResources)
+		if err != nil {
+			return nil, fmt.Errorf("getting key vaults to purge: %w", err)
+		}
+
+		managedHSMs, err := p.getManagedHSMsToPurge(ctx, groupedResources)
+		if err != nil {
+			return nil, fmt.Errorf("getting managed hsms to purge: %w", err)
+		}
+
+		appConfigs, err := p.getAppConfigsToPurge(ctx, groupedResources)
+		if err != nil {
+			return nil, fmt.Errorf("getting app configurations to purge: %w", err)
+		}
+
+		apiManagements, err := p.getApiManagementsToPurge(ctx, groupedResources)
+		if err != nil {
+			return nil, fmt.Errorf("getting API managements to purge: %w", err)
+		}
+
+		cognitiveAccounts, err := p.getCognitiveAccountsToPurge(ctx, groupedResources)
+		if err != nil {
+			return nil, fmt.Errorf("getting cognitive accounts to purge: %w", err)
+		}
+
+		logAnalyticsWorkspaces, err := p.getLogAnalyticsWorkspacesToPurge(ctx, groupedResources)
+		if err != nil {
+			return nil, fmt.Errorf("getting log analytics workspaces to purge: %w", err)
+		}
+
+		p.console.StopSpinner(ctx, "", input.StepDone)
+
+		// For resource-group-scoped deployments, check if the resource group was created by azd.
+		// If not, warn the user that deleting the RG will remove ALL resources, including those
+		// not deployed by azd.
+		if targetScope == azure.DeploymentScopeResourceGroup {
+			rgName := p.env.Getenv(environment.ResourceGroupEnvVarName)
+			// warnExternalResourceGroup returns (userAlreadyConfirmed, error).
+			// When true, user confirmed via the external-RG warning so we skip promptDeletion.
+			// When false with nil error, the RG is azd-owned and normal prompt applies.
+			userAlreadyConfirmed, err := p.warnExternalResourceGroup(
+				ctx, options, rgName, groupedResources, len(resourcesToDelete),
+			)
+			if err != nil {
+				return nil, fmt.Errorf("checking resource group ownership: %w", err)
+			}
+
+			// If the external-RG warning was already confirmed, skip the regular
+			// deletion prompt to avoid double-prompting the user.
+			if !userAlreadyConfirmed {
+				// Prompt for confirmation before deleting resources
+				if err := p.promptDeletion(
+					ctx, options, groupedResources, len(resourcesToDelete),
+				); err != nil {
+					return nil, err
+				}
+			}
+		} else {
+			// Prompt for confirmation before deleting resources
+			if err := p.promptDeletion(
+				ctx, options, groupedResources, len(resourcesToDelete),
+			); err != nil {
+				return nil, err
+			}
+		}
+
+		p.console.Message(ctx, output.WithGrayFormat("Deleting your resources can take some time.\n"))
+
+		// Force delete Log Analytics Workspaces first if purge is enabled
+		// This must happen before deleting resource groups since force delete requires the workspace to exist
+		if options.Purge() && len(logAnalyticsWorkspaces) > 0 {
+			if err := p.forceDeleteLogAnalyticsWorkspaces(ctx, logAnalyticsWorkspaces); err != nil {
+				return nil, fmt.Errorf("force deleting log analytics workspaces: %w", err)
+			}
+		}
+
+		if err := p.destroyDeployment(ctx, deploymentToDelete); err != nil {
+			return nil, fmt.Errorf("deleting resource groups: %w", err)
+		}
+
+		keyVaultsPurge := itemToPurge{
+			resourceType: "Key Vault",
+			count:        len(keyVaults),
+			purge: func(skipPurge bool, self *itemToPurge) error {
+				return p.purgeKeyVaults(ctx, keyVaults, skipPurge)
+			},
+		}
+		managedHSMsPurge := itemToPurge{
+			resourceType: "Managed HSM",
+			count:        len(managedHSMs),
+			purge: func(skipPurge bool, self *itemToPurge) error {
+				return p.purgeManagedHSMs(ctx, managedHSMs, skipPurge)
+			},
+		}
+		appConfigsPurge := itemToPurge{
+			resourceType: "App Configuration",
+			count:        len(appConfigs),
+			purge: func(skipPurge bool, self *itemToPurge) error {
+				return p.purgeAppConfigs(ctx, appConfigs, skipPurge)
+			},
+		}
+		aPIManagement := itemToPurge{
+			resourceType: "API Management",
+			count:        len(apiManagements),
+			purge: func(skipPurge bool, self *itemToPurge) error {
+				return p.purgeAPIManagement(ctx, apiManagements, skipPurge)
+			},
+		}
+
+		var purgeItem []itemToPurge
+		for _, item := range []itemToPurge{keyVaultsPurge, managedHSMsPurge, appConfigsPurge, aPIManagement} {
+			if item.count > 0 {
+				purgeItem = append(purgeItem, item)
+			}
+		}
+
+		// cognitive services are grouped by resource group because the name of the resource group is required to purge
+		groupByKind := cognitiveAccountsByKind(cognitiveAccounts)
+		for name, cogAccounts := range groupByKind {
+			addPurgeItem := itemToPurge{
+				resourceType: name,
+				count:        len(cogAccounts),
+				purge: func(skipPurge bool, self *itemToPurge) error {
+					return p.purgeCognitiveAccounts(ctx, self.cognitiveAccounts, skipPurge)
+				},
+				cognitiveAccounts: groupByKind[name],
+			}
+			purgeItem = append(purgeItem, addPurgeItem)
+		}
+
+		if err := p.purgeItems(ctx, purgeItem, options); err != nil {
+			return nil, fmt.Errorf("purging resources: %w", err)
+		}
+	}
+
+	destroyResult := &provisioning.DestroyResult{
+		InvalidatedEnvKeys: slices.Collect(maps.Keys(provisioning.OutputParametersFromArmOutputs(
+			compileResult.Template.Outputs,
+			azapi.CreateDeploymentOutput(mostRecentDeployment.Outputs),
+		))),
+	}
+
+	return destroyResult, nil
+}
+
+// A local type for adding the resource group to a cognitive account as it is required for purging
+type cognitiveAccount struct {
+	account       armcognitiveservices.Account
+	resourceGroup string
+}
+
+// transform a map of resourceGroup and accounts to group by kind in all resource groups but keeping the resource group
+// on each account
+func cognitiveAccountsByKind(
+	accountsByResourceGroup map[string][]armcognitiveservices.Account) map[string][]cognitiveAccount {
+	result := make(map[string][]cognitiveAccount)
+	for resourceGroup, cogAccounts := range accountsByResourceGroup {
+		for _, cogAccount := range cogAccounts {
+			kindName := *cogAccount.Kind
+			// Replace "FormRecognizer" with "DocumentIntelligence"
+			if kindName == "FormRecognizer" {
+				kindName = "Document Intelligence"
+			}
+			_, exists := result[kindName]
+			if exists {
+				result[kindName] = append(result[kindName], cognitiveAccount{
+					account:       cogAccount,
+					resourceGroup: resourceGroup,
+				})
+			} else {
+				result[kindName] = []cognitiveAccount{{
+					account:       cogAccount,
+					resourceGroup: resourceGroup,
+				}}
+			}
+		}
+	}
+	return result
+}
+
+func getDeploymentOptions(deployments []*azapi.ResourceDeployment) []string {
+	promptValues := []string{}
+	for index, deployment := range deployments {
+		optionTitle := fmt.Sprintf("%d. %s (%s)",
+			index+1,
+			deployment.Name,
+			deployment.Timestamp.Local().Format("1/2/2006, 3:04 PM"),
+		)
+		promptValues = append(promptValues, optionTitle)
+	}
+
+	return promptValues
+}
+
+func (p *BicepProvider) generateResourcesToDelete(
+	ctx context.Context,
+	groupedResources map[string][]*azapi.Resource,
+) []string {
+	lines := []string{"Resource(s) to be deleted:"}
+
+	for resourceGroupName, resources := range groupedResources {
+		lines = append(lines, "")
+
+		// Resource Group
+		resourceGroupLink := fmt.Sprintf("%s/#@/resource/subscriptions/%s/resourceGroups/%s/overview",
+			p.portalUrlBase,
+			p.env.GetSubscriptionId(),
+			resourceGroupName,
+		)
+
+		lines = append(lines,
+			fmt.Sprintf("%s %s",
+				output.WithHighLightFormat("Resource Group:"),
+				output.WithHyperlink(resourceGroupLink, resourceGroupName),
+			),
+		)
+
+		// Resources in each group
+		for _, resource := range resources {
+			resourceTypeName, err := p.resourceManager.GetResourceTypeDisplayName(
+				ctx,
+				p.env.GetSubscriptionId(),
+				resource.Id,
+				azapi.AzureResourceType(resource.Type),
+			)
+			if err != nil {
+				// Fall back to static lookup if dynamic lookup fails
+				resourceTypeName = azapi.GetResourceTypeDisplayName(azapi.AzureResourceType(resource.Type))
+			}
+			if resourceTypeName == "" {
+				continue
+			}
+
+			lines = append(lines, fmt.Sprintf("  • %s: %s", resourceTypeName, resource.Name))
+		}
+	}
+
+	return append(lines, "\n")
+}
+
+// promptDeletion prompts the user for confirmation before deleting resources.
+// Returns nil if the user confirms, or an error if they deny or an error occurs.
+func (p *BicepProvider) promptDeletion(
+	ctx context.Context,
+	options provisioning.DestroyOptions,
+	groupedResources map[string][]*azapi.Resource,
+	resourceCount int,
+) error {
+	if options.Force() {
+		return nil
+	}
+
+	p.console.MessageUxItem(ctx, &ux.MultilineMessage{
+		Lines: p.generateResourcesToDelete(ctx, groupedResources)},
+	)
+	confirmDestroy, err := p.console.Confirm(ctx, input.ConsoleOptions{
+		Message: fmt.Sprintf(
+			"Total resources to %s: %d, are you sure you want to continue?",
+			output.WithErrorFormat("delete"),
+			resourceCount,
+		),
+		DefaultValue: false,
+	})
+
+	if err != nil {
+		return fmt.Errorf("prompting for delete confirmation: %w", err)
+	}
+
+	if !confirmDestroy {
+		return errors.New("user denied delete confirmation")
+	}
+
+	return nil
+}
+
+// warnExternalResourceGroup checks if a resource group was created by azd (has azd-env-name tag
+// matching the current environment). If the RG was not created by azd, it warns the user and asks
+// for explicit confirmation before proceeding with deletion, since deleting the RG will remove ALL
+// resources inside it, including any that were not deployed by azd.
+//
+// Returns (userAlreadyConfirmed=true, nil) if the user confirmed deletion through this warning
+// or if --force is set — the caller should skip promptDeletion to avoid double-prompting.
+// Returns (false, nil) if no warning was needed (RG is azd-owned).
+// Returns (false, error) if the user denied or an error occurred.
+func (p *BicepProvider) warnExternalResourceGroup(
+	ctx context.Context,
+	options provisioning.DestroyOptions,
+	resourceGroupName string,
+	groupedResources map[string][]*azapi.Resource,
+	resourceCount int,
+) (bool, error) {
+	if options.Force() {
+		return true, nil
+	}
+
+	if resourceGroupName == "" {
+		return false, nil
+	}
+
+	rg, err := p.resourceService.GetResourceGroup(ctx, p.env.GetSubscriptionId(), resourceGroupName)
+	if err != nil {
+		// Fail closed: if we can't determine ownership, treat it as external and warn.
+		// This prevents accidental deletion when the API call fails transiently.
+		log.Printf(
+			"warnExternalResourceGroup: failed to get resource group %q, treating as external: %v",
+			resourceGroupName, err,
+		)
+	}
+
+	// If the RG has the azd-env-name tag matching the current environment, azd created it
+	if rg != nil {
+		if envTag, hasTag := rg.Tags[azure.TagKeyAzdEnvName]; hasTag && envTag == p.env.Name() {
+			return false, nil
+		}
+	}
+
+	p.console.MessageUxItem(ctx, &ux.WarningMessage{
+		Description: fmt.Sprintf(
+			"Resource group %s was not created by azd.",
+			output.WithHighLightFormat(resourceGroupName),
+		),
+	})
+	p.console.Message(ctx, fmt.Sprintf(
+		"  Deleting this resource group will remove %s inside it,\n"+
+			"  including any that were not deployed by azd.\n",
+		output.WithErrorFormat("ALL resources"),
+	))
+
+	p.console.MessageUxItem(ctx, &ux.MultilineMessage{
+		Lines: p.generateResourcesToDelete(ctx, groupedResources)},
+	)
+
+	confirmDelete, err := p.console.Confirm(ctx, input.ConsoleOptions{
+		Message: fmt.Sprintf(
+			"Do you still want to delete the entire resource group %s?",
+			output.WithHighLightFormat(resourceGroupName),
+		),
+		DefaultValue: false,
+	})
+	if err != nil {
+		return false, fmt.Errorf("prompting for resource group deletion: %w", err)
+	}
+
+	if !confirmDelete {
+		return false, &errorhandler.ErrorWithSuggestion{
+			Err:        errors.New("user denied delete confirmation"),
+			Message:    "Resource group was not deleted.",
+			Suggestion: "Re-run with --force to skip this check, or delete resources manually in the Azure Portal.",
+		}
+	}
+
+	return true, nil
+}
+
+// destroyDeployment deletes the azure resources within the deployment and voids the deployment state.
+func (p *BicepProvider) destroyDeployment(
+	ctx context.Context,
+	deployment infra.Deployment,
+) error {
+	err := async.RunWithProgressE(func(progressMessage azapi.DeleteDeploymentProgress) {
+		switch progressMessage.State {
+		case azapi.DeleteResourceStateInProgress:
+			p.console.ShowSpinner(ctx, progressMessage.Message, input.Step)
+		case azapi.DeleteResourceStateSucceeded:
+			p.console.StopSpinner(ctx, progressMessage.Message, input.StepDone)
+		case azapi.DeleteResourceStateFailed:
+			p.console.StopSpinner(ctx, progressMessage.Message, input.StepFailed)
+		}
+	}, func(progress *async.Progress[azapi.DeleteDeploymentProgress]) error {
+		optionsMap, err := p.deploymentOptionsMap(false)
+		if err != nil {
+			return err
+		}
+
+		return deployment.Delete(ctx, optionsMap, progress)
+	})
+
+	if err != nil {
+		return err
+	}
+
+	p.console.Message(ctx, "")
+
+	return nil
+}
+
+func itemsCountAsText(items []itemToPurge) string {
+	count := len(items)
+	if count < 1 {
+		log.Panic("calling itemsCountAsText() with empty list.")
+	}
+
+	var tokens []string
+	for _, item := range items {
+		if item.count > 0 {
+			tokens = append(tokens, fmt.Sprintf("%d %s", item.count, item.resourceType))
+		}
+	}
+
+	return ux.ListAsText(tokens)
+}
+
+func (p *BicepProvider) purgeItems(
+	ctx context.Context,
+	items []itemToPurge,
+	options provisioning.DestroyOptions,
+) error {
+	if len(items) == 0 {
+		// nothing to purge
+		return nil
+	}
+
+	skipPurge := false
+	if !options.Purge() {
+
+		p.console.MessageUxItem(ctx, &ux.WarningMessage{
+			Description: fmt.Sprintf(
+				"The following operation will delete %s.",
+				itemsCountAsText(items),
+			),
+		})
+		p.console.Message(ctx, fmt.Sprintf(
+			"These resources have soft delete enabled allowing them to be recovered for a period or time "+
+				"after deletion. During this period, their names may not be reused. In the future, you can use "+
+				"the argument %s to skip this confirmation.\n", output.WithHighLightFormat("--purge")))
+
+		purgeItems, err := p.console.Confirm(ctx, input.ConsoleOptions{
+			Message: fmt.Sprintf(
+				"Would you like to %s these resources instead, allowing their names to be reused?",
+				output.WithErrorFormat("permanently delete"),
+			),
+			DefaultValue: false,
+		})
+		p.console.Message(ctx, "")
+
+		if err != nil {
+			return fmt.Errorf("prompting for confirmation: %w", err)
+		}
+
+		if !purgeItems {
+			skipPurge = true
+		}
+	}
+	for index, item := range items {
+		if err := item.purge(skipPurge, &items[index]); err != nil {
+			return fmt.Errorf("failed to purge %s: %w", item.resourceType, err)
+		}
+	}
+
+	return nil
+}
+
+func (p *BicepProvider) getKeyVaults(
+	ctx context.Context,
+	groupedResources map[string][]*azapi.Resource,
+) ([]*keyvault.KeyVault, error) {
+	vaults := []*keyvault.KeyVault{}
+
+	for resourceGroup, groupResources := range groupedResources {
+		for _, resource := range groupResources {
+			if resource.Type == string(azapi.AzureResourceTypeKeyVault) {
+				vault, err := p.keyvaultService.GetKeyVault(
+					ctx, azure.SubscriptionFromRID(resource.Id), resourceGroup, resource.Name)
+				if err != nil {
+					return nil, fmt.Errorf("listing key vault %s properties: %w", resource.Name, err)
+				}
+				vaults = append(vaults, vault)
+			}
 		}
 	}
 
 	return vaults, nil
 }
 
-func (p *BicepProvider) getKeyVaultsToPurge(ctx context.Context, resources []azcli.AzCliResource) ([]azcli.AzCliKeyVault, error) {
-	vaults, err := p.getKeyVaults(ctx, resources)
+func (p *BicepProvider) getKeyVaultsToPurge(
+	ctx context.Context,
+	groupedResources map[string][]*azapi.Resource,
+) ([]*keyvault.KeyVault, error) {
+	vaults, err := p.getKeyVaults(ctx, groupedResources)
 	if err != nil {
-		return []azcli.AzCliKeyVault{}, err
+		return nil, err
 	}
 
-	vaultsToPurge := []azcli.AzCliKeyVault{}
+	vaultsToPurge := []*keyvault.KeyVault{}
 	for _, v := range vaults {
 		if v.Properties.EnableSoftDelete && !v.Properties.EnablePurgeProtection {
 			vaultsToPurge = append(vaultsToPurge, v)
@@ -360,353 +1805,2137 @@ func (p *BicepProvider) getKeyVaultsToPurge(ctx context.Context, resources []azc
 	return vaultsToPurge, nil
 }
 
+func (p *BicepProvider) getManagedHSMs(
+	ctx context.Context,
+	groupedResources map[string][]*azapi.Resource,
+) ([]*azapi.AzCliManagedHSM, error) {
+	managedHSMs := []*azapi.AzCliManagedHSM{}
+
+	for resourceGroup, groupResources := range groupedResources {
+		for _, resource := range groupResources {
+			if resource.Type == string(azapi.AzureResourceTypeManagedHSM) {
+				managedHSM, err := p.azapi.GetManagedHSM(
+					ctx,
+					azure.SubscriptionFromRID(resource.Id),
+					resourceGroup,
+					resource.Name,
+				)
+				if err != nil {
+					return nil, fmt.Errorf("listing managed hsm %s properties: %w", resource.Name, err)
+				}
+				managedHSMs = append(managedHSMs, managedHSM)
+			}
+		}
+	}
+
+	return managedHSMs, nil
+}
+
+func (p *BicepProvider) getManagedHSMsToPurge(
+	ctx context.Context,
+	groupedResources map[string][]*azapi.Resource,
+) ([]*azapi.AzCliManagedHSM, error) {
+	managedHSMs, err := p.getManagedHSMs(ctx, groupedResources)
+	if err != nil {
+		return nil, err
+	}
+
+	managedHSMsToPurge := []*azapi.AzCliManagedHSM{}
+	for _, v := range managedHSMs {
+		if v.Properties.EnableSoftDelete && !v.Properties.EnablePurgeProtection {
+			managedHSMsToPurge = append(managedHSMsToPurge, v)
+		}
+	}
+
+	return managedHSMsToPurge, nil
+}
+
+func (p *BicepProvider) getCognitiveAccountsToPurge(
+	ctx context.Context,
+	groupedResources map[string][]*azapi.Resource,
+) (map[string][]armcognitiveservices.Account, error) {
+	result := make(map[string][]armcognitiveservices.Account)
+
+	for resourceGroup, groupResources := range groupedResources {
+		cognitiveAccounts := []armcognitiveservices.Account{}
+		for _, resource := range groupResources {
+			if resource.Type == string(azapi.AzureResourceTypeCognitiveServiceAccount) {
+				account, err := p.azapi.GetCognitiveAccount(
+					ctx, azure.SubscriptionFromRID(resource.Id), resourceGroup, resource.Name)
+				if err != nil {
+					return nil, fmt.Errorf("getting cognitive account %s: %w", resource.Name, err)
+				}
+				cognitiveAccounts = append(cognitiveAccounts, account)
+			}
+			if len(cognitiveAccounts) > 0 {
+				result[resourceGroup] = cognitiveAccounts
+			}
+		}
+	}
+
+	return result, nil
+}
+
 // Azure KeyVaults have a "soft delete" functionality (now enabled by default) where a vault may be marked
 // such that when it is deleted it can be recovered for a period of time. During that time, the name may
 // not be reused.
 //
-// This means that running `az dev provision`, then `az dev infra delete` and finally `az dev provision`
+// This means that running `azd provision`, then `azd down` and finally `azd provision`
 // again would lead to a deployment error since the vault name is in use.
 //
 // Since that's behavior we'd like to support, we run a purge operation for each KeyVault after
 // it has been deleted.
 //
-// See https://docs.microsoft.com/azure/key-vault/general/key-vault-recovery?tabs=azure-portal#what-are-soft-delete-and-purge-protection
+// See
+// https://docs.microsoft.com/azure/key-vault/general/key-vault-recovery?tabs=azure-portal#what-are-soft-delete-and-purge-protection
 // for more information on this feature.
-func (p *BicepProvider) purgeKeyVaults(ctx context.Context, asyncContext *async.InteractiveTaskContextWithProgress[*DestroyResult, *DestroyProgress], keyVaults []azcli.AzCliKeyVault, options DestroyOptions) error {
-	if len(keyVaults) > 0 && !options.Purge() {
-		keyVaultWarning := fmt.Sprintf(""+
-			"\nThis operation will delete and purge %d Key Vaults. These Key Vaults have soft delete enabled allowing them to be recovered for a period \n"+
-			"of time after deletion. During this period, their names may not be reused.\n"+
-			"You can use argument --purge to skip this confirmation.\n\n",
-			len(keyVaults))
-
-		p.console.Message(ctx, output.WithWarningFormat(keyVaultWarning))
-
-		err := asyncContext.Interact(func() error {
-			purgeKeyVaults, err := p.console.Confirm(ctx, input.ConsoleOptions{
-				Message:      fmt.Sprintf("Would you like to %s delete these Key Vaults instead, allowing their names to be reused?", output.WithErrorFormat("permanently")),
-				DefaultValue: false,
-			})
-
-			if err != nil {
-				return fmt.Errorf("prompting for purge confirmation: %w", err)
-			}
-
-			if !purgeKeyVaults {
-				return errors.New("user denied purge confirmation")
-			}
-
-			return nil
-		})
-
-		if err != nil {
-			return err
-		}
-	}
-
+//
+//nolint:lll
+func (p *BicepProvider) purgeKeyVaults(
+	ctx context.Context,
+	keyVaults []*keyvault.KeyVault,
+	skip bool,
+) error {
 	for _, keyVault := range keyVaults {
-		progressReport := DestroyProgress{
-			Timestamp: time.Now(),
-			Message:   fmt.Sprintf("%s key vault %s", output.WithErrorFormat("Purging"), output.WithHighLightFormat(keyVault.Name)),
-		}
-
-		asyncContext.SetProgress(&progressReport)
-
-		err := p.azCli.PurgeKeyVault(ctx, p.env.GetSubscriptionId(), keyVault.Name)
+		err := p.runPurgeAsStep(ctx, "Key Vault", keyVault.Name, func() error {
+			return p.keyvaultService.PurgeKeyVault(
+				ctx, azure.SubscriptionFromRID(keyVault.Id), keyVault.Name, keyVault.Location)
+		}, skip)
 		if err != nil {
 			return fmt.Errorf("purging key vault %s: %w", keyVault.Name, err)
 		}
-
-		p.console.Message(ctx, fmt.Sprintf("%s key vault %s", output.WithErrorFormat("Purged"), output.WithHighLightFormat(keyVault.Name)))
 	}
-
 	return nil
 }
 
-// Deletes the azure deployment
-func (p *BicepProvider) deleteDeployment(ctx context.Context, asyncContext *async.InteractiveTaskContextWithProgress[*DestroyResult, *DestroyProgress]) error {
-	asyncContext.SetProgress(&DestroyProgress{Message: "Deleting deployment", Timestamp: time.Now()})
-
-	deploymentName := p.env.GetEnvName()
-
-	if err := p.azCli.DeleteSubscriptionDeployment(ctx, p.env.GetSubscriptionId(), deploymentName); err != nil {
-		return err
-	}
-
-	p.console.Message(ctx, fmt.Sprintf("%s deployment %s", output.WithErrorFormat("Deleted"), output.WithHighLightFormat(deploymentName)))
-
-	return nil
-}
-
-// Converts the specified deployment to a bicep template parameters file and writes the file to disk.
-func (p *BicepProvider) updateParametersFile(ctx context.Context, deployment *Deployment, parameterFilePath string) error {
-	bicepFile := BicepTemplate{
-		Schema:         "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
-		ContentVersion: "1.0.0.0",
-	}
-
-	parameters := make(map[string]BicepInputParameter)
-
-	for key, param := range deployment.Parameters {
-		parameters[key] = BicepInputParameter(param)
-	}
-
-	bicepFile.Parameters = parameters
-
-	bytes, err := json.MarshalIndent(bicepFile, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshaling parameters: %w", err)
-	}
-
-	err = os.WriteFile(parameterFilePath, bytes, osutil.PermissionFile)
-	if err != nil {
-		return fmt.Errorf("writing parameters file: %w", err)
-	}
-
-	return nil
-}
-
-// Creates a normalized view of the azure output parameters and resolves inconsistencies in the output parameter name casings.
-func (p *BicepProvider) createOutputParameters(template *Deployment, azureOutputParams map[string]azcli.AzCliDeploymentOutput) map[string]OutputParameter {
-	canonicalOutputCasings := make(map[string]string, len(template.Outputs))
-
-	for key := range template.Outputs {
-		canonicalOutputCasings[strings.ToLower(key)] = key
-	}
-
-	outputParams := make(map[string]OutputParameter, len(azureOutputParams))
-
-	for key, azureParam := range azureOutputParams {
-		var paramName string
-		canonicalCasing, found := canonicalOutputCasings[strings.ToLower(key)]
-		if found {
-			paramName = canonicalCasing
-		} else {
-			paramName = key
-		}
-
-		outputParams[paramName] = OutputParameter{
-			Type:  azureParam.Type,
-			Value: azureParam.Value,
-		}
-	}
-
-	return outputParams
-}
-
-// createParametersFile will read the parameters file template for environment/module specified by Options,
-// do environment and command substitutions, and write out the result into a temporary file.
-//
-// The caller of the method is responsible for deleting the file when it is no longer necessary.
-func (p *BicepProvider) createParametersFile(ctx context.Context, asyncContext *async.InteractiveTaskContextWithProgress[*DeploymentPlan, *DeploymentPlanningProgress]) (*BicepTemplate, string, error) {
-	parametersTemplateFilePath := p.parametersTemplateFilePath()
-	log.Printf("Reading parameters template file from: %s", parametersTemplateFilePath)
-	parametersBytes, err := os.ReadFile(parametersTemplateFilePath)
-	if err != nil {
-		return nil, "", fmt.Errorf("reading parameter file template: %w", err)
-	}
-
-	replaced, err := envsubst.Eval(string(parametersBytes), func(name string) string {
-		if val, has := p.env.Values[name]; has {
-			return val
-		}
-		return os.Getenv(name)
-	})
-	if err != nil {
-		return nil, "", fmt.Errorf("substituting environment variables inside parameter file: %w", err)
-	}
-
-	if cmdsubst.ContainsCommandInvocation(replaced, cmdsubst.SecretOrRandomPasswordCommandName) {
-		cmdExecutor := cmdsubst.NewSecretOrRandomPasswordExecutor(ctx, p.azCli, p.env.GetSubscriptionId())
-		replaced, err = cmdsubst.Eval(replaced, cmdExecutor)
+func (p *BicepProvider) purgeManagedHSMs(
+	ctx context.Context,
+	managedHSMs []*azapi.AzCliManagedHSM,
+	skip bool,
+) error {
+	for _, managedHSM := range managedHSMs {
+		err := p.runPurgeAsStep(ctx, "Managed HSM", managedHSM.Name, func() error {
+			return p.azapi.PurgeManagedHSM(
+				ctx, azure.SubscriptionFromRID(managedHSM.Id), managedHSM.Name, managedHSM.Location)
+		}, skip)
 		if err != nil {
-			return nil, "", fmt.Errorf("substituting command output inside parameter file: %w", err)
+			return fmt.Errorf("purging managed hsm %s: %w", managedHSM.Name, err)
+		}
+	}
+	return nil
+}
+
+func (p *BicepProvider) purgeCognitiveAccounts(
+	ctx context.Context,
+	cognitiveAccounts []cognitiveAccount,
+	skip bool,
+) error {
+	for _, cogAccount := range cognitiveAccounts {
+		accountName := cogAccount.account.Name
+		if accountName == nil {
+			return fmt.Errorf("Cognitive account without a name")
+		}
+		accountId := cogAccount.account.ID
+		if accountId == nil {
+			return fmt.Errorf("Cognitive account without an id")
+		}
+		location := cogAccount.account.Location
+		if location == nil {
+			return fmt.Errorf("Cognitive account without a location")
+		}
+
+		err := p.runPurgeAsStep(ctx, "Cognitive Account", *accountName, func() error {
+			return p.azapi.PurgeCognitiveAccount(
+				ctx, azure.SubscriptionFromRID(*accountId), *location, cogAccount.resourceGroup, *accountName)
+		}, skip)
+		if err != nil {
+			return fmt.Errorf("purging cognitive account %s: %w", *accountName, err)
+		}
+	}
+	return nil
+}
+
+func (p *BicepProvider) runPurgeAsStep(
+	ctx context.Context, purgeType, name string, step func() error, skipped bool) error {
+
+	message := fmt.Sprintf("Purging %s: %s", purgeType, output.WithHighLightFormat(name))
+	p.console.ShowSpinner(ctx, message, input.Step)
+	if skipped {
+		p.console.StopSpinner(ctx, message, input.StepSkipped)
+		return nil
+	}
+
+	err := step()
+	p.console.StopSpinner(ctx, message, input.GetStepResultFormat(err))
+
+	return err
+}
+
+func (p *BicepProvider) getAppConfigsToPurge(
+	ctx context.Context,
+	groupedResources map[string][]*azapi.Resource,
+) ([]*azapi.AzCliAppConfig, error) {
+	configs := []*azapi.AzCliAppConfig{}
+
+	for resourceGroup, groupResources := range groupedResources {
+		for _, resource := range groupResources {
+			if resource.Type == string(azapi.AzureResourceTypeAppConfig) {
+				config, err := p.azapi.GetAppConfig(
+					ctx,
+					azure.SubscriptionFromRID(resource.Id),
+					resourceGroup,
+					resource.Name,
+				)
+				if err != nil {
+					return nil, fmt.Errorf("listing app configuration %s properties: %w", resource.Name, err)
+				}
+
+				if !config.Properties.EnablePurgeProtection {
+					configs = append(configs, config)
+				}
+			}
 		}
 	}
 
-	var bicepTemplate BicepTemplate
-	if err := json.Unmarshal([]byte(replaced), &bicepTemplate); err != nil {
-		return nil, "", fmt.Errorf("error unmarshalling Bicep template parameters: %w", err)
-	}
-
-	file, err := os.CreateTemp("", "deploymentParameters")
-	if err != nil {
-		return nil, "", err
-	}
-
-	_, err = file.Write([]byte(replaced))
-	file.Close() // Errors OK to ignore (see the docs) and we need to close the file whether Write() succeeded or not.
-	if err != nil {
-		os.Remove(file.Name()) // Error OK to ignore as well.
-		return nil, "", err
-	}
-
-	return &bicepTemplate, file.Name(), nil
+	return configs, nil
 }
 
-// Creates the compiled template from the specified module path
-func (p *BicepProvider) createDeployment(ctx context.Context, modulePath string) (*Deployment, error) {
-	// Compile the bicep file into an ARM template we can create.
-	compiled, err := p.bicepCli.Build(ctx, modulePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to compile bicep template: %w", err)
+func (p *BicepProvider) getApiManagementsToPurge(
+	ctx context.Context,
+	groupedResources map[string][]*azapi.Resource,
+) ([]*azapi.AzCliApim, error) {
+	apims := []*azapi.AzCliApim{}
+
+	for resourceGroup, groupResources := range groupedResources {
+		for _, resource := range groupResources {
+			if resource.Type == string(azapi.AzureResourceTypeApim) {
+				apim, err := p.azapi.GetApim(ctx, azure.SubscriptionFromRID(resource.Id), resourceGroup, resource.Name)
+				if err != nil {
+					return nil, fmt.Errorf("listing api management service %s properties: %w", resource.Name, err)
+				}
+
+				//No filtering needed like it does in key vaults or app configuration
+				//as soft-delete happens for all Api Management resources
+				apims = append(apims, apim)
+			}
+		}
 	}
 
-	// Fetch the parameters from the template and ensure we have a value for each one, otherwise
-	// prompt.
-	var bicepTemplate BicepTemplate
-	if err := json.Unmarshal([]byte(compiled), &bicepTemplate); err != nil {
-		log.Printf("failed un-marshaling compiled arm template to JSON (err: %v), template contents:\n%s", err, compiled)
-		return nil, fmt.Errorf("error un-marshaling arm template from json: %w", err)
-	}
-
-	compiledTemplate, err := p.convertToDeployment(bicepTemplate)
-	if err != nil {
-		return nil, fmt.Errorf("converting from bicep to compiled template: %w", err)
-	}
-
-	return compiledTemplate, nil
+	return apims, nil
 }
 
-// Converts a Bicep parameters file to a generic provisioning template
-func (p *BicepProvider) convertToDeployment(bicepTemplate BicepTemplate) (*Deployment, error) {
-	template := Deployment{}
-	parameters := make(map[string]InputParameter)
-	outputs := make(map[string]OutputParameter)
+func (p *BicepProvider) getLogAnalyticsWorkspacesToPurge(
+	ctx context.Context,
+	groupedResources map[string][]*azapi.Resource,
+) ([]*azapi.AzCliLogAnalyticsWorkspace, error) {
+	workspaces := []*azapi.AzCliLogAnalyticsWorkspace{}
+
+	for resourceGroup, groupResources := range groupedResources {
+		for _, resource := range groupResources {
+			if resource.Type == string(azapi.AzureResourceTypeLogAnalyticsWorkspace) {
+				workspace, err := p.azapi.GetLogAnalyticsWorkspace(
+					ctx,
+					azure.SubscriptionFromRID(resource.Id),
+					resourceGroup,
+					resource.Name,
+				)
+				if err != nil {
+					return nil, fmt.Errorf("listing log analytics workspace %s properties: %w", resource.Name, err)
+				}
+
+				workspaces = append(workspaces, workspace)
+			}
+		}
+	}
+
+	return workspaces, nil
+}
+
+// Azure AppConfigurations have a "soft delete" functionality (now enabled by default) where a configuration store
+// may be marked such that when it is deleted it can be recovered for a period of time. During that time,
+// the name may not be reused.
+//
+// This means that running `azd provision`, then `azd down` and finally `azd provision`
+// again would lead to a deployment error since the configuration name is in use.
+//
+// Since that's behavior we'd like to support, we run a purge operation for each AppConfiguration after it has been deleted.
+//
+// See https://learn.microsoft.com/azure/azure-app-configuration/concept-soft-delete for more information
+// on this feature.
+func (p *BicepProvider) purgeAppConfigs(
+	ctx context.Context,
+	appConfigs []*azapi.AzCliAppConfig,
+	skip bool,
+) error {
+	for _, appConfig := range appConfigs {
+		err := p.runPurgeAsStep(ctx, "app config", appConfig.Name, func() error {
+			return p.azapi.PurgeAppConfig(
+				ctx, azure.SubscriptionFromRID(appConfig.Id), appConfig.Name, appConfig.Location)
+		}, skip)
+		if err != nil {
+			return fmt.Errorf("purging app configuration %s: %w", appConfig.Name, err)
+		}
+	}
+
+	return nil
+}
+
+func (p *BicepProvider) purgeAPIManagement(
+	ctx context.Context,
+	apims []*azapi.AzCliApim,
+	skip bool,
+) error {
+	for _, apim := range apims {
+		err := p.runPurgeAsStep(ctx, "apim", apim.Name, func() error {
+			return p.azapi.PurgeApim(ctx, azure.SubscriptionFromRID(apim.Id), apim.Name, apim.Location)
+		}, skip)
+		if err != nil {
+			return fmt.Errorf("purging api management service %s: %w", apim.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// Handle Log Analytics Workspaces separately with Force option when purge is enabled.
+// Unlike many other resources, Log Analytics Workspaces are not able to be purged after soft-delete
+// because purge function only support for purge tables not a whole workspace and force delete must happen
+// when their resource group is not deleted, so we must purge them explicitly before deleting the resource
+func (p *BicepProvider) forceDeleteLogAnalyticsWorkspaces(
+	ctx context.Context,
+	workspaces []*azapi.AzCliLogAnalyticsWorkspace,
+) error {
+	for _, workspace := range workspaces {
+		message := fmt.Sprintf("Purging Log Analytics Workspace: %s", output.WithHighLightFormat(workspace.Name))
+		p.console.ShowSpinner(ctx, message, input.Step)
+
+		err := p.azapi.PurgeLogAnalyticsWorkspace(
+			ctx,
+			azure.SubscriptionFromRID(workspace.Id),
+			*azure.GetResourceGroupName(workspace.Id),
+			workspace.Name,
+		)
+
+		p.console.StopSpinner(ctx, message, input.GetStepResultFormat(err))
+		if err != nil {
+			return fmt.Errorf("purging log analytics workspace %s: %w", workspace.Name, err)
+		}
+	}
+	return nil
+}
+
+type loadParametersResult struct {
+	parameters     map[string]azure.ArmParameter
+	locationParams []string
+	// envMapping is a map of parameter name to environment variable names
+	// holds information about which parameters are mapped to which env vars for
+	// cases like "param": "${AZURE_FOO}-${AZURE_BAR}", envMapping will
+	// contain {"param": ["AZURE_FOO", "AZURE_BAR"]}
+	//
+	// This information is useful for setting a CI/CD automatically. Each env var
+	// will be set to the value of the parameter as variable or secret.
+	envMapping map[string][]string
+
+	// parameters that should be considered virtual, i.e. their values are only
+	// known at runtime.
+	//
+	// These parameters should not be prompted and treated as resolved values,
+	// with other potential unmapped environment variables stored in envMapping.
+	virtualMapping map[string]struct{}
+}
+
+// envSubstResult contains the results of environment variable substitution
+type envSubstResult struct {
+	hasUnsetEnvVar                  bool
+	hasVirtualEnvVar                bool
+	mappedEnvVars                   []string
+	parametersMappedToAzureLocation []string
+}
+
+// evalParamEnvSubst evaluates environment variable substitution on a single parameter string value.
+// It returns the substituted string, env var mapping information, and any error.
+func evalParamEnvSubst(
+	value string,
+	principalId string,
+	principalType string,
+	paramName string,
+	env *environment.Environment,
+	virtualEnv map[string]string,
+) (string, envSubstResult, error) {
+	result := envSubstResult{}
+
+	replaced, err := envsubst.Eval(value, func(name string) string {
+		if name == environment.PrincipalIdEnvVarName {
+			return principalId
+		}
+		if name == environment.PrincipalTypeEnvVarName {
+			return principalType
+		}
+		if name == environment.LocationEnvVarName {
+			result.parametersMappedToAzureLocation = append(result.parametersMappedToAzureLocation, paramName)
+		}
+
+		if virtualEnv != nil {
+			if value, has := virtualEnv[name]; has {
+				result.hasVirtualEnvVar = true
+				return value
+			}
+		}
+
+		// principalId and principalType are intentionally excluded from the mapped env vars
+		// as they are global env vars.
+		result.mappedEnvVars = append(result.mappedEnvVars, name)
+
+		value, isDefined := env.LookupEnv(name)
+		if !isDefined {
+			result.hasUnsetEnvVar = true
+		}
+		return value
+	})
+	return replaced, result, err
+}
+
+// evalCommandSubstitution evaluates command substitutions (like secretOrRandomPassword) in the given string.
+func (p *BicepProvider) evalCommandSubstitution(ctx context.Context, value string) (string, error) {
+	if !cmdsubst.ContainsCommandInvocation(value, cmdsubst.SecretOrRandomPasswordCommandName) {
+		return value, nil
+	}
+
+	cmdExecutor := cmdsubst.NewSecretOrRandomPasswordExecutor(p.keyvaultService, p.env.GetSubscriptionId())
+	replaced, err := cmdsubst.Eval(ctx, value, cmdExecutor)
+	if err != nil {
+		return "", fmt.Errorf("substituting command output: %w", err)
+	}
+	return replaced, nil
+}
+
+// loadParameters reads the parameters file template for environment/module specified by Options,
+// doing environment and command substitutions, and returns the values.
+func (p *BicepProvider) loadParameters(ctx context.Context, template *azure.ArmTemplate) (loadParametersResult, error) {
+	parametersFilename := fmt.Sprintf("%s.parameters.json", p.options.Module)
+	paramFilePath := filepath.Join(filepath.Dir(p.path), parametersFilename)
+	parametersBytes, err := os.ReadFile(paramFilePath)
+	// if the file does not exist, we return an empty parameters map
+	// This makes AZD to support deploying bicep modules without parameters file, assuming AZD prompts for all required
+	// parameters.
+	if os.IsNotExist(err) {
+		log.Printf("parameters file %s does not exist, using empty parameters", paramFilePath)
+		return loadParametersResult{}, nil
+	}
+	if err != nil {
+		return loadParametersResult{}, fmt.Errorf("reading parameters.json: %w", err)
+	}
+
+	principalId, err := p.curPrincipal.CurrentPrincipalId(ctx)
+	if err != nil {
+		return loadParametersResult{}, fmt.Errorf("fetching current principal id: %w", err)
+	}
+
+	principalType, err := p.curPrincipal.CurrentPrincipalType(ctx)
+	if err != nil {
+		return loadParametersResult{}, fmt.Errorf("fetching current principal type: %w", err)
+	}
+
+	var decodedParamsFile azure.ArmParameterFile
+	if err := json.Unmarshal(parametersBytes, &decodedParamsFile); err != nil {
+		return loadParametersResult{}, fmt.Errorf("error unmarshalling Bicep template parameters: %w", err)
+	}
+
+	parametersMappedToAzureLocation := []string{}
+	resolvedParams := map[string]azure.ArmParameter{}
+	envMapping := map[string][]string{}
+	virtualMapping := map[string]struct{}{}
+
+	// resolving each parameter to keep track of the name during the resolution.
+	// We used to resolve all the file before, supporting env var substitution at any part of the file.
+	// We want to support substitution only for the parameter value.
+	// We also need to identify which parameters are mapped to AZURE_LOCATION (if any).
+	// We also want to exclude parameters mapped to env vars which env var is not set (instead of using empty string).
+	for paramName, param := range decodedParamsFile.Parameters {
+		paramDef, hasDef := template.Parameters[paramName]
+		var paramType provisioning.ParameterType
+		if hasDef {
+			paramType = provisioning.ParameterTypeFromArmType(paramDef.Type)
+		}
+
+		// Path A: Handle complex types (array, object) with string values (like "${MY_ARRAY}")
+		if hasDef &&
+			(paramType == provisioning.ParameterTypeObject || paramType == provisioning.ParameterTypeArray) &&
+			param.KeyVaultReference == nil {
+			if stringVal, ok := param.Value.(string); ok {
+				// Run envsubst on just the string value, not the full parameter JSON
+				// This allows us to validate the substituted value as JSON,
+				// and avoid issues with string quoting in the parameters file.
+				replaced, substResult, err := evalParamEnvSubst(
+					stringVal,
+					principalId,
+					string(principalType),
+					paramName,
+					p.env,
+					p.options.VirtualEnv,
+				)
+				if err != nil {
+					return loadParametersResult{}, err
+				}
+
+				envMapping[paramName] = substResult.mappedEnvVars
+				parametersMappedToAzureLocation = append(
+					parametersMappedToAzureLocation, substResult.parametersMappedToAzureLocation...)
+
+				if substResult.hasVirtualEnvVar {
+					// Record the parameter as virtual, skip further processing
+					virtualMapping[paramName] = struct{}{}
+					continue
+				}
+
+				// Omit unset parameters
+				if replaced == "" && substResult.hasUnsetEnvVar {
+					continue
+				}
+
+				// Parse the substituted value as JSON (array/object)
+				var jsonValue any
+				if err := json.Unmarshal([]byte(replaced), &jsonValue); err != nil {
+					return loadParametersResult{}, fmt.Errorf(
+						"substituting parameter '%s' (%s): %w: value '%s' is not valid JSON",
+						paramName, paramDef.Type, err, replaced)
+				}
+
+				// Check for command substitution (like secretOrRandomPassword)
+				cmdSubstStr, err := p.evalCommandSubstitution(ctx, replaced)
+				if err != nil {
+					return loadParametersResult{}, err
+				}
+
+				// Re-parse after command substitution if it was applied
+				if cmdSubstStr != replaced {
+					if err := json.Unmarshal([]byte(cmdSubstStr), &jsonValue); err != nil {
+						return loadParametersResult{}, fmt.Errorf(
+							"command-substituting parameter '%s' (%s): %w: value '%s' is not valid JSON",
+							paramName, paramDef.Type, err, cmdSubstStr)
+					}
+				}
+
+				resolvedParams[paramName] = azure.ArmParameter{Value: jsonValue}
+				continue
+			}
+		}
+
+		// Path B: Handle all other cases: non-complex types, complex types with non-string values, keyvault refs
+		paramBytes, err := json.Marshal(param)
+		if err != nil {
+			return loadParametersResult{}, fmt.Errorf("error decoding deployment parameter %s: %w", paramName, err)
+		}
+
+		replaced, substResult, err := evalParamEnvSubst(
+			string(paramBytes),
+			principalId,
+			string(principalType),
+			paramName,
+			p.env,
+			p.options.VirtualEnv,
+		)
+		if err != nil {
+			return loadParametersResult{}, fmt.Errorf("substituting environment variables for %s: %w", paramName, err)
+		}
+
+		envMapping[paramName] = substResult.mappedEnvVars
+		parametersMappedToAzureLocation = append(
+			parametersMappedToAzureLocation, substResult.parametersMappedToAzureLocation...)
+
+		if substResult.hasVirtualEnvVar {
+			// Record the parameter as virtual, skip further processing
+			virtualMapping[paramName] = struct{}{}
+			continue
+		}
+
+		// resolve command substitutions like `secretOrRandomPassword`
+		replaced, err = p.evalCommandSubstitution(ctx, replaced)
+		if err != nil {
+			return loadParametersResult{}, err
+		}
+		var resolvedParam azure.ArmParameter
+		if err := json.Unmarshal([]byte(replaced), &resolvedParam); err != nil {
+			return loadParametersResult{}, fmt.Errorf("error unmarshalling Bicep template parameters: %w", err)
+		}
+		if resolvedParam.Value == nil && resolvedParam.KeyVaultReference == nil {
+			// ignore parameters that are not set
+			continue
+		}
+		if resolvedParam.Value != nil && resolvedParam.KeyVaultReference != nil {
+			return loadParametersResult{}, fmt.Errorf(
+				"parameter %s has both a value and a keyvault reference: %w", paramName, err)
+		}
+		if resolvedParam.KeyVaultReference != nil {
+			// parameter defined using a key vault reference. AZD does not validate the key vault reference
+			// if there is an issue with it, the deployment will fail.
+			resolvedParams[paramName] = resolvedParam
+			continue
+		}
+
+		// Ignore string parameters which are empty b/c they are mapped to an undefined env var
+		if stringValue, isString := resolvedParam.Value.(string); isString {
+			// After previous checks, we know resolvedParam.Value is not nil
+			if stringValue == "" && substResult.hasUnsetEnvVar {
+				// parameter is empty and has an unset env var
+				continue
+			}
+		}
+
+		// all other cases here represent a valid resolved parameter
+		resolvedParams[paramName] = resolvedParam
+	}
+
+	return loadParametersResult{
+		parameters:     resolvedParams,
+		locationParams: parametersMappedToAzureLocation,
+		envMapping:     envMapping,
+		virtualMapping: virtualMapping,
+	}, nil
+}
+
+type compiledBicepParamResult struct {
+	TemplateJson   string `json:"templateJson"`
+	ParametersJson string `json:"parametersJson"`
+}
+
+type compileBicepResult struct {
+	RawArmTemplate azure.RawArmTemplate
+	Template       azure.ArmTemplate
+	// Parameters are populated either by compiling a .bicepparam (automatically) or by azd after compiling a .bicep file.
+	Parameters azure.ArmParameters
+}
+
+// compileBicep compiles the bicep module at the given path and returns the compiled ARM template and parameters.
+// The results of the compilation are cached in memory.
+func (p *BicepProvider) compileBicep(ctx context.Context) (*compileBicepResult, error) {
+	if p.compileBicepMemoryCache != nil {
+		return p.compileBicepMemoryCache, nil
+	}
+
+	var compiled string
+	var parameters azure.ArmParameters
+
+	if p.mode == bicepparamMode {
+		azdEnv := p.env.Environ()
+		// append principalID (not stored to .env by default). For non-bicepparam, principalId is resolved
+		// without looking at .env
+		if _, exists := p.env.LookupEnv(environment.PrincipalIdEnvVarName); !exists {
+			currentPrincipalId, err := p.curPrincipal.CurrentPrincipalId(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("fetching current principal id for bicepparam compilation: %w", err)
+			}
+			azdEnv = append(azdEnv, fmt.Sprintf("%s=%s", environment.PrincipalIdEnvVarName, currentPrincipalId))
+		}
+		compiledResult, err := p.bicepCli.BuildBicepParam(ctx, p.path, azdEnv)
+		if err != nil {
+			return nil, fmt.Errorf("failed to compile bicepparam template: %w", err)
+		}
+		compiled = compiledResult.Compiled
+
+		var bicepParamOutput compiledBicepParamResult
+		if err := json.Unmarshal([]byte(compiled), &bicepParamOutput); err != nil {
+			log.Printf("failed unmarshalling compiled bicepparam (err: %v), template contents:\n%s", err, compiled)
+			return nil, fmt.Errorf("failed unmarshalling arm template from json: %w", err)
+		}
+		compiled = bicepParamOutput.TemplateJson
+		var params azure.ArmParameterFile
+		if err := json.Unmarshal([]byte(bicepParamOutput.ParametersJson), &params); err != nil {
+			log.Printf("failed unmarshalling compiled bicepparam parameters(err: %v), template contents:\n%s", err, compiled)
+			return nil, fmt.Errorf("failed unmarshalling arm parameters template from json: %w", err)
+		}
+		parameters = params.Parameters
+	} else {
+		res, err := p.bicepCli.Build(ctx, p.path)
+		if err != nil {
+			return nil, fmt.Errorf("failed to compile bicep template: %w", err)
+		}
+		compiled = res.Compiled
+	}
+
+	rawTemplate := azure.RawArmTemplate(compiled)
+
+	var template azure.ArmTemplate
+	if err := json.Unmarshal(rawTemplate, &template); err != nil {
+		log.Printf("failed unmarshalling compiled arm template to JSON (err: %v), template contents:\n%s", err, compiled)
+		return nil, fmt.Errorf("failed unmarshalling arm template from json: %w", err)
+	}
+
+	// update user-defined parameters
+	for paramKey, param := range template.Parameters {
+		paramRef := param.Ref
+		isUserDefinedType := paramRef != ""
+		if isUserDefinedType {
+			definitionKeyName, err := definitionName(paramRef)
+			if err != nil {
+				return nil, err
+			}
+			paramDefinition, findDefinition := template.Definitions[definitionKeyName]
+			if !findDefinition {
+				return nil, fmt.Errorf("did not find definition for parameter type: %s", definitionKeyName)
+			}
+			template.Parameters[paramKey] = azure.ArmTemplateParameterDefinition{
+				// Take this values from the parameter definition
+				Type:                 paramDefinition.Type,
+				AllowedValues:        paramDefinition.AllowedValues,
+				Properties:           paramDefinition.Properties,
+				AdditionalProperties: paramDefinition.AdditionalProperties,
+				// Azd combines Metadata from type definition and original parameter
+				// This allows to definitions to use azd-metadata on user-defined types and then add more properties
+				// to metadata or override something just for one parameter
+				Metadata: combineMetadata(paramDefinition.Metadata, param.Metadata),
+				// Keep this values from the original parameter
+				DefaultValue: param.DefaultValue,
+				// Note: Min/MaxLength and Min/MaxValue can't be used on user-defined types. No need to handle it here.
+			}
+		}
+	}
+
+	// outputs resolves just the type. Value and Metadata should persist
+	for outputKey, output := range template.Outputs {
+		paramRef := output.Ref
+		isUserDefinedType := paramRef != ""
+		if isUserDefinedType {
+			definitionKeyName, err := definitionName(paramRef)
+			if err != nil {
+				return nil, err
+			}
+			paramDefinition, findDefinition := template.Definitions[definitionKeyName]
+			if !findDefinition {
+				return nil, fmt.Errorf("did not find definition for parameter type: %s", definitionKeyName)
+			}
+			template.Outputs[outputKey] = azure.ArmTemplateOutput{
+				Type:     paramDefinition.Type,
+				Value:    output.Value,
+				Metadata: output.Metadata,
+			}
+		}
+	}
+	p.compileBicepMemoryCache = &compileBicepResult{
+		RawArmTemplate: rawTemplate,
+		Template:       template,
+		Parameters:     parameters,
+	}
+
+	return p.compileBicepMemoryCache, nil
+}
+
+func combineMetadata(base map[string]json.RawMessage, override map[string]json.RawMessage) map[string]json.RawMessage {
+	if base == nil && override == nil {
+		return nil
+	}
+
+	if override == nil {
+		return base
+	}
+
+	// final map is expected to be at least the same size as the base
+	finalMetadata := make(map[string]json.RawMessage, len(base))
+
+	maps.Copy(finalMetadata, base)
+
+	maps.Copy(finalMetadata, override)
+
+	return finalMetadata
+}
+
+func definitionName(typeDefinitionRef string) (string, error) {
+	// We typically expect `#/definitions/<name>` or `/definitions/<name>`, but loosely, we simply take
+	// `<name>` as the value of the last separated element.
+	definitionKeyNameTokens := strings.Split(typeDefinitionRef, "/")
+	definitionKeyNameTokensLen := len(definitionKeyNameTokens)
+	if definitionKeyNameTokensLen < 1 {
+		return "", fmt.Errorf("failed resolving user defined parameter type: %s", typeDefinitionRef)
+	}
+	return definitionKeyNameTokens[definitionKeyNameTokensLen-1], nil
+}
+
+// Converts a Bicep parameters file to a generic [provisioning.Deployment].
+func (p *BicepProvider) convertToDeployment(bicepTemplate azure.ArmTemplate) provisioning.Deployment {
+	result := provisioning.Deployment{}
+	parameters := make(map[string]provisioning.InputParameter)
+	outputs := make(map[string]provisioning.OutputParameter)
 
 	for key, param := range bicepTemplate.Parameters {
-		parameters[key] = InputParameter(param)
+		parameters[key] = provisioning.InputParameter{
+			Type:         string(provisioning.ParameterTypeFromArmType(param.Type)),
+			DefaultValue: param.DefaultValue,
+		}
 	}
 
 	for key, param := range bicepTemplate.Outputs {
-		outputs[key] = OutputParameter(param)
+		outputs[key] = provisioning.OutputParameter{
+			Type:  provisioning.ParameterTypeFromArmType(param.Type),
+			Value: param.Value,
+		}
 	}
 
-	template.Parameters = parameters
-	template.Outputs = outputs
+	result.Parameters = parameters
+	result.Outputs = outputs
 
-	return &template, nil
+	return result
+}
+
+// Provision validation outcome constants for telemetry.
+const (
+	provisionValidationOutcomePassed           = "passed"
+	provisionValidationOutcomeWarningsAccepted = "warnings_accepted"
+	provisionValidationOutcomeCanceledByErrors = "canceled_by_errors"
+	provisionValidationOutcomeCanceledByUser   = "canceled_by_user"
+	provisionValidationOutcomeSkipped          = "skipped"
+	provisionValidationOutcomeError            = "error"
+)
+
+// resolveProvisionValidationGates maps user config to the two independent
+// provision-validation gates. The two keys are deliberately separate:
+//   - `validation.provision=off` disables only azd's local (client-side)
+//     provision validation.
+//   - `provision.preflight=off` disables only the server-side ARM provision
+//     validation call.
+//
+// Each key controls its own step; neither key affects the other.
+func resolveProvisionValidationGates(userConfig config.Config) (skipValidation bool, skipArmPreflight bool) {
+	if val, exists := userConfig.GetString("validation.provision"); exists && val == "off" {
+		skipValidation = true
+	}
+	if val, exists := userConfig.GetString("provision.preflight"); exists && val == "off" {
+		skipArmPreflight = true
+	}
+	return skipValidation, skipArmPreflight
+}
+
+// validateProvision runs azd's pre-deployment provision validation on the ARM template.
+//
+// It performs up to two independent steps, each individually skippable via config:
+//   - local (client-side) provision validation (skipped when skipLocalValidation is true)
+//   - server-side ARM provision validation (skipped when skipArmPreflight is true)
+//
+// Only the local step is traced under the `validation.provision` telemetry event; the
+// server-side ARM call runs outside that span so its failures/latency are not attributed
+// to azd's local validation event.
+//
+// It returns (validation context, canceled, err) where:
+//   - canceled=true, err=nil: validation detected issues and provisioning should be skipped
+//     (exit code 0).
+//   - canceled=false, err!=nil: the validation itself failed to run (exit code 1).
+//   - canceled=false, err=nil: validation passed, proceed with provisioning.
+func (p *BicepProvider) validateProvision(
+	ctx context.Context,
+	target infra.Deployment,
+	modulePath string,
+	armTemplate azure.RawArmTemplate,
+	armParameters azure.ArmParameters,
+	tags map[string]*string,
+	options map[string]any,
+	skipLocalValidation bool,
+	skipArmPreflight bool,
+) (valCtx *validationContext, canceled bool, err error) {
+	// Local (client-side) provision validation, traced under the validation.provision event.
+	valCtx, canceled, err = p.traceLocalProvisionValidation(
+		ctx, target, modulePath, armTemplate, armParameters, skipLocalValidation)
+	if err != nil || canceled {
+		return valCtx, canceled, err
+	}
+
+	// Server-side ARM provision validation. Skipped independently via provision.preflight=off.
+	// This runs outside the validation.provision span on purpose so ARM preflight errors are
+	// not attributed to azd's local validation telemetry.
+	if skipArmPreflight {
+		return valCtx, false, nil
+	}
+	err = target.ValidatePreflight(ctx, armTemplate, armParameters, tags, options)
+	return valCtx, false, annotateDeploymentErrorResources(err, valCtx, armTemplate)
+}
+
+// traceLocalProvisionValidation runs (or skips) azd's local provision validation within the
+// `validation.provision` telemetry span and records the outcome attributes. It returns the
+// validation context and the same (canceled, err) semantics as validateProvision for the local step.
+func (p *BicepProvider) traceLocalProvisionValidation(
+	ctx context.Context,
+	target infra.Deployment,
+	modulePath string,
+	armTemplate azure.RawArmTemplate,
+	armParameters azure.ArmParameters,
+	skipLocalValidation bool,
+) (valCtx *validationContext, canceled bool, err error) {
+	ctx, span := tracing.Start(ctx, events.ProvisionValidationEvent)
+	defer func() {
+		span.EndWithStatus(err)
+	}()
+
+	// Tag the dispatch site so this Bicep "arm-provision" emission can be
+	// distinguished from the provider-agnostic "provision" dispatch, which
+	// shares ProvisionValidationEvent and also fires on Bicep provisions.
+	span.SetAttributes(fields.ProvisionValidationCheckTypeKey.String(azdext.ValidationCheckTypeArmProvision))
+
+	if skipLocalValidation {
+		p.setProvisionValidationOutcome(span, provisionValidationOutcomeSkipped, []string{})
+		// Emit the same empty/zero attribute shape as the other skipped paths so downstream
+		// telemetry queries see a consistent set of validation.provision.* fields.
+		span.SetAttributes(fields.ProvisionValidationRulesKey.StringSlice([]string{}))
+		span.SetAttributes(fields.ProvisionValidationDiagnosticsKey.StringSlice([]string{}))
+		span.SetAttributes(fields.ProvisionValidationWarningCountKey.Int(0))
+		span.SetAttributes(fields.ProvisionValidationErrorCountKey.Int(0))
+		return nil, false, nil
+	}
+
+	return p.runLocalProvisionValidation(ctx, span, target, modulePath, armTemplate, armParameters)
+}
+
+// runLocalProvisionValidation executes azd's local (client-side) provision validation
+// pipeline and reports findings to the user. It returns the validation context and
+// (canceled, err) using the same semantics as validateProvision (canceled=true means
+// provisioning should be skipped with exit code 0).
+func (p *BicepProvider) runLocalProvisionValidation(
+	ctx context.Context,
+	span tracing.Span,
+	target infra.Deployment,
+	modulePath string,
+	armTemplate azure.RawArmTemplate,
+	armParameters azure.ArmParameters,
+) (valCtx *validationContext, canceled bool, err error) {
+	// Local validation catches common issues without requiring a network round-trip.
+	// Resolve the environment location for RG-scoped deployments: prefer the actual
+	// resource group location (if the RG already exists), then fall back to AZURE_LOCATION.
+	envLocation := p.resolveResourceGroupLocation(
+		ctx, p.env.GetSubscriptionId())
+	if envLocation == "" {
+		envLocation = strings.ToLower(p.env.GetLocation())
+	}
+	validator := newProvisionValidator(
+		modulePath, p.bicepCli, target, envLocation)
+
+	// Register the role assignment permission check so it runs as part of the
+	// validation pipeline. The check inspects whether the template contains
+	// Microsoft.Authorization/roleAssignments and, if so, verifies the current
+	// principal has the required write permission.
+	validator.AddCheck(ProvisionValidationCheck{
+		RuleID: "role_assignment_permissions",
+		Fn:     p.checkRoleAssignmentPermissions,
+	})
+
+	validator.AddCheck(ProvisionValidationCheck{
+		RuleID: "ai_model_quota",
+		Fn:     p.checkAiModelQuota,
+	})
+
+	validator.AddCheck(ProvisionValidationCheck{
+		RuleID: "reserved_resource_names",
+		Fn:     p.checkReservedResourceNames,
+	})
+
+	valCtx, results, err := validator.validate(ctx, p.console, armTemplate, armParameters)
+	if err != nil {
+		p.setProvisionValidationOutcome(span, provisionValidationOutcomeError, nil)
+		return nil, false, fmt.Errorf("local provision validation failed: %w", err)
+	}
+
+	// Dispatch to extension-provided validation checks for the "arm-provision" check type.
+	// Extensions register checks via the validation-provider capability.
+	// The dispatcher is optional — if no extensions are loaded, skip silently.
+	var extRuleIDs []string
+	var dispatcher provisioning.ValidationCheckDispatcher
+	if resolveErr := p.serviceLocator.Resolve(&dispatcher); resolveErr == nil && valCtx != nil {
+		// Build context from the validation context — includes all serializable data
+		// (ARM template, parameters, snapshot, location). New fields added to
+		// validationContext.extensionContext() are automatically available to extensions.
+		checkContext := valCtx.extensionContext(armTemplate, armParameters)
+
+		// Bound extension dispatch so a blocked or unresponsive extension check
+		// cannot hang core validation. A timeout surfaces as extErr below and is
+		// treated as a non-fatal skip (logged; validation continues).
+		dispatchCtx, cancelDispatch := context.WithTimeout(ctx, extensionValidationTimeout)
+		extResults, invokedRuleIDs, extErr := dispatcher.DispatchChecks(
+			dispatchCtx, azdext.ValidationCheckTypeArmProvision, checkContext,
+		)
+		cancelDispatch()
+		if extErr != nil {
+			if errors.Is(extErr, context.DeadlineExceeded) {
+				log.Printf(
+					"extension validation checks timed out after %s; skipping: %v",
+					extensionValidationTimeout, extErr,
+				)
+			} else {
+				log.Printf("extension validation checks failed: %v", extErr)
+			}
+		}
+		extRuleIDs = append(extRuleIDs, invokedRuleIDs...)
+		for _, extResult := range extResults {
+			severity := ProvisionValidationCheckWarning
+			if extResult.Severity ==
+				azdext.ValidationCheckSeverity_VALIDATION_CHECK_SEVERITY_ERROR {
+				severity = ProvisionValidationCheckError
+			}
+			links := make([]ux.ProvisionValidationReportLink, len(extResult.Links))
+			for i, l := range extResult.Links {
+				links[i] = ux.ProvisionValidationReportLink{
+					Title: l.Text, URL: l.Url,
+				}
+			}
+			results = append(results, ProvisionValidationCheckResult{
+				Severity:     severity,
+				DiagnosticID: extResult.DiagnosticId,
+				Message:      extResult.Message,
+				Suggestion:   extResult.Suggestion,
+				Links:        links,
+			})
+		}
+	}
+
+	// Record the rule IDs that actually executed. This is done after validate()
+	// because validate() may skip checks entirely (e.g. when the bicep snapshot
+	// is unavailable). A nil result with nil error means checks were skipped.
+	if results == nil {
+		p.setProvisionValidationOutcome(span, provisionValidationOutcomeSkipped, nil)
+		// No rules actually executed; record an empty slice for telemetry.
+		span.SetAttributes(fields.ProvisionValidationRulesKey.StringSlice([]string{}))
+	} else {
+		ruleIDs := make([]string, len(validator.checks))
+		for i, check := range validator.checks {
+			ruleIDs[i] = check.RuleID
+		}
+		span.SetAttributes(fields.ProvisionValidationRulesKey.StringSlice(ruleIDs))
+	}
+
+	// Record extension-provided rule IDs separately for telemetry attribution.
+	if len(extRuleIDs) > 0 {
+		span.SetAttributes(fields.ProvisionValidationExtensionRulesKey.StringSlice(extRuleIDs))
+	}
+
+	// Compute telemetry metrics from the results.
+	var diagnosticIDs []string
+	var warningCount, errorCount int
+	for _, result := range results {
+		if result.DiagnosticID != "" {
+			diagnosticIDs = append(diagnosticIDs, result.DiagnosticID)
+		}
+		if result.Severity == ProvisionValidationCheckError {
+			errorCount++
+		} else {
+			warningCount++
+		}
+	}
+	span.SetAttributes(fields.ProvisionValidationDiagnosticsKey.StringSlice(diagnosticIDs))
+	span.SetAttributes(fields.ProvisionValidationWarningCountKey.Int(warningCount))
+	span.SetAttributes(fields.ProvisionValidationErrorCountKey.Int(errorCount))
+
+	// Build a UX report from the validation results and display it.
+	if len(results) > 0 {
+		report := &ux.ProvisionValidationReport{}
+		for _, result := range results {
+			report.Items = append(report.Items, ux.ProvisionValidationReportItem{
+				IsError:      result.Severity == ProvisionValidationCheckError,
+				DiagnosticID: result.DiagnosticID,
+				Message:      result.Message,
+				Suggestion:   result.Suggestion,
+				Links:        result.Links,
+			})
+		}
+		p.console.MessageUxItem(ctx, report)
+
+		if report.HasErrors() {
+			// Errors were already displayed by the UX report above. The validation
+			// successfully detected problems and provisioning is intentionally canceled.
+			// This is not an internal failure, so no error is returned (exit code 0).
+			p.console.Message(ctx, "Validation detected errors, provisioning canceled.")
+			p.setProvisionValidationOutcome(span, provisionValidationOutcomeCanceledByErrors, diagnosticIDs)
+			return valCtx, true, nil
+		}
+
+		if report.HasWarnings() {
+			p.console.Message(ctx, "")
+			continueDeployment, promptErr := p.console.Confirm(ctx, input.ConsoleOptions{
+				Message:      "Proceed with provisioning despite the warnings above?",
+				DefaultValue: true,
+			})
+			if promptErr != nil {
+				p.setProvisionValidationOutcome(
+					span, provisionValidationOutcomeError, diagnosticIDs,
+				)
+				return valCtx, false, fmt.Errorf(
+					"prompting for validation confirmation: %w", promptErr,
+				)
+			}
+			if !continueDeployment {
+				// User chose not to continue — this is an intentional cancel, not a failure.
+				p.setProvisionValidationOutcome(span, provisionValidationOutcomeCanceledByUser, diagnosticIDs)
+				return valCtx, true, nil
+			}
+			p.setProvisionValidationOutcome(span, provisionValidationOutcomeWarningsAccepted, diagnosticIDs)
+		}
+	} else if results != nil {
+		p.setProvisionValidationOutcome(span, provisionValidationOutcomePassed, nil)
+	}
+
+	return valCtx, false, nil
+}
+
+// setProvisionValidationOutcome records the validation outcome on both the span and as a usage-level
+// attribute so it can be correlated with the overall deployment result.
+func (p *BicepProvider) setProvisionValidationOutcome(
+	span tracing.Span,
+	outcome string,
+	diagnosticIDs []string,
+) {
+	span.SetAttributes(fields.ProvisionValidationOutcomeKey.String(outcome))
+
+	// Set usage-level attributes so the parent command span (cmd.provision / cmd.up) can
+	// correlate validation outcome with the final deployment result. This enables tracking
+	// false positives (warnings_accepted + deploy succeeds) and true positives
+	// (warnings_accepted + deploy fails).
+	tracing.SetUsageAttributes(
+		fields.ProvisionValidationOutcomeKey.String(outcome),
+		fields.ProvisionValidationDiagnosticsKey.StringSlice(diagnosticIDs),
+	)
+}
+
+// checkRoleAssignmentPermissions is a ProvisionValidationCheckFn that verifies the current principal
+// has Microsoft.Authorization/roleAssignments/write permission when the template contains
+// role assignments. The PermissionsService is resolved lazily via the service locator so it
+// is only instantiated when actually needed.
+//
+// For B2B/guest users, the principal's object ID differs between the home tenant and the
+// resource tenant. This check resolves the principal ID in the resource tenant context
+// (sub.TenantId) so that the role assignment query uses the correct identity.
+// See https://github.com/Azure/azure-dev/issues/7173 for the broader fix.
+func (p *BicepProvider) checkRoleAssignmentPermissions(
+	ctx context.Context, valCtx *validationContext,
+) ([]ProvisionValidationCheckResult, error) {
+	if !valCtx.Props.HasRoleAssignments {
+		return nil, nil
+	}
+
+	var permissionsService *azapi.PermissionsService
+	if err := p.serviceLocator.Resolve(&permissionsService); err != nil {
+		log.Printf(
+			"could not resolve PermissionsService, skipping role assignment permission check: %v", err)
+		return nil, nil
+	}
+
+	subscriptionId := p.env.GetSubscriptionId()
+
+	// Resolve the principal ID in the resource tenant context rather than the user-access
+	// (home) tenant. For B2B/guest users, CurrentPrincipalId returns the home-tenant oid,
+	// which does not match the guest identity in the resource tenant. The assignedTo() role
+	// assignment filter cannot resolve cross-tenant identities, causing false positive
+	// warnings. This is a tactical fix; see #7173 for the full CurrentPrincipalId fix.
+	principalId, err := p.resolveResourceTenantPrincipalId(ctx, subscriptionId)
+	if err != nil {
+		log.Printf(
+			"could not determine current principal, skipping role assignment permission check: %v", err)
+		return nil, nil
+	}
+
+	requiredActions := []string{
+		"Microsoft.Authorization/roleAssignments/write",
+	}
+
+	hasPermission, err := permissionsService.HasRequiredPermissions(
+		ctx, subscriptionId, principalId, requiredActions,
+	)
+	if err != nil {
+		log.Printf("error checking role assignment permissions, skipping check: %v", err)
+		return nil, nil
+	}
+
+	if !hasPermission.HasPermission {
+		return []ProvisionValidationCheckResult{{
+			Severity:     ProvisionValidationCheckWarning,
+			DiagnosticID: "role_assignment_missing",
+			Message: fmt.Sprintf(
+				"Principal %s lacks role assignment"+
+					" permissions on subscription %s\n"+
+					"The deployment includes role assignments"+
+					" and will fail without %s permission.",
+				output.WithHighLightFormat(
+					"(%s)", principalId),
+				output.WithHighLightFormat(subscriptionId),
+				output.WithGrayFormat(
+					"Microsoft.Authorization/"+
+						"roleAssignments/write"),
+			),
+			Suggestion: "Ensure you have the" +
+				" 'Role Based Access Control" +
+				" Administrator'," +
+				" 'User Access Administrator'," +
+				" 'Owner', or a custom role with" +
+				" 'Microsoft.Authorization/" +
+				"roleAssignments/write' assigned" +
+				" to your account.",
+		}}, nil
+	}
+
+	if hasPermission.Conditional {
+		return []ProvisionValidationCheckResult{{
+			Severity:     ProvisionValidationCheckWarning,
+			DiagnosticID: "role_assignment_conditional",
+			Message: fmt.Sprintf(
+				"Principal %s has conditional role"+
+					" assignment permissions on"+
+					" subscription %s\n"+
+					"An ABAC condition may restrict"+
+					" which roles can be assigned."+
+					" The deployment may fail if the"+
+					" condition does not permit the"+
+					" specific role assignments in"+
+					" the template.",
+				output.WithHighLightFormat(
+					"(%s)", principalId),
+				output.WithHighLightFormat(subscriptionId),
+			),
+		}}, nil
+	}
+
+	return nil, nil
+}
+
+// checkReservedResourceNames inspects predicted resource names and warns when a
+// resource name segment matches Azure's published reserved-word restrictions.
+// All violations are reported so users can resolve them in a single pass
+// instead of rediscovering new violations on each validation re-run.
+func (p *BicepProvider) checkReservedResourceNames(
+	_ context.Context, valCtx *validationContext,
+) ([]ProvisionValidationCheckResult, error) {
+	var results []ProvisionValidationCheckResult
+
+	const docsLink = "https://learn.microsoft.com/azure/azure-resource-manager/templates/error-reserved-resource-name"
+
+	for _, resource := range valCtx.SnapshotResources {
+		if isReservedNameCheckExempt(resource.Type) {
+			continue
+		}
+		for _, v := range findReservedResourceNameViolations(resource.Name) {
+			resourceName := output.WithHighLightFormat(
+				"%q", resource.Name)
+			resourceType := output.WithGrayFormat(
+				"(%s)", resource.Type)
+
+			results = append(results, ProvisionValidationCheckResult{
+				Severity:     ProvisionValidationCheckWarning,
+				DiagnosticID: "reserved_resource_name",
+				Message: fmt.Sprintf(
+					"Resource %s %s %s the"+
+						" reserved word %q\n"+
+						"Azure does not allow reserved"+
+						" words in resource names."+
+						" The deployment will fail.",
+					resourceName, resourceType,
+					v.matchType, v.reservedWord,
+				),
+				Links: []ux.ProvisionValidationReportLink{
+					{
+						URL:   docsLink,
+						Title: "Reserved resource name errors",
+					},
+				},
+			})
+		}
+	}
+
+	return results, nil
+}
+
+// checkAiModelQuota inspects the Bicep snapshot for cognitive services model deployments
+// and validates that the subscription has sufficient quota at each deployment location.
+// Returns a warning for each deployment that would exceed the available quota.
+func (p *BicepProvider) checkAiModelQuota(
+	ctx context.Context, valCtx *validationContext,
+) ([]ProvisionValidationCheckResult, error) {
+	if len(valCtx.Props.CognitiveDeployments) == 0 {
+		return nil, nil
+	}
+
+	if p.aiModelService == nil {
+		log.Printf("AI model service not configured, skipping quota check")
+		return nil, nil
+	}
+
+	subscriptionId := p.env.GetSubscriptionId()
+	if subscriptionId == "" {
+		log.Printf("no subscription ID set, skipping AI model quota check")
+		return nil, nil
+	}
+
+	// Use the pre-resolved fallback location from the validation context.
+	// This was already resolved in validateProvision from the actual RG
+	// location or AZURE_LOCATION, so we avoid a duplicate API call.
+	fallbackLocation := strings.ToLower(valCtx.EnvLocation)
+
+	// Group deployments by location to minimize API calls.
+	byLocation := map[string][]cognitiveDeploymentInfo{}
+	for _, dep := range valCtx.Props.CognitiveDeployments {
+		loc := strings.ToLower(dep.Location)
+		if loc == "" {
+			loc = fallbackLocation
+		}
+		if loc == "" {
+			log.Printf(
+				"skipping quota check for deployment %q: "+
+					"could not determine location",
+				dep.Name)
+			continue
+		}
+		byLocation[loc] = append(byLocation[loc], dep)
+	}
+
+	var results []ProvisionValidationCheckResult
+
+	for _, loc := range slices.Sorted(maps.Keys(byLocation)) {
+		deps := byLocation[loc]
+		usages, err := p.aiModelService.ListUsages(ctx, subscriptionId, loc)
+		if err != nil {
+			log.Printf("failed to fetch AI quota for location %s, skipping: %v", loc, err)
+			continue
+		}
+
+		// Build a lookup map from usage name → remaining quota.
+		usageMap := map[string]float64{}
+		for _, u := range usages {
+			usageMap[u.Name] = u.Limit - u.CurrentValue
+		}
+
+		// Fetch the model catalog for this location to resolve usage names.
+		// The usage name (e.g. "OpenAI.GlobalStandard.gpt-4.1-mini") comes from the Azure
+		// model catalog — it cannot be reliably constructed from template data because the
+		// naming convention isn't a simple "{Format}.{SkuName}.{ModelName}" concatenation.
+		catalogModels, catalogErr := p.aiModelService.ListModels(ctx, subscriptionId, []string{loc})
+		if catalogErr != nil {
+			log.Printf("failed to fetch AI model catalog for %s, skipping: %v", loc, catalogErr)
+			continue
+		}
+
+		// Aggregate required capacity per usage name so that multiple deployments
+		// sharing the same quota pool are checked against their combined demand.
+		requiredByUsage := map[string]float64{}
+		type depWithUsage struct {
+			dep       cognitiveDeploymentInfo
+			usageName string
+			capacity  float64
+		}
+		var resolved []depWithUsage
+
+		for _, dep := range deps {
+			usageName := resolveUsageName(catalogModels, dep)
+			if usageName == "" {
+				// Model/SKU/version combo not found in the catalog — warn the user.
+				var detailParts []string
+				if dep.SkuName != "" {
+					detailParts = append(detailParts,
+						fmt.Sprintf("SKU: %s", dep.SkuName))
+				}
+				if dep.ModelVersion != "" {
+					detailParts = append(detailParts,
+						fmt.Sprintf("version %q", dep.ModelVersion))
+				}
+				details := ""
+				if len(detailParts) > 0 {
+					details = fmt.Sprintf(
+						" (%s)", strings.Join(detailParts, ", "))
+				}
+				results = append(results, ProvisionValidationCheckResult{
+					Severity:     ProvisionValidationCheckWarning,
+					DiagnosticID: "ai_model_not_found",
+					Message: fmt.Sprintf(
+						"Model %s%s not found in %s\n"+
+							"Model not found in AI model catalog."+
+							" Provisioning will likely fail.",
+						output.WithHighLightFormat(
+							"%q", dep.ModelName),
+						output.WithGrayFormat(details),
+						output.WithHighLightFormat(loc),
+					),
+					Suggestion: "Verify the model name, SKU," +
+						" and version are correct.",
+					Links: []ux.ProvisionValidationReportLink{
+						{
+							URL: "https://learn.microsoft.com/" +
+								"azure/ai-services/openai/" +
+								"concepts/models",
+							Title: "Azure OpenAI supported" +
+								" models and regions",
+						},
+					},
+				})
+				continue
+			}
+
+			effectiveCapacity := float64(dep.Capacity)
+			if effectiveCapacity <= 0 {
+				effectiveCapacity = 1
+			}
+
+			requiredByUsage[usageName] += effectiveCapacity
+			resolved = append(resolved, depWithUsage{
+				dep:       dep,
+				usageName: usageName,
+				capacity:  effectiveCapacity,
+			})
+		}
+
+		// Check aggregated capacity against remaining quota.
+		// Skip when the /usages API returned an empty list (e.g. free-tier
+		// subscriptions that have not yet provisioned Cognitive Services
+		// resources).  Empty usages means no consumption data is
+		// available — not that quota is zero.  The model-catalog
+		// validation above still runs so that ai_model_not_found
+		// warnings are surfaced regardless.
+		if len(usages) == 0 {
+			continue
+		}
+
+		reportedUsage := map[string]bool{}
+		for _, r := range resolved {
+			if reportedUsage[r.usageName] {
+				continue // already reported for this usage name
+			}
+
+			remaining, found := usageMap[r.usageName]
+			if !found {
+				// Usage entry not returned by the API — treat as zero remaining
+				// to avoid silently skipping quota validation.
+				remaining = 0
+			}
+
+			totalRequired := requiredByUsage[r.usageName]
+			if remaining < totalRequired {
+				reportedUsage[r.usageName] = true
+
+				var suggestion string
+				if remaining > 0 {
+					suggestion = fmt.Sprintf(
+						"Reduce the requested capacity"+
+							" to %.0f or change your"+
+							" deployment location via %s."+
+							" You can also request a quota"+
+							" increase in the Azure portal.",
+						remaining,
+						output.WithHighLightFormat(
+							"azd env set"+
+								" AZURE_LOCATION <location>"),
+					)
+				} else {
+					suggestion = fmt.Sprintf(
+						"No quota is available."+
+							" Change your deployment"+
+							" location via %s or request"+
+							" a quota increase in the"+
+							" Azure portal.",
+						output.WithHighLightFormat(
+							"azd env set"+
+								" AZURE_LOCATION <location>"),
+					)
+				}
+
+				results = append(results, ProvisionValidationCheckResult{
+					Severity:     ProvisionValidationCheckWarning,
+					DiagnosticID: "ai_model_quota_exceeded",
+					Message: fmt.Sprintf(
+						"Insufficient quota for model %s %s"+
+							" in %s\n"+
+							"Requested: %.0f · Available: %.0f",
+						output.WithHighLightFormat(
+							"%q", r.dep.ModelName),
+						output.WithGrayFormat(
+							"(SKU: %s)", r.dep.SkuName),
+						output.WithHighLightFormat(loc),
+						totalRequired,
+						remaining,
+					),
+					Suggestion: suggestion,
+					Links: []ux.ProvisionValidationReportLink{
+						{
+							URL:   "https://learn.microsoft.com/azure/quotas/quickstart-increase-quota-portal",
+							Title: "Increase Azure subscription quotas",
+						},
+					},
+				})
+			}
+		}
+	}
+
+	return results, nil
+}
+
+// resolveUsageName looks up the authoritative usage name from the Azure model catalog
+// for a cognitive deployment. The usage name is a quota API identifier (e.g.
+// "OpenAI.GlobalStandard.gpt-4.1-mini") that may differ from a naive concatenation
+// of the template's model format, SKU, and model name.
+func resolveUsageName(catalogModels []ai.AiModel, dep cognitiveDeploymentInfo) string {
+	for _, model := range catalogModels {
+		if !strings.EqualFold(model.Name, dep.ModelName) {
+			continue
+		}
+		if dep.ModelFormat != "" && !strings.EqualFold(model.Format, dep.ModelFormat) {
+			continue
+		}
+		for _, version := range model.Versions {
+			// If the template specifies a version, match it; otherwise accept any version.
+			if dep.ModelVersion != "" &&
+				!strings.EqualFold(version.Version, dep.ModelVersion) {
+				continue
+			}
+			for _, sku := range version.Skus {
+				if strings.EqualFold(sku.Name, dep.SkuName) {
+					return sku.UsageName
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// reservedNameViolation describes a single reserved-word match against a
+// resource name segment.
+type reservedNameViolation struct {
+	segment      string
+	reservedWord string
+	matchType    string
+}
+
+// findReservedResourceNameViolations returns every reserved-word violation
+// found in resourceName. A single resource can produce multiple violations
+// (for example "LoginMicrosoftApp" triggers both the LOGIN prefix and the
+// MICROSOFT substring rule), so all matches are returned to avoid fix-rerun
+// cycles during validation.
+//
+// Only the trailing `/`-delimited segment of the name is evaluated. For child
+// resources, ARM emits the name as `<parent>/<child>` (and `<grandparent>/...`
+// for deeper children), but the parent is also enumerated separately in the
+// snapshot and is checked on its own pass — re-scanning the parent prefix
+// under each child would duplicate warnings whenever a parent name contains a
+// reserved word.
+func findReservedResourceNameViolations(resourceName string) []reservedNameViolation {
+	// Skip names that are unresolved ARM template expressions (e.g. "[guid(...)]").
+	// These are evaluated at deployment time and the literal text inside the expression
+	// (which often contains provider namespaces like "Microsoft.ContainerRegistry") is
+	// not the actual resource name.
+	if strings.HasPrefix(resourceName, "[") {
+		return nil
+	}
+
+	// Evaluate only the trailing path segment so child resources don't re-flag
+	// reserved words already reported on their parents.
+	segment := resourceName
+	if idx := strings.LastIndex(resourceName, "/"); idx >= 0 {
+		segment = resourceName[idx+1:]
+	}
+	if segment == "" {
+		return nil
+	}
+
+	var violations []reservedNameViolation
+	normalized := strings.ToUpper(segment)
+	if _, found := azureReservedResourceNameExactMatches[normalized]; found {
+		// An exact match subsumes any prefix/substring match on the same segment,
+		// so skip the remaining checks to avoid duplicate reports.
+		return []reservedNameViolation{{
+			segment:      segment,
+			reservedWord: normalized,
+			matchType:    "exactly matches",
+		}}
+	}
+
+	if strings.HasPrefix(normalized, azureReservedResourceNamePrefixMatch) {
+		violations = append(violations, reservedNameViolation{
+			segment:      segment,
+			reservedWord: azureReservedResourceNamePrefixMatch,
+			matchType:    "starts with",
+		})
+	}
+
+	for _, reservedWord := range azureReservedResourceNameContainsMatches {
+		if strings.Contains(normalized, reservedWord) {
+			violations = append(violations, reservedNameViolation{
+				segment:      segment,
+				reservedWord: reservedWord,
+				matchType:    "contains",
+			})
+		}
+	}
+
+	return violations
+}
+
+// resolveResourceGroupLocation returns the Azure location of the resource group specified
+// in AZURE_RESOURCE_GROUP. Returns empty string if the env var is not set or the lookup fails.
+func (p *BicepProvider) resolveResourceGroupLocation(ctx context.Context, subscriptionId string) string {
+	if subscriptionId == "" {
+		return ""
+	}
+
+	rgName, has := p.env.LookupEnv(environment.ResourceGroupEnvVarName)
+	if !has || rgName == "" {
+		return ""
+	}
+
+	rg, err := p.resourceService.GetResourceGroup(
+		ctx, subscriptionId, rgName)
+	if err != nil {
+		log.Printf(
+			"could not get resource group %q location: %v",
+			rgName, err)
+		return ""
+	}
+
+	return strings.ToLower(rg.Location)
+}
+
+// resolveResourceTenantPrincipalId returns the current user's object ID as seen in the
+// subscription's resource tenant. This is needed because B2B/guest users have a different
+// object ID in the resource tenant than in their home tenant. Returns an error if the
+// resource tenant principal cannot be resolved; the caller should skip the check rather
+// than fall back to the home-tenant oid (which would produce false positive warnings).
+func (p *BicepProvider) resolveResourceTenantPrincipalId(
+	ctx context.Context, subscriptionId string,
+) (string, error) {
+	sub, err := p.subscriptionManager.GetSubscription(ctx, subscriptionId)
+	if err != nil {
+		return "", fmt.Errorf("getting subscription %s: %w", subscriptionId, err)
+	}
+
+	var userProfileService *azapi.UserProfileService
+	if err := p.serviceLocator.Resolve(&userProfileService); err != nil {
+		return "", fmt.Errorf("resolving UserProfileService: %w", err)
+	}
+
+	// Call Graph /me against the resource tenant to get the guest oid.
+	principalId, err := azureutil.GetCurrentPrincipalId(ctx, userProfileService, sub.TenantId)
+	if err != nil {
+		return "", fmt.Errorf(
+			"resolving principal in resource tenant %s: %w", sub.TenantId, err)
+	}
+
+	return principalId, nil
 }
 
 // Deploys the specified Bicep module and parameters with the selected provisioning scope (subscription vs resource group)
-func (p *BicepProvider) deployModule(ctx context.Context, scope infra.Scope, bicepPath string, parametersPath string) (*azcli.AzCliDeployment, error) {
-	// We've seen issues where `Deploy` completes but for a short while after, fetching the deployment fails with a `DeploymentNotFound` error.
-	// Since other commands of ours use the deployment, let's try to fetch it here and if we fail with `DeploymentNotFound`,
-	// ignore this error, wait a short while and retry.
-	if err := scope.Deploy(ctx, bicepPath, parametersPath); err != nil {
-		return nil, fmt.Errorf("failed deploying: %w", err)
+func (p *BicepProvider) deployModule(
+	ctx context.Context,
+	target infra.Deployment,
+	armTemplate azure.RawArmTemplate,
+	armParameters azure.ArmParameters,
+	tags map[string]*string,
+	options map[string]any,
+	valCtx *validationContext,
+) (*azapi.ResourceDeployment, error) {
+	deployResult, err := target.Deploy(ctx, armTemplate, armParameters, tags, options)
+	return deployResult, annotateDeploymentErrorResources(err, valCtx, armTemplate)
+}
+
+// inputsParameter generates and updates input parameters for the Azure Resource Manager (ARM) template.
+// It takes an existingInputs map that contains the current input values for each resource, and an autoGenParameters map
+// that contains information about the input parameters to be generated.
+// The method iterates over the autoGenParameters map and checks if each input parameter already exists in the existingInputs
+// map.
+// If an input parameter does not exist, a new value is generated and added to the existingInputs map.
+// The method returns an azure.ArmParameterValue struct that contains the updated existingInputs map, a boolean indicating
+// whether new inputs were written, and an error if any occurred during the generation of input values.
+func inputsParameter(
+	existingInputs map[string]map[string]any, autoGenParameters map[string]map[string]azure.AutoGenInput) (
+	inputsParameter azure.ArmParameter, inputsUpdated bool, err error) {
+	wroteNewInput := false
+
+	for inputResource, inputResourceInfo := range autoGenParameters {
+		existingRecordsForResource := make(map[string]any)
+		if current, exists := existingInputs[inputResource]; exists {
+			existingRecordsForResource = current
+		}
+		for inputName, inputInfo := range inputResourceInfo {
+			if _, has := existingRecordsForResource[inputName]; !has {
+				val, err := password.Generate(password.GenerateConfig{
+					Length:     inputInfo.Length,
+					NoLower:    inputInfo.NoLower,
+					NoUpper:    inputInfo.NoUpper,
+					NoNumeric:  inputInfo.NoNumeric,
+					NoSpecial:  inputInfo.NoSpecial,
+					MinLower:   inputInfo.MinLower,
+					MinUpper:   inputInfo.MinUpper,
+					MinNumeric: inputInfo.MinNumeric,
+					MinSpecial: inputInfo.MinSpecial,
+				},
+				)
+				if err != nil {
+					return inputsParameter, inputsUpdated, fmt.Errorf("generating value for input %s: %w", inputName, err)
+				}
+				existingRecordsForResource[inputName] = val
+				wroteNewInput = true
+			}
+		}
+		existingInputs[inputResource] = existingRecordsForResource
 	}
 
-	var deployment azcli.AzCliDeployment
-	var err error
+	return azure.ArmParameter{
+		Value: existingInputs,
+	}, wroteNewInput, nil
+}
 
-	for i := 0; i < 10; i++ {
-		time.Sleep(time.Duration(math.Min(float64(i), 3)*10) * time.Second)
-		deployment, err = scope.GetDeployment(ctx)
-		if errors.Is(err, azcli.ErrDeploymentNotFound) {
+// ensureParameters validates that all parameters from the template are defined.
+// Parameters values can be defined in the parameters file (main.parameters.json). This file supports mapping values to
+// environment variables.
+// If a parameter is not defined in the parameters file AND there is not a default value defined in the template for it,
+// AZD will prompt the user for a value.
+// Parameters mapped to env var ${AZURE_LOCATION} are identified as location parameters for AZD during prompting. AZD will
+// prompt just for one location and save the value in AZD's .env file as AZURE_LOCATION and the value is used for all
+// parameters mapped to that env var.
+// AZD supports resolving env vars with a default value defined in the parameters file using the syntax
+// ${AZURE_LOCATION=defaultValue}. If the env var is not set, the default value will be used.
+func (p *BicepProvider) ensureParameters(
+	ctx context.Context,
+	template azure.ArmTemplate,
+) (azure.ArmParameters, error) {
+	//snapshot the AZURE_LOCATIOn in azd env if it is set in System env
+	locationSystemEnv, hasLocation := os.LookupEnv(environment.LocationEnvVarName)
+	_, hasAzdLocation := p.env.Dotenv()[environment.LocationEnvVarName]
+	if hasLocation && !hasAzdLocation && locationSystemEnv != "" {
+		p.env.SetLocation(locationSystemEnv)
+		if err := p.envManager.Save(ctx, p.env); err != nil {
+			return nil, fmt.Errorf("saving location to .env: %w", err)
+		}
+	}
+	// using loadParameters to resolve the parameters file (usually main.parameters.json)
+	// parameters with a mapping to env vars are resolved.
+	// Parameters mapped to env vars that are not set in the environment are removed from the parameters file
+	parametersResult, err := p.loadParameters(ctx, &template)
+	if err != nil {
+		return nil, fmt.Errorf("resolving bicep parameters file: %w", err)
+	}
+	parameters := parametersResult.parameters
+	locationParameters := parametersResult.locationParams
+	virtualParameters := parametersResult.virtualMapping
+
+	if len(template.Parameters) == 0 {
+		return azure.ArmParameters{}, nil
+	}
+	configuredParameters := make(azure.ArmParameters, len(template.Parameters))
+
+	sortedKeys := slices.Sorted(maps.Keys(template.Parameters))
+
+	configModified := false
+
+	var parameterPrompts []struct {
+		key   string
+		param azure.ArmTemplateParameterDefinition
+	}
+
+	// make all parameters mapped to AZURE_LOCATION env var to be location parameters
+	for _, key := range sortedKeys {
+		param := template.Parameters[key]
+		if slices.Contains(locationParameters, key) {
+			azdMetadata, hasAzdMetadata := param.AzdMetadata()
+			if !hasAzdMetadata {
+				azdMetadata = azure.AzdMetadata{
+					Type: to.Ptr(azure.AzdMetadataTypeLocation),
+				}
+			}
+			if azdMetadata.Type == nil {
+				azdMetadata.Type = to.Ptr(azure.AzdMetadataTypeLocation)
+			}
+			if azdMetadata.Type != nil && *azdMetadata.Type != azure.AzdMetadataTypeLocation {
+				return nil, fmt.Errorf(
+					"parameter %s is mapped to AZURE_LOCATION but has a different azd metadata type: %s."+
+						"Parameters mapped to AZURE_LOCATION can only be typed as location",
+					key,
+					*azdMetadata.Type)
+			}
+			mdBytes, err := json.Marshal(azdMetadata)
+			if err != nil {
+				return nil, fmt.Errorf("marshalling azd metadata: %w", err)
+			}
+			if param.Metadata == nil {
+				param.Metadata = map[string]json.RawMessage{"azd": mdBytes}
+			} else {
+				param.Metadata["azd"] = mdBytes
+			}
+			template.Parameters[key] = param
+		}
+	}
+
+	for _, key := range sortedKeys {
+		param := template.Parameters[key]
+		parameterType := provisioning.ParameterTypeFromArmType(param.Type)
+		azdMetadata, hasMetadata := param.AzdMetadata()
+
+		// If a value is marked virtual, we skip configuration entirely
+		if _, has := virtualParameters[key]; has {
 			continue
-		} else if err != nil {
-			return nil, fmt.Errorf("failed waiting for deployment: %w", err)
+		}
+
+		// If a value is explicitly configured via a parameters file, use it.
+		if v, has := parameters[key]; has {
+			// Directly pass through Key Vault references without prompting.
+			if v.KeyVaultReference != nil {
+				configuredParameters[key] = azure.ArmParameter{
+					KeyVaultReference: v.KeyVaultReference,
+				}
+				continue
+			}
+
+			paramValue := armParameterFileValue(parameterType, v.Value, param.DefaultValue)
+			if paramValue != nil {
+
+				if stringValue, isString := paramValue.(string); isString && param.Secure() {
+					// For secure parameters using a string value, azd checks if the string is an Azure Key Vault Secret
+					// and if yes, it fetches the secret value from the Key Vault.
+					if keyvault.IsAzureKeyVaultSecret(stringValue) {
+						paramValue, err = p.keyvaultService.SecretFromAkvs(ctx, stringValue)
+						if err != nil {
+							return nil, err
+						}
+					}
+				}
+
+				configuredParameters[key] = azure.ArmParameter{
+					Value: paramValue,
+				}
+				continue
+			}
+		}
+
+		// If this parameter has a default, then there is no need for us to configure it.
+		if param.DefaultValue != nil {
+			continue
+		}
+
+		if param.Nullable != nil && *param.Nullable {
+			// If the parameter is nullable, we can skip prompting for it.
+			continue
+		}
+
+		// This required parameter was not in parameters file - see if we stored a value in config from an earlier
+		// prompt and if so use it.
+		configKey := fmt.Sprintf("infra.parameters.%s", key)
+
+		if v, has := p.env.Config.Get(configKey); has {
+			if isValueAssignableToParameterType(parameterType, v) {
+				configuredParameters[key] = azure.ArmParameter{
+					Value: v,
+				}
+				continue
+			} else {
+				// The saved value is no longer valid (perhaps the user edited their template to change the type of a)
+				// parameter and then re-ran `azd provision`. Forget the saved value (if we can) and prompt for a new one.
+				_ = p.env.Config.Unset("infra.parameters.%s")
+			}
+		}
+
+		// If the parameter is tagged with {type: "generate"}, skip prompting.
+		// We generate it once, then save to config for next attempts.`.
+		if hasMetadata && parameterType == provisioning.ParameterTypeString && azdMetadata.Type != nil &&
+			*azdMetadata.Type == azure.AzdMetadataTypeGenerate {
+
+			// - generate once
+			genValue, err := autoGenerate(key, azdMetadata)
+			if err != nil {
+				return nil, err
+			}
+			configuredParameters[key] = azure.ArmParameter{
+				Value: genValue,
+			}
+			mustSetParamAsConfig(key, genValue, p.env.Config, param.Secure())
+			configModified = true
+			continue
+		}
+
+		// No saved value for this required parameter, we'll need to prompt for it.
+		parameterPrompts = append(parameterPrompts, struct {
+			key   string
+			param azure.ArmTemplateParameterDefinition
+		}{key: key, param: param})
+	}
+
+	// If in no-prompt mode and there are missing parameters, return an error with all missing inputs
+	if len(parameterPrompts) > 0 && p.console.IsNoPromptMode() {
+		return nil, p.buildMissingInputsError(parameterPrompts, parametersResult.envMapping)
+	}
+
+	if len(parameterPrompts) > 0 {
+		if p.console.SupportsPromptDialog() {
+
+			dialog := input.PromptDialog{
+				Title: "Configure required deployment parameters",
+				Description: "The following parameters are required for deployment. " +
+					"Provide values for each parameter. They will be saved for future deployments.",
+			}
+
+			for _, prompt := range parameterPrompts {
+				dialog.Prompts = append(dialog.Prompts, p.promptDialogItemForParameter(prompt.key, prompt.param))
+			}
+
+			values, err := p.console.PromptDialog(ctx, dialog)
+			if err != nil {
+				return nil, fmt.Errorf("prompting for values: %w", err)
+			}
+
+			for _, prompt := range parameterPrompts {
+				key := prompt.key
+				value := values[prompt.key]
+				mustSetParamAsConfig(key, value, p.env.Config, prompt.param.Secure())
+				configModified = true
+				configuredParameters[key] = azure.ArmParameter{
+					Value: value,
+				}
+			}
 		} else {
-			return &deployment, nil
+			for _, prompt := range parameterPrompts {
+				key := prompt.key
+
+				// Otherwise, prompt for the value.
+				value, err := p.promptForParameter(ctx, key, prompt.param, locationParameters)
+				if err != nil {
+					return nil, fmt.Errorf("prompting for value: %w", err)
+				}
+
+				if key != "location" {
+					// location param is special.
+					// It is not persisted in config, it is set in the .env directly
+					mustSetParamAsConfig(key, value, p.env.Config, prompt.param.Secure())
+				}
+				configModified = true
+				configuredParameters[key] = azure.ArmParameter{
+					Value: value,
+				}
+			}
 		}
 	}
 
-	return nil, fmt.Errorf("timed out waiting for deployment: %w", err)
-}
-
-// Gets the path to the project parameters file path
-func (p *BicepProvider) parametersTemplateFilePath() string {
-	infraPath := p.options.Path
-	if strings.TrimSpace(infraPath) == "" {
-		infraPath = "infra"
-	}
-
-	parametersFilename := fmt.Sprintf("%s.parameters.json", p.options.Module)
-	return filepath.Join(p.projectPath, infraPath, parametersFilename)
-}
-
-// Gets the folder path to the specified module
-func (p *BicepProvider) modulePath() string {
-	infraPath := p.options.Path
-	if strings.TrimSpace(infraPath) == "" {
-		infraPath = "infra"
-	}
-
-	moduleFilename := fmt.Sprintf("%s.bicep", p.options.Module)
-	return filepath.Join(p.projectPath, infraPath, moduleFilename)
-}
-
-// Ensures the provisioning parameters are valid and prompts the user for input as needed
-func (p *BicepProvider) ensureParameters(ctx context.Context, deployment *Deployment) (bool, error) {
-	if len(deployment.Parameters) == 0 {
-		return false, nil
-	}
-
-	updatedParameters := false
-	for key, param := range deployment.Parameters {
-		// If this parameter has a default, then there is no need for us to configure it
-		if param.HasDefaultValue() {
-			continue
-		}
-		if !param.HasValue() {
-			userValue, err := p.console.Prompt(ctx, input.ConsoleOptions{
-				Message: fmt.Sprintf("Please enter a value for the '%s' deployment parameter:", key),
-			})
-
-			if err != nil {
-				return false, fmt.Errorf("prompting for deployment parameter: %w", err)
-			}
-
-			param.Value = userValue
-
-			saveParameter, err := p.console.Confirm(ctx, input.ConsoleOptions{
-				Message: "Save the value in the environment for future use",
-			})
-
-			if err != nil {
-				return false, fmt.Errorf("prompting to save deployment parameter: %w", err)
-			}
-
-			if saveParameter {
-				p.env.Values[key] = userValue
-			}
-
-			updatedParameters = true
+	if configModified {
+		if err := p.envManager.Save(ctx, p.env); err != nil {
+			return nil, fmt.Errorf("saving prompt values: %w", err)
 		}
 	}
+	return configuredParameters, nil
+}
 
-	return updatedParameters, nil
+var configInfraParametersKey = "infra.parameters."
+
+// mustSetParamAsConfig sets the specified key-value pair in the given config.Config object.
+// If the isSecured flag is set to true, the value is set as a secret using config.SetSecret,
+// otherwise it is set using config.Set.
+// If an error occurs while setting the value, the function panics with a warning message.
+func mustSetParamAsConfig(key string, value any, config config.Config, isSecured bool) {
+	configKey := configInfraParametersKey + key
+
+	if !isSecured {
+		if err := config.Set(configKey, value); err != nil {
+			log.Panicf("failed setting config value: %v", err)
+		}
+		return
+	}
+
+	secretString, castOk := value.(string)
+	if !castOk {
+		log.Panic("tried to set a non-string as secret. This is not supported.")
+	}
+	if err := config.SetSecret(configKey, secretString); err != nil {
+		log.Panicf("failed setting a secret in config: %v", err)
+	}
+}
+
+// Convert the ARM parameters file value into a value suitable for deployment
+func armParameterFileValue(paramType provisioning.ParameterType, value any, defaultValue any) any {
+	// Quick return if the value being converted is not a string
+	if value == nil || reflect.TypeOf(value).Kind() != reflect.String {
+		return value
+	}
+
+	// Relax the handling of bool and number types to accept convertible strings
+	switch paramType {
+	case provisioning.ParameterTypeBoolean:
+		if val, ok := value.(string); ok {
+			if boolVal, err := strconv.ParseBool(val); err == nil {
+				return boolVal
+			}
+		}
+	case provisioning.ParameterTypeNumber:
+		if val, ok := value.(string); ok {
+			if intVal, err := strconv.ParseInt(val, 10, 64); err == nil {
+				return intVal
+			}
+		}
+	case provisioning.ParameterTypeString:
+		// Use Cases
+		// 1. Non-empty input value, return input value (no prompt)
+		// 2. Empty input value and no default - return nil (prompt user)
+		// 3. Empty input value and non-empty default - return empty input string (no prompt)
+		paramVal, paramValid := value.(string)
+		if paramValid && paramVal != "" {
+			return paramVal
+		}
+
+		defaultVal, hasDefault := defaultValue.(string)
+		if hasDefault && paramValid && paramVal != defaultVal {
+			return paramVal
+		}
+	default:
+		return value
+	}
+
+	return nil
+}
+
+func isValueAssignableToParameterType(paramType provisioning.ParameterType, value any) bool {
+	switch paramType {
+	case provisioning.ParameterTypeArray:
+		_, ok := value.([]any)
+		return ok
+	case provisioning.ParameterTypeBoolean:
+		_, ok := value.(bool)
+		return ok
+	case provisioning.ParameterTypeNumber:
+		switch t := value.(type) {
+		case int, int8, int16, int32, int64:
+			return true
+		case uint, uint8, uint16, uint32, uint64:
+			return true
+		case float32:
+			return float64(t) == math.Trunc(float64(t))
+		case float64:
+			return t == math.Trunc(t)
+		case json.Number:
+			_, err := t.Int64()
+			return err == nil
+		default:
+			return false
+		}
+	case provisioning.ParameterTypeObject:
+		_, ok := value.(map[string]any)
+		return ok
+	case provisioning.ParameterTypeString:
+		_, ok := value.(string)
+		return ok
+	default:
+		panic(fmt.Sprintf("unexpected type: %v", paramType))
+	}
 }
 
 // NewBicepProvider creates a new instance of a Bicep Infra provider
-func NewBicepProvider(ctx context.Context, env *environment.Environment, projectPath string, infraOptions Options) *BicepProvider {
-	azCli := azcli.GetAzCli(ctx)
-	bicepCli := bicep.GetBicepCli(ctx)
-	console := input.GetConsole(ctx)
-
-	// Default to a module named "main" if not specified.
-	if strings.TrimSpace(infraOptions.Module) == "" {
-		infraOptions.Module = "main"
-	}
-
+func NewBicepProvider(
+	azapi *azapi.AzureClient,
+	bicepCli *bicep.Cli,
+	resourceService *azapi.ResourceService,
+	resourceManager infra.ResourceManager,
+	deploymentManager *infra.DeploymentManager,
+	envManager environment.Manager,
+	env *environment.Environment,
+	console input.Console,
+	prompters prompt.Prompter,
+	curPrincipal provisioning.CurrentPrincipalIdProvider,
+	keyvaultService keyvault.KeyVaultService,
+	cloud *cloud.Cloud,
+	subscriptionManager *account.SubscriptionsManager,
+	aiModelService *ai.AiModelService,
+	serviceLocator ioc.ServiceLocator,
+) provisioning.Provider {
 	return &BicepProvider{
-		env:         env,
-		projectPath: projectPath,
-		options:     infraOptions,
-		console:     console,
-		bicepCli:    bicepCli,
-		azCli:       azCli,
+		envManager:          envManager,
+		env:                 env,
+		console:             console,
+		azapi:               azapi,
+		bicepCli:            bicepCli,
+		resourceService:     resourceService,
+		resourceManager:     resourceManager,
+		deploymentManager:   deploymentManager,
+		prompters:           prompters,
+		curPrincipal:        curPrincipal,
+		keyvaultService:     keyvaultService,
+		portalUrlBase:       cloud.PortalUrlBase,
+		subscriptionManager: subscriptionManager,
+		aiModelService:      aiModelService,
+		serviceLocator:      serviceLocator,
 	}
 }
 
-// Registers the Bicep provider with the provisioning module
-func Register() {
-	err := RegisterProvider(Bicep, func(ctx context.Context, env *environment.Environment, projectPath string, options Options) (Provider, error) {
-		return NewBicepProvider(ctx, env, projectPath, options), nil
-	})
-
+func (p *BicepProvider) Parameters(ctx context.Context) ([]provisioning.Parameter, error) {
+	compileResult, err := p.compileBicep(ctx)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("creating template: %w", err)
 	}
+	// templateParameters are the parameters defined in the bicep template. We know when a parameter is secured,
+	// its type and its default value from this definition.
+	templateParameters := compileResult.Template.Parameters
+
+	// parametersInfo contains the env vars mappings (from a parameters file). bicepparam is not supported yet.
+	parametersInfo, err := p.loadParameters(ctx, &compileResult.Template)
+	if err != nil {
+		return nil, fmt.Errorf("loading parameters: %w", err)
+	}
+
+	// resolved parameters contains the final value for the parameters after evaluating. The final value can be
+	// from env var, from default value or from user input (prompt).
+	resolvedParams, err := p.ensureParameters(ctx, compileResult.Template)
+	if err != nil {
+		return nil, fmt.Errorf("resolving parameters: %w", err)
+	}
+
+	provisionParameters := []provisioning.Parameter{}
+	for key, param := range templateParameters {
+		_, isVirtual := parametersInfo.virtualMapping[key]
+		if isVirtual {
+			// For virtual parameters, we pass through remaining env var mappings
+			provisionParameters = append(provisionParameters, provisioning.Parameter{
+				Name:               key,
+				Secret:             param.Secure(),
+				EnvVarMapping:      parametersInfo.envMapping[key],
+				LocalPrompt:        false,
+				UsingEnvVarMapping: true,
+			})
+			continue
+		}
+
+		if _, usingParam := resolvedParams[key]; !usingParam {
+			// No resolved param for this parameter definition.
+			continue
+		}
+
+		_, isPrompt := p.env.Config.Get(fmt.Sprintf("infra.parameters.%s", key))
+		singleMapping := len(parametersInfo.envMapping[key]) == 1
+		usingEnvVarMapping := false
+		if singleMapping {
+			envValue, defined := p.env.LookupEnv(parametersInfo.envMapping[key][0])
+			usingEnvVarMapping = singleMapping && defined && envValue == fmt.Sprintf("%v", resolvedParams[key].Value)
+		}
+		provisionParameters = append(provisionParameters, provisioning.Parameter{
+			Name:          key,
+			Secret:        param.Secure(),
+			Value:         resolvedParams[key].Value,
+			EnvVarMapping: parametersInfo.envMapping[key],
+			// No env var mapping and param is persisted in env config infra.parameters means local prompt only
+			// If user set an env var mapping after a local prompt, the env var overrides the value persisted in config
+			// which turns local prompt false
+			LocalPrompt:        isPrompt && !usingEnvVarMapping,
+			UsingEnvVarMapping: usingEnvVarMapping,
+		})
+	}
+
+	return provisionParameters, nil
+}
+
+func (p *BicepProvider) PlannedOutputs(ctx context.Context) ([]provisioning.PlannedOutput, error) {
+	compileResult, err := p.compileBicep(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("creating template: %w", err)
+	}
+
+	var outputs []provisioning.PlannedOutput
+	for key, output := range compileResult.Template.Outputs {
+		if azure.IsSecuredARMType(output.Type) {
+			continue
+		}
+
+		outputs = append(outputs, provisioning.PlannedOutput{
+			Name: key,
+		})
+	}
+
+	return outputs, nil
+}
+
+// armParametersJSON serializes ARM parameters to JSON for passing
+// to extension validation checks. Returns nil on error.
+func armParametersJSON(params azure.ArmParameters) []byte {
+	data, err := json.Marshal(params)
+	if err != nil {
+		return nil
+	}
+	return data
 }

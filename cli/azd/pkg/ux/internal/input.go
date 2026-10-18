@@ -1,0 +1,255 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package internal
+
+import (
+	"context"
+	"errors"
+	"io"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"unicode"
+
+	surveyterm "github.com/AlecAivazis/survey/v2/terminal"
+)
+
+var ErrCancelled = errors.New("cancelled by user")
+
+// Input is a base component for UX components that require user input.
+type Input struct {
+	cursor Cursor
+	value  []rune
+}
+
+type KeyPressEventArgs struct {
+	Value     string
+	Char      rune
+	Key       rune
+	Hint      bool
+	Cancelled bool
+}
+
+type FileReader interface {
+	io.Reader
+	Fd() uintptr
+}
+
+type FileWriter interface {
+	io.Writer
+	Fd() uintptr
+}
+
+type InputConfig struct {
+	InitialValue   string
+	IgnoreHintKeys bool
+
+	// Use these variables if you want to do unit testing.
+	Stdin  FileReader // Optional; defaults to os.Stdin when nil.
+	Stdout FileWriter // Optional; defaults to os.Stdout when nil.
+	Stderr io.Writer  // Optional; defaults to os.Stderr when nil.
+}
+
+// NewInput creates a new Input instance.
+func NewInput(writers ...io.Writer) *Input {
+	w := io.Writer(os.Stdout)
+	if len(writers) > 0 && writers[0] != nil {
+		w = writers[0]
+	}
+
+	return &Input{
+		cursor: NewCursor(w),
+	}
+}
+
+// KeyPressEventHandler is a function type that handles key press events.
+// Return true to continue listening for key presses, false to stop.
+type KeyPressEventHandler func(args *KeyPressEventArgs) (bool, error)
+
+// ResetValue resets the value of the input.
+func (i *Input) ResetValue() {
+	i.value = []rune{}
+}
+
+// ReadInput reads user input from the keyboard.
+func (i *Input) ReadInput(ctx context.Context, config *InputConfig, handler KeyPressEventHandler) error {
+	if config == nil {
+		config = &InputConfig{}
+	}
+	stdin := config.Stdin
+	if stdin == nil {
+		stdin = os.Stdin
+	}
+	stdout := config.Stdout
+	if stdout == nil {
+		stdout = os.Stdout
+	}
+	stderr := config.Stderr
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+
+	// Create a cancellable context to avoid leaking goroutines.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	i.cursor.ShowCursor()
+	i.value = []rune(config.InitialValue)
+
+	// Channel to receive errors from the keyboard input
+	errChan := make(chan error, 1)
+
+	// Channel to receive OS signals (e.g., Ctrl+C)
+	signalChan := make(chan os.Signal, 1)
+
+	// Channel to receive active key press events
+	inputChan := make(chan *KeyPressEventArgs)
+
+	// Signals that we should continue listening for key presses.
+	receiveChan := make(chan struct{}, 1)
+
+	// Register for SIGINT (Ctrl+C) signal
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+	defer func() {
+		signal.Stop(signalChan)
+	}()
+
+	stdio := surveyterm.Stdio{In: stdin, Out: stdout, Err: stderr}
+	rr := surveyterm.NewRuneReader(stdio)
+
+	// Start listening for key presses
+	// We need to do this on a separate goroutine to avoid blocking the main thread.
+	// To ensure we can still handle Ctrl+C or context cancellations.
+	go func() {
+		// Set terminal to raw mode for reading
+		// This allows us to read all user inputs without the terminal processing them
+		// (e.g., handling backspace, Ctrl+C, etc.).
+		if err := rr.SetTermMode(); err != nil {
+			errChan <- err
+			return
+		}
+
+		// On Windows, clear ENABLE_VIRTUAL_TERMINAL_INPUT so the
+		// console delivers native virtual-key codes instead of ANSI
+		// escape sequences. The survey library's RuneReader expects
+		// VK codes for arrow key dispatch. RestoreTermMode() will
+		// restore the original console mode when input completes.
+		if err := disableVirtualTerminalInput(stdin); err != nil {
+			// Non-fatal: worst case is the pre-existing ANSI leak.
+			_ = err
+		}
+
+		defer func() {
+			if err := rr.RestoreTermMode(); err != nil {
+				log.Printf("Error restoring terminal mode: %v\n", err)
+			}
+		}()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-receiveChan:
+				// Read the next rune from the terminal
+				char, _, err := rr.ReadRune()
+				if err != nil {
+					errChan <- err
+					return
+				}
+
+				newValue, eventArgs := processKey(i.value, char, config.IgnoreHintKeys)
+				i.value = newValue
+				if eventArgs.Cancelled {
+					cancel()
+					return
+				}
+				inputChan <- &eventArgs
+			}
+		}
+	}()
+
+	// Start the main event loop
+	receiveChan <- struct{}{}
+
+	for {
+		select {
+		case err := <-errChan:
+			return err
+		case <-ctx.Done():
+			// If cancellation comes from context, return cancellation error.
+			allErrors := errors.Join(ErrCancelled, ctx.Err())
+			args := KeyPressEventArgs{Cancelled: true}
+			_, err := handler(&args)
+			if err != nil {
+				allErrors = errors.Join(allErrors, err)
+			}
+
+			return allErrors
+		case <-signalChan:
+			// On OS signal, cancel the context to notify the goroutine.
+			cancel()
+
+			allErrors := errors.Join(ErrCancelled)
+			if ctx.Err() != nil {
+				allErrors = errors.Join(allErrors, ctx.Err())
+			}
+
+			args := KeyPressEventArgs{Cancelled: true}
+			_, err := handler(&args)
+			if err != nil {
+				allErrors = errors.Join(allErrors, err)
+			}
+			return allErrors
+		case args, ok := <-inputChan:
+			if !ok {
+				return nil
+			}
+
+			keepListening, err := handler(args)
+			if err != nil {
+				return err
+			}
+
+			if !keepListening {
+				return nil
+			}
+
+			receiveChan <- struct{}{}
+		}
+	}
+}
+
+// processKey processes a single rune of user input against the current input buffer
+// and produces the updated buffer plus the corresponding KeyPressEventArgs.
+//
+// It is a pure function: it has no side effects beyond the returned values, which
+// makes it straightforward to unit-test independently of the terminal/goroutine
+// machinery in ReadInput.
+func processKey(current []rune, char rune, ignoreHints bool) ([]rune, KeyPressEventArgs) {
+	eventArgs := KeyPressEventArgs{
+		Char: char,
+		Key:  char,
+	}
+	newValue := current
+
+	if len(current) > 0 && (char == surveyterm.KeyBackspace || char == surveyterm.KeyDelete) {
+		newValue = current[:len(current)-1]
+	} else if !ignoreHints && char == '?' {
+		eventArgs.Hint = true
+	} else if !ignoreHints && char == surveyterm.KeyEscape {
+		eventArgs.Hint = false
+	} else if char == surveyterm.KeySpace {
+		newValue = append(newValue, ' ')
+	} else if unicode.IsPrint(char) {
+		newValue = append(newValue, char)
+	} else if char == surveyterm.KeyInterrupt || char == surveyterm.KeyEscape {
+		eventArgs.Cancelled = true
+	} else if char == '\n' { // Handle both '\r' and '\n' as Enter key
+		eventArgs.Key = surveyterm.KeyEnter
+	}
+
+	eventArgs.Value = string(newValue)
+	return newValue, eventArgs
+}

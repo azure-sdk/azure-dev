@@ -1,0 +1,764 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package cmd
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/azure/azure-dev/cli/azd/cmd/actions"
+	"github.com/azure/azure-dev/cli/azd/internal"
+	"github.com/azure/azure-dev/cli/azd/pkg/account"
+	"github.com/azure/azure-dev/cli/azd/pkg/alpha"
+	"github.com/azure/azure-dev/cli/azd/pkg/apphost"
+	"github.com/azure/azure-dev/cli/azd/pkg/azapi"
+	"github.com/azure/azure-dev/cli/azd/pkg/cloud"
+	"github.com/azure/azure-dev/cli/azd/pkg/environment"
+	"github.com/azure/azure-dev/cli/azd/pkg/environment/azdcontext"
+	"github.com/azure/azure-dev/cli/azd/pkg/exec"
+	"github.com/azure/azure-dev/cli/azd/pkg/exegraph"
+	"github.com/azure/azure-dev/cli/azd/pkg/input"
+	"github.com/azure/azure-dev/cli/azd/pkg/output"
+	"github.com/azure/azure-dev/cli/azd/pkg/output/ux"
+	"github.com/azure/azure-dev/cli/azd/pkg/project"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+)
+
+type DeployFlags struct {
+	ServiceName string
+	All         bool
+	Timeout     int
+	fromPackage string
+	preview     bool
+	flagSet     *pflag.FlagSet
+	global      *internal.GlobalCommandOptions
+	*internal.EnvFlag
+}
+
+const defaultDeployTimeoutSeconds = 1200
+
+func (d *DeployFlags) Bind(local *pflag.FlagSet, global *internal.GlobalCommandOptions) {
+	d.BindNonCommon(local, global)
+	d.bindCommon(local, global)
+}
+
+func (d *DeployFlags) BindNonCommon(
+	local *pflag.FlagSet,
+	global *internal.GlobalCommandOptions) {
+	local.StringVar(
+		&d.ServiceName,
+		"service",
+		"",
+		//nolint:lll
+		"Deploys a specific service (when the string is unspecified, all services that are listed in the "+azdcontext.ProjectFileName+" file are deployed).",
+	)
+	//deprecate:flag hide --service
+	_ = local.MarkHidden("service")
+	d.global = global
+}
+
+func (d *DeployFlags) bindCommon(local *pflag.FlagSet, global *internal.GlobalCommandOptions) {
+	d.EnvFlag = &internal.EnvFlag{}
+	d.EnvFlag.Bind(local, global)
+	d.flagSet = local
+
+	local.BoolVar(
+		&d.All,
+		"all",
+		false,
+		"Deploys all services that are listed in "+azdcontext.ProjectFileName,
+	)
+	local.StringVar(
+		&d.fromPackage,
+		"from-package",
+		"",
+		//nolint:lll
+		"Deploys the packaged service located at the provided path. Supports zipped file packages (file path) or container images (image tag).",
+	)
+	local.IntVar(
+		&d.Timeout,
+		"timeout",
+		defaultDeployTimeoutSeconds,
+		fmt.Sprintf(
+			"Maximum time in seconds for azd to wait for each service deployment. This stops azd from waiting "+
+				"but does not cancel the Azure-side deployment. (default: %d)",
+			defaultDeployTimeoutSeconds,
+		),
+	)
+	local.BoolVar(&d.preview, "preview", false, "Preview changes to services without deploying them.")
+}
+
+func (d *DeployFlags) SetCommon(envFlag *internal.EnvFlag) {
+	d.EnvFlag = envFlag
+}
+
+func NewDeployFlags(cmd *cobra.Command, global *internal.GlobalCommandOptions) *DeployFlags {
+	flags := &DeployFlags{}
+	flags.Bind(cmd.Flags(), global)
+
+	return flags
+}
+
+func NewDeployFlagsFromEnvAndOptions(envFlag *internal.EnvFlag, global *internal.GlobalCommandOptions) *DeployFlags {
+	return &DeployFlags{
+		Timeout: defaultDeployTimeoutSeconds,
+		EnvFlag: envFlag,
+		global:  global,
+	}
+}
+
+func (d *DeployFlags) timeoutChanged() bool {
+	if d.flagSet == nil {
+		return false
+	}
+
+	timeoutFlag := d.flagSet.Lookup("timeout")
+	return timeoutFlag != nil && timeoutFlag.Changed
+}
+
+func NewDeployCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "deploy <service>",
+		Short: "Deploy your project code to Azure.",
+	}
+	cmd.Args = cobra.MaximumNArgs(1)
+
+	return cmd
+}
+
+type DeployAction struct {
+	flags               *DeployFlags
+	args                []string
+	projectConfig       *project.ProjectConfig
+	azdCtx              *azdcontext.AzdContext
+	env                 *environment.Environment
+	envManager          environment.Manager
+	projectManager      project.ProjectManager
+	serviceManager      project.ServiceManager
+	resourceManager     project.ResourceManager
+	accountManager      account.Manager
+	azCli               *azapi.AzureClient
+	portalUrlBase       string
+	formatter           output.Formatter
+	writer              io.Writer
+	console             input.Console
+	commandRunner       exec.CommandRunner
+	alphaFeatureManager *alpha.FeatureManager
+	importManager       *project.ImportManager
+	progressTracker     *deployProgressTracker // set at runtime when using parallel deployment graph
+}
+
+func NewDeployAction(
+	flags *DeployFlags,
+	args []string,
+	projectConfig *project.ProjectConfig,
+	projectManager project.ProjectManager,
+	serviceManager project.ServiceManager,
+	resourceManager project.ResourceManager,
+	azdCtx *azdcontext.AzdContext,
+	environment *environment.Environment,
+	envManager environment.Manager,
+	accountManager account.Manager,
+	cloud *cloud.Cloud,
+	azCli *azapi.AzureClient,
+	commandRunner exec.CommandRunner,
+	console input.Console,
+	formatter output.Formatter,
+	writer io.Writer,
+	alphaFeatureManager *alpha.FeatureManager,
+	importManager *project.ImportManager,
+) actions.Action {
+	return &DeployAction{
+		flags:               flags,
+		args:                args,
+		projectConfig:       projectConfig,
+		azdCtx:              azdCtx,
+		env:                 environment,
+		envManager:          envManager,
+		projectManager:      projectManager,
+		serviceManager:      serviceManager,
+		resourceManager:     resourceManager,
+		accountManager:      accountManager,
+		portalUrlBase:       cloud.PortalUrlBase,
+		azCli:               azCli,
+		formatter:           formatter,
+		writer:              writer,
+		console:             console,
+		commandRunner:       commandRunner,
+		alphaFeatureManager: alphaFeatureManager,
+		importManager:       importManager,
+	}
+}
+
+type DeploymentResult struct {
+	Timestamp time.Time                               `json:"timestamp"`
+	Services  map[string]*project.ServiceDeployResult `json:"services"`
+}
+
+func (da *DeployAction) Run(ctx context.Context) (*actions.ActionResult, error) {
+	targetServiceName := da.flags.ServiceName
+	if len(da.args) == 1 {
+		targetServiceName = da.args[0]
+	}
+
+	if da.env.GetSubscriptionId() == "" {
+		return nil, &internal.ErrorWithSuggestion{
+			Err:        internal.ErrInfraNotProvisioned,
+			Suggestion: "Run 'azd provision' to set up infrastructure before deploying.",
+		}
+	}
+
+	targetServiceName, err := getTargetServiceName(
+		ctx,
+		da.projectManager,
+		da.importManager,
+		da.projectConfig,
+		string(project.ServiceEventDeploy),
+		targetServiceName,
+		da.flags.All,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if da.flags.All && da.flags.fromPackage != "" {
+		return nil, &internal.ErrorWithSuggestion{
+			Err:        internal.ErrFromPackageWithAll,
+			Suggestion: "Use 'azd deploy <service> --from-package <path>' to target a specific service.",
+		}
+	}
+
+	if targetServiceName == "" && da.flags.fromPackage != "" {
+		return nil, &internal.ErrorWithSuggestion{
+			Err:        internal.ErrFromPackageNoService,
+			Suggestion: "Use 'azd deploy <service> --from-package <path>' to target a specific service.",
+		}
+	}
+
+	if da.flags.preview && (da.flags.fromPackage != "" || da.flags.timeoutChanged()) {
+		return nil, &internal.ErrorWithSuggestion{
+			Err: fmt.Errorf(
+				"'--preview' cannot be combined with '--from-package' or '--timeout': %w",
+				internal.ErrInvalidFlagCombination,
+			),
+			Suggestion: "Run 'azd deploy --preview' without '--from-package' and '--timeout'.",
+		}
+	}
+
+	stableServices, err := da.importManager.ServiceStableFiltered(
+		ctx, da.projectConfig, targetServiceName, da.env.Getenv)
+	if err != nil {
+		return nil, err
+	}
+
+	// Preview skips service initialization, tool checks, and the package, publish, and deploy steps.
+	if da.flags.preview {
+		return da.deployPreview(ctx, stableServices)
+	}
+
+	if err := da.projectManager.InitializeServices(ctx, stableServices); err != nil {
+		return nil, err
+	}
+
+	if err := da.projectManager.EnsureServiceTargetTools(ctx, stableServices); err != nil {
+		return nil, err
+	}
+
+	// Command title
+	da.console.MessageUxItem(ctx, &ux.MessageTitle{
+		Title: "Deploying services (azd deploy)",
+	})
+
+	startTime := time.Now()
+
+	// Always deploy through the service execution graph. The graph handles
+	// any service count (including N=1) with a uniform progress tracker
+	// and the same package → publish → deploy step topology.
+	return da.deployServicesGraph(ctx, stableServices, startTime)
+}
+
+// DeploymentPreviewResult is the JSON output of `azd deploy --preview`.
+type DeploymentPreviewResult struct {
+	Timestamp time.Time                                      `json:"timestamp"`
+	Services  map[string]*project.ServiceDeployPreviewResult `json:"services"`
+}
+
+// deployPreview asks each service target to preview its deployment without packaging, publishing, or deploying.
+func (da *DeployAction) deployPreview(
+	ctx context.Context,
+	services []*project.ServiceConfig,
+) (*actions.ActionResult, error) {
+	da.console.MessageUxItem(ctx, &ux.MessageTitle{
+		Title:     "Previewing service deployment changes (azd deploy --preview)",
+		TitleNote: "This is a preview. No changes will be applied to your services.",
+	})
+
+	startTime := time.Now()
+	results := map[string]*project.ServiceDeployPreviewResult{}
+	for _, svc := range services {
+		stepMessage := fmt.Sprintf("Previewing service %s", svc.Name)
+		da.console.ShowSpinner(ctx, stepMessage, input.Step)
+
+		result, err := da.previewService(ctx, svc)
+		if errors.Is(err, project.ErrDeployPreviewNotSupported) {
+			da.console.StopSpinner(ctx, stepMessage, input.StepSkipped)
+			da.console.MessageUxItem(ctx, &ux.WarningMessage{
+				Description: fmt.Sprintf(
+					"Service '%s' (host: %s) does not support deployment preview.", svc.Name, svc.Host),
+			})
+			continue
+		}
+
+		da.console.StopSpinner(ctx, stepMessage, input.GetStepResultFormat(err))
+		if err != nil {
+			return nil, fmt.Errorf("previewing service '%s': %w", svc.Name, err)
+		}
+
+		results[svc.Name] = result
+		if da.formatter.Kind() != output.JsonFormat && result.Message != "" {
+			da.console.Message(ctx, result.Message)
+		}
+	}
+
+	if da.formatter.Kind() == output.JsonFormat {
+		previewResult := DeploymentPreviewResult{
+			Timestamp: time.Now(),
+			Services:  results,
+		}
+
+		if err := da.formatter.Format(previewResult, da.writer, nil); err != nil {
+			return nil, fmt.Errorf("deploy preview result could not be displayed: %w", err)
+		}
+	}
+
+	return &actions.ActionResult{
+		Message: &actions.ResultMessage{
+			Header: fmt.Sprintf("Generated deployment preview in %s.", ux.DurationAsText(since(startTime))),
+		},
+	}, nil
+}
+
+func (da *DeployAction) previewService(
+	ctx context.Context,
+	svc *project.ServiceConfig,
+) (*project.ServiceDeployPreviewResult, error) {
+	serviceTarget, err := da.serviceManager.GetServiceTarget(ctx, svc)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		result     *project.ServiceDeployPreviewResult
+		previewErr error
+	)
+	if previewer, ok := serviceTarget.(project.ServiceTargetResourcePreviewer); ok {
+		targetResource, err := da.serviceManager.GetTargetResource(ctx, svc, serviceTarget)
+		if err != nil {
+			return nil, fmt.Errorf("resolving target resource: %w", err)
+		}
+
+		result, previewErr = previewer.PreviewWithTarget(ctx, svc, targetResource)
+	} else if previewer, ok := serviceTarget.(project.ServiceTargetPreviewer); ok {
+		result, previewErr = previewer.Preview(ctx, svc)
+	} else {
+		return nil, project.ErrDeployPreviewNotSupported
+	}
+
+	if previewErr == nil && result == nil {
+		return nil, errors.New("service target returned no deployment preview")
+	}
+
+	return result, previewErr
+}
+
+// dotNetPackagePublishBuildGateKey groups standard .NET services whose
+// package or publish phase can run dotnet publish locally.
+func dotNetPackagePublishBuildGateKey(svc *project.ServiceConfig) string {
+	if svc != nil && svc.DotNetContainerApp == nil && svc.Language.IsDotNet() {
+		return "dotnet"
+	}
+	return ""
+}
+
+// deployServicesGraph builds an execution graph of service deployments and runs them in
+// parallel via the execution graph scheduler. Concurrent local .NET publishes
+// receive an isolated artifacts path when supported, with a shared runtime
+// mutex as the compatibility fallback. The mutex is released before Azure
+// deployment work begins.
+func (da *DeployAction) deployServicesGraph(
+	ctx context.Context,
+	stableServices []*project.ServiceConfig,
+	startTime time.Time,
+) (*actions.ActionResult, error) {
+	deployTimeout, err := da.resolveDeployTimeout()
+	if err != nil {
+		return nil, err
+	}
+	concurrency := resolveDeployGraphConcurrency(da.env.LookupEnv)
+
+	// Wrap console for thread-safe output during parallel deployment.
+	// Graph step callbacks may call ShowSpinner/StopSpinner/Message which are
+	// not goroutine-safe on the underlying console.
+	origConsole := da.console
+	sc := &syncConsole{Console: origConsole}
+
+	// Create a tracker and suppress individual service spinners so
+	// the tracker owns the progress display. Skip the tracker entirely in
+	// machine-readable output modes (e.g. --output json) so raw progress
+	// lines don't pollute stdout alongside the JSON result, and when no
+	// writer is available (e.g. test mocks).
+	if w := origConsole.GetWriter(); da.formatter.Kind() != output.JsonFormat && w != nil {
+		serviceNames := make([]string, len(stableServices))
+		for i, svc := range stableServices {
+			serviceNames[i] = svc.Name
+		}
+		da.progressTracker = newDeployProgressTracker(
+			w,
+			origConsole.IsSpinnerInteractive(),
+			serviceNames,
+		)
+		da.console = &silentSpinnerConsole{syncConsole: sc}
+		// Suppress previewer output at the shared console level so that
+		// DI-injected consumers (e.g. ContainerHelper's Docker output)
+		// don't corrupt the progress table display.
+		if ps, ok := origConsole.(input.PreviewerPauser); ok {
+			ps.PausePreviewer()
+			defer ps.ResumePreviewer()
+		}
+	} else {
+		// Still wrap the console for thread-safety without suppressing spinners.
+		da.console = sc
+	}
+	defer func() {
+		da.console = origConsole
+		da.progressTracker = nil
+	}()
+
+	g := exegraph.NewGraph()
+	state := newDeployGraphState(stableServices)
+	var packagePublishBuildGateKey func(*project.ServiceConfig) string
+	if da.flags.fromPackage == "" {
+		packagePublishBuildGateKey = dotNetPackagePublishBuildGateKey
+	}
+
+	if _, err := addServiceStepsToGraph(g, serviceGraphOptions{
+		services:                   stableServices,
+		serviceManager:             da.serviceManager,
+		deployTimeout:              deployTimeout,
+		maxConcurrency:             concurrency.max,
+		fromPackage:                da.flags.fromPackage,
+		state:                      state,
+		packagePublishBuildGateKey: packagePublishBuildGateKey,
+		buildGateKey:               aspireBuildGateKey,
+		onDeployTimeout: func(ctx context.Context, svc *project.ServiceConfig) {
+			da.console.MessageUxItem(ctx, deployTimeoutWarning(svc.Name, deployTimeout))
+		},
+		onPhaseProgress: func(svcName string, phase deployPhase, detail string) {
+			// Forward intra-phase progress (e.g. "Pushing image…") to the
+			// tracker so the table's Detail column reflects what each step
+			// is doing — not just which phase. updateProgress is a no-op
+			// when the tracker is nil (JSON output / no writer paths).
+			da.updateProgress(svcName, phase, detail)
+		},
+	}); err != nil {
+		return nil, err
+	}
+
+	// Wire progress tracker to graph step lifecycle callbacks.
+	// Step names are "package-<svc>", "publish-<svc>", "deploy-<svc>".
+	opts := exegraph.RunOptions{
+		MaxConcurrency:   concurrency.max,
+		GroupConcurrency: concurrency.groups,
+		ErrorPolicy:      exegraph.FailFast,
+		OnStepStart: func(stepName string) {
+			if svc, ok := strings.CutPrefix(stepName, "package-"); ok {
+				da.updateProgress(svc, phasePackaging, "")
+			} else if svc, ok := strings.CutPrefix(stepName, "publish-"); ok {
+				da.updateProgress(svc, phasePublish, "")
+			} else if svc, ok := strings.CutPrefix(stepName, "deploy-"); ok {
+				da.updateProgress(svc, phaseDeploying, "")
+			}
+		},
+		OnStepDone: func(stepName string, err error) {
+			if err != nil {
+				phase, detail := serviceStepCompletionProgress(err)
+				for _, prefix := range []string{"deploy-", "publish-", "package-"} {
+					if svc, ok := strings.CutPrefix(stepName, prefix); ok {
+						da.updateProgress(svc, phase, detail)
+						return
+					}
+				}
+			}
+			if svc, ok := strings.CutPrefix(stepName, "deploy-"); ok {
+				da.updateProgress(svc, phaseDone, "")
+			}
+		},
+	}
+
+	projectEventArgs := project.ProjectLifecycleEventArgs{
+		Project: da.projectConfig,
+	}
+
+	// Start the progress ticker if the tracker is active.
+	var stopTicker func()
+	if da.progressTracker != nil {
+		stopTicker = da.progressTracker.StartTicker(ctx)
+	}
+
+	err = da.projectConfig.Invoke(ctx, project.ProjectEventDeploy, projectEventArgs, func() error {
+		result := exegraph.RunWithResult(ctx, g, opts)
+		// Log per-step timing for diagnostics and benchmarking.
+		for _, st := range result.Steps {
+			log.Printf("deploy-graph step %-30s  %s  %s", st.Name, st.Status, st.Duration.Round(time.Millisecond))
+		}
+		log.Printf("deploy-graph total: %s (%d steps)", result.TotalDuration.Round(time.Millisecond), len(result.Steps))
+
+		// Unwrap the graph runner's step-level error prefix ("step X failed: ...")
+		// so user-facing messages contain only the action error, not internal graph
+		// framing. When exactly one step failed, return its inner error directly;
+		// when multiple failed, join their inner errors.
+		return unwrapStepErrors(result)
+	})
+
+	// Stop ticker and render final progress state.
+	if stopTicker != nil {
+		stopTicker()
+	}
+	if da.progressTracker != nil {
+		da.progressTracker.RenderFinal()
+	}
+
+	// Clean up temporary package artifacts created during graph execution.
+	if da.flags.fromPackage == "" {
+		state.CleanupTempArtifacts()
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if da.formatter.Kind() != output.JsonFormat {
+		displayDeployWarnings(ctx, da.console, stableServices, state)
+	}
+
+	// Display service endpoint artifacts collected during deploy steps.
+	if da.formatter.Kind() != output.JsonFormat {
+		for _, svc := range stableServices {
+			if dr := state.GetResult(svc.Name); dr != nil && len(dr.Artifacts) > 0 {
+				da.console.MessageUxItem(ctx, dr.Artifacts)
+			}
+		}
+	}
+
+	aspireDashboardUrl := apphost.AspireDashboardUrl(ctx, da.env, da.alphaFeatureManager)
+	if aspireDashboardUrl != nil {
+		da.console.MessageUxItem(ctx, aspireDashboardUrl)
+	}
+
+	if da.formatter.Kind() == output.JsonFormat {
+		deployResult := DeploymentResult{
+			Timestamp: time.Now(),
+			Services:  state.ResultsSnapshot(),
+		}
+
+		if fmtErr := da.formatter.Format(deployResult, da.writer, nil); fmtErr != nil {
+			return nil, fmt.Errorf("deploy result could not be displayed: %w", fmtErr)
+		}
+	}
+
+	// Invalidate cache after successful deploy so azd show will refresh
+	if err := da.envManager.InvalidateEnvCache(ctx, da.env.Name()); err != nil {
+		log.Printf("warning: failed to invalidate state cache: %v", err)
+	}
+
+	return &actions.ActionResult{
+		Message: &actions.ResultMessage{
+			Header: fmt.Sprintf(
+				"Your application was deployed to Azure in %s.",
+				ux.DurationAsText(since(startTime)),
+			),
+			FollowUp: getResourceGroupFollowUp(ctx,
+				da.formatter,
+				da.portalUrlBase,
+				da.projectConfig,
+				da.resourceManager,
+				da.env,
+				false,
+			),
+		},
+	}, nil
+}
+
+func (da *DeployAction) resolveDeployTimeout() (time.Duration, error) {
+	return resolveDeployTimeout(da.flags)
+}
+
+// resolveDeployTimeout picks the deploy-per-service timeout from, in order:
+//
+//  1. --timeout CLI flag (if set by the user)
+//  2. AZD_DEPLOY_TIMEOUT environment variable (integer seconds)
+//  3. [defaultDeployTimeoutSeconds]
+//
+// Exposed as a free function so [UpGraphAction] — which shares the same
+// [DeployFlags] type but not the [DeployAction] receiver — can resolve the
+// timeout without duplicating the precedence logic.
+func resolveDeployTimeout(flags *DeployFlags) (time.Duration, error) {
+	if flags != nil && flags.timeoutChanged() {
+		if flags.Timeout <= 0 {
+			return 0, &deployTimeoutValueError{
+				message: "invalid value for --timeout: must be greater than 0 seconds",
+			}
+		}
+
+		return time.Duration(flags.Timeout) * time.Second, nil
+	}
+
+	if envVal, ok := os.LookupEnv("AZD_DEPLOY_TIMEOUT"); ok {
+		seconds, err := strconv.Atoi(envVal)
+		if err != nil {
+			return 0, &deployTimeoutValueError{message: fmt.Sprintf(
+				"invalid AZD_DEPLOY_TIMEOUT value '%s': must be an integer number of seconds",
+				envVal,
+			)}
+		}
+		if seconds <= 0 {
+			return 0, &deployTimeoutValueError{message: fmt.Sprintf(
+				"invalid AZD_DEPLOY_TIMEOUT value '%d': must be greater than 0 seconds",
+				seconds,
+			)}
+		}
+		return time.Duration(seconds) * time.Second, nil
+	}
+
+	return time.Duration(defaultDeployTimeoutSeconds) * time.Second, nil
+}
+
+type deployTimeoutValueError struct {
+	message string
+}
+
+func (e *deployTimeoutValueError) Error() string {
+	return e.message
+}
+
+func (e *deployTimeoutValueError) Unwrap() error {
+	return internal.ErrInvalidArgValue
+}
+
+func GetCmdDeployHelpDescription(*cobra.Command) string {
+	return generateCmdHelpDescription("Deploy application to Azure.", []string{
+		formatHelpNote(
+			"By default, deploys all services listed in 'azure.yaml' in the current directory," +
+				" or the service described in the project that matches the current directory."),
+		formatHelpNote(
+			fmt.Sprintf("When %s is set, only the specific service is deployed.", output.WithHighLightFormat("<service>"))),
+		formatHelpNote("After the deployment is complete, the endpoint is printed. To start the service, select" +
+			" the endpoint or paste it in a browser."),
+		formatHelpNote(fmt.Sprintf("When %s is set, services whose host supports deployment preview report"+
+			" the changes a deployment would make. Nothing is packaged, published, or deployed, and hooks do not run.",
+			output.WithHighLightFormat("--preview"))),
+	})
+}
+
+func GetCmdDeployHelpFooter(*cobra.Command) string {
+	return generateCmdHelpSamplesBlock(map[string]string{
+		"Deploy all services in the current project to Azure.": output.WithHighLightFormat(
+			"azd deploy --all",
+		),
+		"Deploy the service named 'api' to Azure.": output.WithHighLightFormat(
+			"azd deploy api",
+		),
+		"Deploy the service named 'web' to Azure.": output.WithHighLightFormat(
+			"azd deploy web",
+		),
+		"Deploy the service named 'api' to Azure from a previously generated package.": output.WithHighLightFormat(
+			"azd deploy api --from-package <package-path>",
+		),
+	})
+}
+
+// updateProgress notifies the progress tracker if it is active.
+// When the tracker is nil (single-service path), this is a no-op.
+func (da *DeployAction) updateProgress(serviceName string, phase deployPhase, detail string) {
+	if da.progressTracker != nil {
+		da.progressTracker.Update(serviceName, phase, detail)
+	}
+}
+
+// unwrapStepErrors extracts the inner (action-level) errors from a graph
+// RunResult, stripping the graph scheduler's "step %q failed: " prefix added
+// by runStep. This keeps user-facing deploy errors clean — the step-name
+// framing is useful for diagnostics logs but should not leak to users.
+//
+// Skipped steps (dependency failures) are omitted — only genuine step Action
+// errors are returned. When exactly one step failed, its inner error is
+// returned directly (not wrapped in errors.Join).
+func unwrapStepErrors(result *exegraph.RunResult) error {
+	if result.Error == nil {
+		return nil
+	}
+
+	var inner []error
+	for _, st := range result.Steps {
+		if st.Err == nil || st.Status == exegraph.StepSkipped {
+			continue
+		}
+		// runStep wraps with fmt.Errorf("step %q failed: %w", ...) — one Unwrap
+		// level peels off that prefix while preserving the action error chain.
+		if unwrapped := errors.Unwrap(st.Err); unwrapped != nil {
+			inner = append(inner, unwrapped)
+		} else {
+			inner = append(inner, st.Err)
+		}
+	}
+
+	switch len(inner) {
+	case 0:
+		// Shouldn't happen if result.Error != nil, but be safe.
+		return result.Error
+	case 1:
+		return inner[0]
+	default:
+		return errors.Join(inner...)
+	}
+}
+
+// silentSpinnerConsole wraps syncConsole but suppresses spinner output.
+// When the progress table is active, the tracker owns the progress display
+// and per-service spinners would interfere with the table rendering.
+//
+// Dropped spinner calls are logged at debug level so extension authors can
+// diagnose missing spinner output from custom service targets — the swallow
+// is intentional but invisible by default, and a silent no-op makes
+// "my spinner doesn't show up" hard to root-cause without log access.
+type silentSpinnerConsole struct {
+	*syncConsole
+}
+
+func (*silentSpinnerConsole) ShowSpinner(_ context.Context, title string, _ input.SpinnerUxType) {
+	log.Printf("silentSpinnerConsole: dropped ShowSpinner(%q) — progress table active", title)
+}
+
+func (*silentSpinnerConsole) StopSpinner(_ context.Context, title string, _ input.SpinnerUxType) {
+	log.Printf("silentSpinnerConsole: dropped StopSpinner(%q) — progress table active", title)
+}
+
+func (*silentSpinnerConsole) IsSpinnerRunning(_ context.Context) bool { return false }
+
+func (*silentSpinnerConsole) ShowPreviewer(_ context.Context, _ *input.ShowPreviewerOptions) io.Writer {
+	log.Printf("silentSpinnerConsole: dropped ShowPreviewer — progress table active")
+	return io.Discard
+}
+
+func (*silentSpinnerConsole) StopPreviewer(_ context.Context, _ bool) {
+	log.Printf("silentSpinnerConsole: dropped StopPreviewer — progress table active")
+}

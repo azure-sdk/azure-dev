@@ -1,0 +1,114 @@
+# Release History
+
+## 1.0.0-beta.9 (2026-09-30)
+
+### Bugs Fixed
+
+- [[#10104]](https://github.com/Azure/azure-dev/pull/10104) Reject explicitly supplied `--project-endpoint` flags on commands that do not use a project endpoint instead of silently ignoring them. Thanks @Siglud for the contribution!
+
+### Other Changes
+
+- [[#10104]](https://github.com/Azure/azure-dev/pull/10104) Improve `azd ai toolbox` help formatting, examples, and configuration and environment guidance. Thanks @Siglud for the contribution!
+
+## 1.0.0-beta.8 (2026-09-24)
+
+### Bugs Fixed
+
+- [[#10008]](https://github.com/Azure/azure-dev/pull/10008) Fix cross-tenant toolbox deployment to authenticate through the selected subscription's user-access tenant.
+
+### Other Changes
+
+- [[#10114]](https://github.com/Azure/azure-dev/pull/10114) Update gRPC to v1.83.2 to address the GHSA-2v4p-qf9q-27wj security advisory.
+- [[#10128]](https://github.com/Azure/azure-dev/pull/10128) Update OpenTelemetry Go to v1.45.0 to address the GHSA-8wmf-6v46-5gfg security advisory.
+
+## 1.0.0-beta.7 (2026-09-17)
+
+### Breaking Changes
+
+- [[#10024]](https://github.com/Azure/azure-dev/pull/10024) Remove the standalone `azd ai toolbox deploy` command in favor of `azd deploy <service>`. Thanks @JerryYangKai for the contribution!
+
+### Other Changes
+
+- [[#9841]](https://github.com/Azure/azure-dev/pull/9841) Add a shared best-effort telemetry reporting foundation without emitting new Toolbox usage events. Thanks @JerryYangKai for the contribution!
+
+## 1.0.0-beta.6 (2026-09-04)
+
+### Features Added
+
+- [[#9735]](https://github.com/Azure/azure-dev/pull/9735) Add local `toolbox.yaml` definitions and `azd ai toolbox deploy` with dependency-aware composition. Thanks @JerryYangKai for the contribution!
+
+### Other Changes
+
+- [[#9825]](https://github.com/Azure/azure-dev/pull/9825) Update gRPC to v1.83.1 to address the GHSA-vp52-pcj8-j9qc security advisory.
+
+## 1.0.0-beta.5 (2026-08-06)
+
+### Features Added
+
+- [[#9079]](https://github.com/Azure/azure-dev/pull/9079) Add service-scoped environment support for Foundry toolbox services while preserving project-wide fallback behavior.
+
+### Bugs Fixed
+
+- [[#9326]](https://github.com/Azure/azure-dev/pull/9326) Track toolbox readiness and cleanup state so dependent agent deployments fail early with actionable guidance.
+
+## 1.0.0-beta.4 (2026-07-23)
+
+### Features Added
+
+- [[#9229]](https://github.com/Azure/azure-dev/pull/9229) `azd ai toolbox` now supports the WorkIQ (`work_iq_preview`), FabricIQ (`fabric_iq_preview`), and toolbox-search (`toolbox_search_preview`) preview tools, and `azd ai toolbox connection list` now surfaces any tool that exposes a project connection.
+
+### Bugs Fixed
+
+- [[#9220]](https://github.com/Azure/azure-dev/pull/9220) Fix `azd ai toolbox create --project-endpoint --from-file` failing when run outside an azd project; the best-effort environment sync now skips silently when no `azure.yaml` is present instead of failing the command.
+
+## 1.0.0-beta.3 (2026-07-16)
+
+### Features Added
+
+- [[#9024]](https://github.com/Azure/azure-dev/pull/9024) `azd deploy` for `host: azure.ai.toolbox` services now supports an `endpoint:` field in `azure.yaml` to reference an existing toolbox by its MCP endpoint URL, skipping version creation. This enables reusing a toolbox managed outside the current project.
+
+### Bugs Fixed
+
+- [[#9013]](https://github.com/Azure/azure-dev/pull/9013) Fix `azd ai toolbox skill add/remove` and `connection add/remove` branching from the toolbox's default version instead of its latest, causing sequential mutations to silently drop earlier changes. Add a `--from-version` flag to override the branch source.
+
+### Other Changes
+
+- [[#9103]](https://github.com/Azure/azure-dev/pull/9103) Pin internal azd module dependency to released version.
+
+## 1.0.0-beta.2 (2026-07-09)
+
+### Other Changes
+
+- [[#8866]](https://github.com/Azure/azure-dev/pull/8866) Remove `Foundry-Features: Toolboxes=V1Preview` opt-in header now that Foundry toolbox APIs are GA.
+
+## 1.0.0-beta.1 (2026-06-30)
+
+### Features Added
+
+- [[#8818]](https://github.com/Azure/azure-dev/pull/8818) The `azure.ai.toolboxes` extension now registers an `azure.ai.toolbox` service-target host. `azd deploy`/`azd up` upsert each `host: azure.ai.toolbox` service in `azure.yaml` as a new toolbox version, resolving named `connection` references to their project connection IDs, expanding `${VAR}` references, and publishing the toolbox MCP endpoint to the azd environment.
+- [[#8890]](https://github.com/Azure/azure-dev/pull/8890) Bump `requiredAzdVersion` to `>=1.27.0`.
+
+## 0.1.1-preview (2026-06-19)
+
+### Features
+
+- [[#8672]](https://github.com/Azure/azure-dev/issues/8672) `azd ai toolbox create` now writes the new toolbox's versioned MCP endpoint to the active azd environment under the `TOOLBOX_<NORMALIZED_NAME>_MCP_ENDPOINT` variable (the same key agents consume), and `azd ai toolbox delete` clears it when the whole toolbox is removed.
+
+### Bugs Fixed
+
+- [[#8688]](https://github.com/Azure/azure-dev/issues/8688) Resolve the project endpoint that `azd ai agent init` stores. `azd ai toolbox` commands now fall back to `AZURE_AI_PROJECT_ENDPOINT` (after `FOUNDRY_PROJECT_ENDPOINT`) in both the active azd environment and the host environment, so the hosted-agent + toolbox workflow no longer fails with "no Foundry project endpoint resolved" after init.
+
+## 0.1.0-preview (2026-05-28)
+
+Initial release of the `azure.ai.toolboxes` extension for managing Microsoft Foundry Toolboxes from the terminal.
+
+### Features
+
+- `azd ai toolbox create` — Create a new toolbox and its initial version from a JSON or YAML file.
+- `azd ai toolbox show` — Show a toolbox version, including its computed MCP endpoint.
+- `azd ai toolbox list` — List toolboxes on the Foundry project.
+- `azd ai toolbox delete` — Delete a toolbox or a specific version.
+- `azd ai toolbox publish` — Promote a version to be the default for a toolbox.
+- `azd ai toolbox versions list` — List all published versions for a toolbox.
+- `azd ai toolbox connection add/remove/list` — Attach or detach connection-backed tools to a toolbox version. Supported tool types: MCP (RemoteTool), Azure AI Search (CognitiveSearch), RemoteA2A, and GroundingWithCustomSearch.
+- `azd ai toolbox skill add/remove/list` — Attach or detach skill references to a toolbox version.

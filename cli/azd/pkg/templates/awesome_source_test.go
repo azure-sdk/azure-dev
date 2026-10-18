@@ -1,0 +1,104 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package templates
+
+import (
+	"net/http"
+	"testing"
+
+	"github.com/azure/azure-dev/cli/azd/test/mocks"
+	"github.com/stretchr/testify/require"
+)
+
+var testAwesomeAzdTemplates []*awesomeAzdTemplate = []*awesomeAzdTemplate{
+	{
+		Title:       "template1",
+		Description: "Description of template 1",
+		Source:      "http://github.com/user/template1",
+	},
+	{
+		Title:       "template2",
+		Description: "Description of template 2",
+		Source:      "htdtp://github.com/user/template2",
+	},
+	{
+		Title:        "agent template",
+		Source:       "https://github.com/microsoft-foundry/foundry-samples/blob/main/azure.yaml",
+		TemplateType: "extension.ai.agent",
+	},
+}
+
+func Test_NewAwesomeAzdTemplateSource_ValidUrl(t *testing.T) {
+	mockContext := mocks.NewMockContext(t.Context())
+	mockAwesomeAzdTemplateSource(mockContext)
+
+	name := "test"
+	url := "https://aka.ms/awesome-azd/templates.json"
+
+	source, err := newAwesomeAzdTemplateSource(t.Context(), name, url, mockContext.HttpClient)
+	require.Nil(t, err)
+
+	require.Equal(t, name, source.Name())
+}
+
+func Test_NewAwesomeAzdTemplateSource_SkipsExtensionTemplates(t *testing.T) {
+	mockContext := mocks.NewMockContext(t.Context())
+	mockAwesomeAzdTemplateSource(mockContext)
+
+	source, err := newAwesomeAzdTemplateSource(
+		t.Context(),
+		"test",
+		"https://aka.ms/awesome-azd/templates.json",
+		mockContext.HttpClient)
+	require.NoError(t, err)
+
+	templates, err := source.ListTemplates(t.Context())
+	require.NoError(t, err)
+	require.Len(t, templates, 2)
+	require.Equal(t, []string{"template1", "template2"}, []string{templates[0].Name, templates[1].Name})
+}
+
+func Test_NewAwesomeAzdTemplateSource_ValidUrl_InvalidJson(t *testing.T) {
+	mockContext := mocks.NewMockContext(t.Context())
+
+	name := "test"
+	url := "https://example.com/templates.json"
+
+	mockContext.HttpClient.When(func(req *http.Request) bool {
+		return req.Method == http.MethodGet && req.URL.String() == url
+	}).RespondFn(func(req *http.Request) (*http.Response, error) {
+		return mocks.CreateHttpResponseWithBody(req, http.StatusOK, "invalid json")
+	})
+
+	source, err := newAwesomeAzdTemplateSource(t.Context(), name, url, mockContext.HttpClient)
+	require.Nil(t, source)
+	require.Error(t, err)
+}
+
+func Test_NewAwesomeAzdTemplateSource_InvalidUrl(t *testing.T) {
+	mockContext := mocks.NewMockContext(t.Context())
+
+	name := "test"
+	url := "https://example.com/templates.json"
+
+	mockContext.HttpClient.When(func(req *http.Request) bool {
+		return req.Method == http.MethodGet && req.URL.String() == url
+	}).RespondFn(func(req *http.Request) (*http.Response, error) {
+		return mocks.CreateEmptyHttpResponse(req, http.StatusNotFound)
+	})
+
+	source, err := newAwesomeAzdTemplateSource(t.Context(), name, url, mockContext.HttpClient)
+	require.Nil(t, source)
+	require.Error(t, err)
+}
+
+func mockAwesomeAzdTemplateSource(mockContext *mocks.MockContext) {
+	const url = "https://aka.ms/awesome-azd/templates.json"
+
+	mockContext.HttpClient.When(func(req *http.Request) bool {
+		return req.Method == http.MethodGet && req.URL.String() == url
+	}).RespondFn(func(req *http.Request) (*http.Response, error) {
+		return mocks.CreateHttpResponseWithBody(req, http.StatusOK, testAwesomeAzdTemplates)
+	})
+}

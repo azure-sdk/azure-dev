@@ -1,0 +1,279 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ExtensionSchema",
+  "description": "Schema representing the structure of extension.yaml for azd extensions. Provides comprehensive metadata with enhanced inline documentation for improved authoring experience.",
+  "definitions": {
+    "ExtensionExample": {
+      "type": "object",
+      "title": "Extension Example",
+      "description": "An example demonstrating how to use the extension.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "title": "Example Name",
+          "description": "A brief name for the example."
+        },
+        "description": {
+          "type": "string",
+          "title": "Example Description",
+          "description": "Detailed explanation of what the example demonstrates."
+        },
+        "usage": {
+          "type": "string",
+          "title": "Example Usage",
+          "description": "Command or instructions that show how to use this example."
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "usage"
+      ]
+    },
+    "ExtensionDependency": {
+      "type": "object",
+      "title": "Extension Dependency",
+      "description": "A dependency required by this extension.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "title": "Dependency ID",
+          "description": "Unique identifier of the dependent extension."
+        },
+        "version": {
+          "type": "string",
+          "title": "Dependency Version",
+          "description": "The required version or version range, following semantic versioning."
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "Provider": {
+      "type": "object",
+      "title": "Provider",
+      "description": "A provider registered by this extension.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "title": "Provider Name",
+          "description": "Unique identifier for this provider within the extension."
+        },
+        "type": {
+          "type": "string",
+          "title": "Provider Type",
+          "description": "The type of provider.",
+          "enum": [
+            "service-target"
+          ]
+        },
+        "description": {
+          "type": "string",
+          "title": "Description",
+          "description": "Description of what this provider does."
+        }
+      },
+      "required": [
+        "name",
+        "type",
+        "description"
+      ]
+    }
+  },
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "title": "Extension ID",
+      "description": "A unique identifier for the extension."
+    },
+    "namespace": {
+      "type": "string",
+      "title": "Extension Namespace",
+      "description": "Namespace used to group extension commands; optional."
+    },
+    "entryPoint": {
+      "type": "string",
+      "title": "Entry Point",
+      "description": "Executable or script that serves as the entry point of the extension; optional."
+    },
+    "version": {
+      "type": "string",
+      "title": "Extension Version",
+      "description": "Semantic version of the extension. Use the format MAJOR.MINOR.PATCH (optionally with a pre-release tag).",
+      "pattern": "^\\d+\\.\\d+\\.\\d+(-[A-Za-z0-9-.]+)?$"
+    },
+    "requiredAzdVersion": {
+      "type": "string",
+      "title": "Required azd Version",
+      "description": "azd core version constraint required to use this extension. Supports semantic versioning constraint expressions (e.g. \">= 1.24.0\")."
+    },
+    "capabilities": {
+      "type": "array",
+      "title": "Capabilities",
+      "description": "List of capabilities provided by the extension. Supported values: custom-commands, lifecycle-events, mcp-server, service-target-provider, framework-service-provider, provisioning-provider, validation-provider, metadata. Select one or more from the allowed list. Each value must be unique. Not required for extension packs, which declare dependencies instead and have no executable.",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "oneOf": [
+          {
+            "type": "string",
+            "const": "custom-commands",
+            "title": "Custom Commands",
+            "description": "Custom commands expose new command groups and commands to azd."
+          },
+          {
+            "type": "string",
+            "const": "lifecycle-events",
+            "title": "Lifecycle Events",
+            "description": "Lifecycle events enable extensions to subscribe to azd project and service lifecycle events."
+          },
+          {
+            "type": "string",
+            "const": "mcp-server",
+            "title": "MCP Server",
+            "description": "MCP server capability enables extensions to provide Model Context Protocol tools that can be used by AI agents."
+          },
+          {
+            "type": "string",
+            "const": "service-target-provider",
+            "title": "Service Target Provider",
+            "description": "Service target provider enables extensions to provide custom service deployment targets."
+          },
+          {
+            "type": "string",
+            "const": "framework-service-provider",
+            "title": "Framework Service Provider",
+            "description": "Framework service provider enables extensions to provide custom language frameworks and build systems."
+          },
+          {
+            "type": "string",
+            "const": "provisioning-provider",
+            "title": "Provisioning Provider",
+            "description": "Provisioning provider enables extensions to provide a custom infrastructure provisioning experience."
+          },
+          {
+            "type": "string",
+            "const": "validation-provider",
+            "title": "Validation Provider",
+            "description": "Validation provider enables extensions to contribute checks to azd validation pipelines."
+          },
+          {
+            "type": "string",
+            "const": "metadata",
+            "title": "Metadata",
+            "description": "Metadata capability enables extensions to provide comprehensive metadata about their commands and capabilities via a metadata command."
+          }
+        ]
+      }
+    },
+    "displayName": {
+      "type": "string",
+      "title": "Display Name",
+      "description": "Human-readable name of the extension."
+    },
+    "description": {
+      "type": "string",
+      "title": "Description",
+      "description": "A detailed description of the extension including its features and purpose."
+    },
+    "usage": {
+      "type": "string",
+      "title": "Usage",
+      "description": "Instructions or details on how to use the extension."
+    },
+    "examples": {
+      "type": "array",
+      "title": "Examples",
+      "description": "Usage examples that help illustrate how the extension can be used.",
+      "items": {
+        "$ref": "#/definitions/ExtensionExample"
+      }
+    },
+    "tags": {
+      "type": "array",
+      "title": "Tags",
+      "description": "Keywords to help categorize and filter the extension.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "dependencies": {
+      "type": "array",
+      "title": "Dependencies",
+      "description": "List of other extensions that this extension depends on. These will be resolved and installed automatically.",
+      "items": {
+        "$ref": "#/definitions/ExtensionDependency"
+      },
+      "minItems": 1
+    },
+    "providers": {
+      "type": "array",
+      "title": "Providers",
+      "description": "List of providers that this extension registers. Each provider must have a corresponding capability declared.",
+      "items": {
+        "$ref": "#/definitions/Provider"
+      }
+    },
+    "platforms": {
+      "type": "object",
+      "title": "Platform Metadata",
+      "description": "Optional, platform-specific metadata to tailor the extension for different environments.",
+      "additionalProperties": {
+        "type": "object",
+        "title": "Platform Specific",
+        "description": "Custom metadata for a particular platform.",
+        "additionalProperties": true
+      }
+    },
+    "mcp": {
+      "type": "object",
+      "title": "MCP Configuration",
+      "description": "Configuration for Model Context Protocol server functionality. Required when mcp-server capability is declared.",
+      "properties": {
+        "serve": {
+          "type": "object",
+          "title": "MCP Server Configuration",
+          "description": "Configuration for starting the extension's MCP server.",
+          "properties": {
+            "args": {
+              "type": "array",
+              "title": "Server Arguments",
+              "description": "Command-line arguments to pass when starting the MCP server. Typically ['mcp', 'serve'] or similar.",
+              "items": {
+                "type": "string"
+              },
+              "default": ["mcp", "serve"]
+            },
+            "env": {
+              "type": "array",
+              "title": "Environment Variables",
+              "description": "Additional environment variables to set when starting the MCP server.",
+              "items": {
+                "type": "string"
+              },
+              "default": []
+            }
+          },
+          "required": ["args"]
+        }
+      },
+      "required": ["serve"]
+    }
+  },
+  "required": [
+    "id",
+    "version",
+    "displayName",
+    "description"
+  ],
+  "anyOf": [
+    {
+      "required": ["capabilities"]
+    },
+    {
+      "required": ["dependencies"]
+    }
+  ]
+}

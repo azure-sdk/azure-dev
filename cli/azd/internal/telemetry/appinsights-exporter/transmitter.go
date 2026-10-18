@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
 package appinsightsexporter
 
 // Forked implementation from github.com/microsoft/ApplicationInsights-Go
@@ -5,6 +8,7 @@ package appinsightsexporter
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -13,7 +17,7 @@ import (
 )
 
 type Transmitter interface {
-	Transmit(payload []byte, items TelemetryItems) (*TransmissionResult, error)
+	Transmit(ctx context.Context, payload []byte, items TelemetryItems) (*TransmissionResult, error)
 }
 
 type httpTransmitter struct {
@@ -60,7 +64,11 @@ func NewTransmitter(endpointAddress string, client *http.Client) Transmitter {
 	return &httpTransmitter{endpointAddress, client}
 }
 
-func (transmitter *httpTransmitter) Transmit(payload []byte, items TelemetryItems) (*TransmissionResult, error) {
+func (transmitter *httpTransmitter) Transmit(
+	ctx context.Context,
+	payload []byte,
+	items TelemetryItems,
+) (*TransmissionResult, error) {
 	startTime := time.Now()
 
 	// Compress the payload
@@ -74,7 +82,7 @@ func (transmitter *httpTransmitter) Transmit(payload []byte, items TelemetryItem
 
 	gzipWriter.Close()
 
-	req, err := http.NewRequest(http.MethodPost, transmitter.endpoint, &postBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, transmitter.endpoint, &postBody)
 	if err != nil {
 		return nil, err
 	}
@@ -83,7 +91,7 @@ func (transmitter *httpTransmitter) Transmit(payload []byte, items TelemetryItem
 	req.Header.Set("Content-Type", "application/x-json-stream")
 	req.Header.Set("Accept-Encoding", "gzip, deflate")
 
-	resp, err := transmitter.client.Do(req)
+	resp, err := transmitter.client.Do(req) //nolint:gosec // G704: endpoint is a known telemetry ingestion URL
 	if err != nil {
 		diagLog.Printf("Failed to transmit telemetry: %s", err.Error())
 		return nil, err

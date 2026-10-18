@@ -1,0 +1,83 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+import { WorkspaceResource } from '@microsoft/vscode-azureresources-api';
+import * as vscode from 'vscode';
+import { callWithTelemetryAndErrorHandling } from '@microsoft/vscode-azext-utils';
+import { TelemetryId } from '../../telemetry/telemetryId';
+import { AzureDevCliEnvironments } from './AzureDevCliEnvironments';
+import { AzureDevCliModel, AzureDevCliModelContext, RefreshHandler } from './AzureDevCliModel';
+import { AzureDevCliServices } from './AzureDevCliServices';
+import { AzDevShowResults, AzureDevShowProvider } from '../../services/AzureDevShowProvider';
+import { AsyncLazy } from '../../utils/lazy';
+import { AzureDevEnvListProvider } from '../../services/AzureDevEnvListProvider';
+import { AzureDevEnvValuesProvider } from '../../services/AzureDevEnvValuesProvider';
+
+export class AzureDevCliApplication implements AzureDevCliModel {
+    private results: AsyncLazy<AzDevShowResults>;
+
+    constructor(
+        private readonly resource: WorkspaceResource,
+        private readonly refresh: RefreshHandler,
+        private readonly showProvider: AzureDevShowProvider,
+        private readonly envListProvider: AzureDevEnvListProvider,
+        private readonly envValuesProvider: AzureDevEnvValuesProvider,
+        private readonly visibleEnvVars: Set<string>,
+        private readonly onToggleVisibility: (key: string) => void,
+        private readonly includeEnvironments: boolean = true) {
+        this.results = new AsyncLazy(() => this.getResults());
+    }
+
+    get context(): AzureDevCliModelContext {
+        return {
+            configurationFile: vscode.Uri.file(this.resource.id),
+        };
+    }
+
+    async getChildren(): Promise<AzureDevCliModel[]> {
+        const results = await this.results.getValue();
+
+        const children: AzureDevCliModel[] = [
+            new AzureDevCliServices(this.context, Object.keys(results?.services ?? {}))
+        ];
+
+        if (this.includeEnvironments) {
+            children.push(new AzureDevCliEnvironments(
+                this.context,
+                this.refresh,
+                this.envListProvider,
+                this.envValuesProvider,
+                this.visibleEnvVars,
+                this.onToggleVisibility
+            ));
+        }
+
+        return children;
+    }
+
+    async getTreeItem(): Promise<vscode.TreeItem> {
+        const results = await this.results.getValue();
+
+        const treeItem = new vscode.TreeItem(results?.name ?? this.resource.name, vscode.TreeItemCollapsibleState.Expanded);
+
+        treeItem.contextValue = 'ms-azuretools.azure-dev.views.workspace.application';
+        treeItem.iconPath = new vscode.ThemeIcon('azure');
+
+        return treeItem;
+    }
+
+    private getResults(): Promise<AzDevShowResults> {
+        return callWithTelemetryAndErrorHandling(
+            TelemetryId.WorkspaceViewApplicationResolve,
+            async actionContext => {
+                // This runs automatically whenever the workspace tree resolves. A non-zero `azd show`
+                // exit here is almost always an expected/environmental state (not logged in, no
+                // environment yet, invalid azure.yaml) rather than an extension bug, so don't surface a
+                // modal error with a "Report Issue" button. The failure is still captured in telemetry,
+                // and azure.yaml problems are reported independently via the Problems panel.
+                actionContext.errorHandling.suppressDisplay = true;
+                return await this.showProvider.getShowResults(actionContext, this.context.configurationFile);
+            }
+        ) as Promise<AzDevShowResults>;
+    }
+}

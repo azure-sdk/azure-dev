@@ -1,0 +1,1224 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package agent_api
+
+import (
+	"encoding/json"
+	"fmt"
+	"math"
+	"time"
+)
+
+// AgentProtocol represents the protocol types supported by agents
+type AgentProtocol string
+
+const (
+	// AgentProtocolActivityProtocol is the canonical Activity protocol wire value.
+	// Upstream renamed it from "activity_protocol" to "activity"; the legacy value
+	// is still accepted on read via AgentProtocolActivityProtocolLegacy.
+	AgentProtocolActivityProtocol AgentProtocol = "activity"
+	// AgentProtocolActivityProtocolLegacy is the pre-rename Activity wire value,
+	// preserved for back-compat when reading manifests authored before the rename.
+	AgentProtocolActivityProtocolLegacy AgentProtocol = "activity_protocol"
+	AgentProtocolInvocations            AgentProtocol = "invocations"
+	AgentProtocolInvocationsWS          AgentProtocol = "invocations_ws"
+	AgentProtocolResponses              AgentProtocol = "responses"
+	AgentProtocolA2A                    AgentProtocol = "a2a"
+)
+
+// IsActivityProtocolName reports whether the given definition-level protocol name
+// denotes the Activity protocol. It accepts both the canonical "activity" and the
+// legacy "activity_protocol" value (upstream renamed it; legacy stays accepted).
+func IsActivityProtocolName(p AgentProtocol) bool {
+	return p == AgentProtocolActivityProtocol || p == AgentProtocolActivityProtocolLegacy
+}
+
+// InvocableProtocols returns the set of protocols that azd can invoke directly.
+// activity is deployment-only — it cannot be used for local or remote
+// invocation through azd. A2A is remote-only (see IsInvocable / IsLocalInvocable).
+func InvocableProtocols() []AgentProtocol {
+	return []AgentProtocol{
+		AgentProtocolResponses,
+		AgentProtocolInvocations,
+		AgentProtocolA2A,
+	}
+}
+
+// IsInvocable reports whether the protocol can be used for invocation through azd.
+func (p AgentProtocol) IsInvocable() bool {
+	switch p {
+	case AgentProtocolResponses, AgentProtocolInvocations, AgentProtocolA2A:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsLocalInvocable reports whether the protocol can be invoked against a locally
+// running agent (azd ai agent run). A2A is a remote agent-to-agent protocol and
+// is only invocable against a deployed Foundry agent.
+func (p AgentProtocol) IsLocalInvocable() bool {
+	return p.IsInvocable() && p != AgentProtocolA2A
+}
+
+// AgentKind represents the different types of agents
+type AgentKind string
+
+const (
+	AgentKindHosted   AgentKind = "hosted"
+	AgentKindWorkflow AgentKind = "workflow"
+	// AgentKindPrompt is the Foundry prompt agent kind backed by the Prompt
+	// Execution Service (PES). "prompt" is the wire discriminator for both the
+	// plain and the harnessed ("managed") flavor — a harness is a property of
+	// the agent, not a kind of its own.
+	AgentKindPrompt AgentKind = "prompt"
+	// AgentKindVoice is the data-plane (service) kind for a declarative voice
+	// (speech-to-speech) agent. The azd manifest authoring kind is "prompt-voice"
+	// (agent_yaml.AgentKindPromptVoice), which the map layer translates to this
+	// value before posting through the unified /agents API.
+	AgentKindVoice AgentKind = "voice"
+)
+
+// DigitalWorkerType identifies the service-side Digital Worker classification.
+type DigitalWorkerType string
+
+const (
+	// DigitalWorkerTypeM365 is a Microsoft 365 Digital Worker.
+	DigitalWorkerTypeM365 DigitalWorkerType = "m365"
+)
+
+// AgentEventType represents the types of events that can be handled
+type AgentEventType string
+
+const (
+	AgentEventTypeResponseCompleted AgentEventType = "response.completed"
+)
+
+// AgentEventHandlerDestinationType represents the destination types for event handlers
+type AgentEventHandlerDestinationType string
+
+const (
+	AgentEventHandlerDestinationTypeEvals AgentEventHandlerDestinationType = "evals"
+)
+
+// RaiInvocationContentType identifies how the invocations request or response body is encoded,
+// which determines how the content-safety proxy extracts the text it moderates.
+type RaiInvocationContentType string
+
+const (
+	// RaiInvocationContentTypeJSON extracts text from a JSON body using JSONPath expressions.
+	RaiInvocationContentTypeJSON RaiInvocationContentType = "json"
+	// RaiInvocationContentTypeText treats the whole body as the text to moderate.
+	RaiInvocationContentTypeText RaiInvocationContentType = "text"
+)
+
+// RaiInvocationMode declares the response shapes the agent container is able to produce.
+// It is not an "input and output" switch: at runtime the proxy inspects the actual response
+// Content-Type and runs exactly one output gate.
+type RaiInvocationMode string
+
+const (
+	// RaiInvocationModeNonStreaming declares the agent only returns buffered (non-SSE) responses.
+	RaiInvocationModeNonStreaming RaiInvocationMode = "non_streaming"
+	// RaiInvocationModeStreaming declares the agent only returns server-sent event streams.
+	RaiInvocationModeStreaming RaiInvocationMode = "streaming"
+	// RaiInvocationModeBoth declares the agent may return either shape depending on the request.
+	RaiInvocationModeBoth RaiInvocationMode = "both"
+)
+
+// SseTextSelector locates the text to moderate inside a single server-sent event frame.
+type SseTextSelector struct {
+	// EventType is the SSE event name the selector applies to.
+	EventType string `json:"event_type"`
+	// TextField is the JSONPath expression, relative to the frame payload, holding the text.
+	TextField string `json:"text_field,omitempty"`
+}
+
+// InvocationsModeration configures how the content-safety proxy extracts text from
+// invocations-protocol requests and responses so it can be submitted to the RAI policy.
+// Without it a RAI policy attached to an invocations agent has nothing to moderate.
+type InvocationsModeration struct {
+	InputContentType  RaiInvocationContentType `json:"input_content_type,omitempty"`
+	OutputContentType RaiInvocationContentType `json:"output_content_type,omitempty"`
+	ResponseMode      RaiInvocationMode        `json:"response_mode"`
+	InputPaths        []string                 `json:"input_paths,omitempty"`
+	OutputPaths       []string                 `json:"output_paths,omitempty"`
+	StreamSelectors   []SseTextSelector        `json:"stream_selectors,omitempty"`
+}
+
+// RaiConfig represents configuration for Responsible AI content filtering
+type RaiConfig struct {
+	RaiPolicyName string `json:"rai_policy_name"`
+	// InvocationsModeration is optional and only meaningful for agents that expose the
+	// invocations protocol.
+	InvocationsModeration *InvocationsModeration `json:"invocations_moderation,omitempty"`
+}
+
+// AgentDefinition is the base definition for all agent types
+type AgentDefinition struct {
+	Kind      AgentKind  `json:"kind"`
+	RaiConfig *RaiConfig `json:"rai_config,omitempty"`
+}
+
+// ProtocolVersionRecord represents a mapping for protocol and version
+type ProtocolVersionRecord struct {
+	Protocol AgentProtocol `json:"protocol"`
+	Version  string        `json:"version"`
+}
+
+// AgentEndpointProtocol represents the protocol types supported at the agent endpoint level.
+// These differ from AgentProtocol (which is used in definition-level protocol_versions).
+type AgentEndpointProtocol string
+
+const (
+	AgentEndpointProtocolActivity    AgentEndpointProtocol = "activity"
+	AgentEndpointProtocolResponses   AgentEndpointProtocol = "responses"
+	AgentEndpointProtocolA2A         AgentEndpointProtocol = "a2a"
+	AgentEndpointProtocolMCP         AgentEndpointProtocol = "mcp"
+	AgentEndpointProtocolInvocations AgentEndpointProtocol = "invocations"
+)
+
+// VersionSelectorType represents the type of version selection rule.
+type VersionSelectorType string
+
+const (
+	VersionSelectorTypeFixedRatio VersionSelectorType = "FixedRatio"
+)
+
+// VersionSelectionRule describes how traffic is routed to an agent version.
+// Discriminated by Type. For FixedRatio rules, TrafficPercentage is set.
+type VersionSelectionRule struct {
+	Type              VersionSelectorType `json:"type"`
+	AgentVersion      string              `json:"agent_version"`
+	TrafficPercentage *int32              `json:"traffic_percentage,omitempty"`
+}
+
+// VersionSelector determines how traffic is routed to different versions of an agent.
+type VersionSelector struct {
+	VersionSelectionRules []VersionSelectionRule `json:"version_selection_rules"`
+}
+
+// AgentEndpointAuthorizationSchemeType represents the authorization scheme type.
+type AgentEndpointAuthorizationSchemeType string
+
+const (
+	AgentEndpointAuthSchemeEntra            AgentEndpointAuthorizationSchemeType = "Entra"
+	AgentEndpointAuthSchemeBotService       AgentEndpointAuthorizationSchemeType = "BotService"
+	AgentEndpointAuthSchemeBotServiceRbac   AgentEndpointAuthorizationSchemeType = "BotServiceRbac"
+	AgentEndpointAuthSchemeBotServiceTenant AgentEndpointAuthorizationSchemeType = "BotServiceTenant"
+)
+
+// IsolationKeySourceKind represents the kind of isolation key source.
+type IsolationKeySourceKind string
+
+const (
+	IsolationKeySourceKindEntra  IsolationKeySourceKind = "Entra"
+	IsolationKeySourceKindHeader IsolationKeySourceKind = "Header"
+)
+
+// IsolationKeySource describes the source from which a per-user isolation key is derived.
+// Discriminated by Kind.
+type IsolationKeySource struct {
+	Kind IsolationKeySourceKind `json:"kind"`
+}
+
+// AgentEndpointAuthorizationScheme describes an authorization scheme for the agent endpoint.
+// Discriminated by Type. For Entra schemes, IsolationKeySource may be set.
+type AgentEndpointAuthorizationScheme struct {
+	Type               AgentEndpointAuthorizationSchemeType `json:"type"`
+	IsolationKeySource *IsolationKeySource                  `json:"isolation_key_source,omitempty"`
+}
+
+// ActivityProtocolConfiguration describes configuration specific to the activity protocol.
+type ActivityProtocolConfiguration struct {
+	EnableM365PublicEndpoint *bool `json:"enable_m365_public_endpoint,omitempty"`
+}
+
+// ResponsesProtocolConfiguration describes configuration specific to the responses protocol.
+type ResponsesProtocolConfiguration struct{}
+
+// A2AProtocolConfiguration describes configuration specific to the A2A protocol.
+type A2AProtocolConfiguration struct{}
+
+// MCPProtocolConfiguration describes configuration specific to the MCP protocol.
+type MCPProtocolConfiguration struct{}
+
+// InvocationsProtocolConfiguration describes configuration specific to the invocations protocol.
+type InvocationsProtocolConfiguration struct{}
+
+// InvocationsWSProtocolConfiguration describes configuration specific to the WebSocket-based invocations protocol.
+type InvocationsWSProtocolConfiguration struct{}
+
+// ProtocolConfiguration describes per-protocol configuration for the agent endpoint.
+// The presence of a key declares the protocol is enabled.
+type ProtocolConfiguration struct {
+	Activity      *ActivityProtocolConfiguration      `json:"activity,omitempty"`
+	Responses     *ResponsesProtocolConfiguration     `json:"responses,omitempty"`
+	A2A           *A2AProtocolConfiguration           `json:"a2a,omitempty"`
+	MCP           *MCPProtocolConfiguration           `json:"mcp,omitempty"`
+	Invocations   *InvocationsProtocolConfiguration   `json:"invocations,omitempty"`
+	InvocationsWS *InvocationsWSProtocolConfiguration `json:"invocations_ws,omitempty"`
+}
+
+// AgentEndpoint describes the endpoint configuration for an agent.
+type AgentEndpoint struct {
+	VersionSelector       *VersionSelector                   `json:"version_selector,omitempty"`
+	Protocols             []AgentEndpointProtocol            `json:"protocols,omitempty"`
+	ProtocolConfiguration *ProtocolConfiguration             `json:"protocol_configuration,omitempty"`
+	AuthorizationSchemes  []AgentEndpointAuthorizationScheme `json:"authorization_schemes,omitempty"`
+}
+
+// AgentCardSkill describes a single capability that an agent can perform.
+type AgentCardSkill struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Tags        []string `json:"tags,omitempty"`
+	Examples    []string `json:"examples,omitempty"`
+}
+
+// AgentCard is the A2A agent card that advertises an agent's capabilities.
+type AgentCard struct {
+	Description string           `json:"description"`
+	Version     *string          `json:"version,omitempty"`
+	Skills      []AgentCardSkill `json:"skills"`
+}
+
+// WorkflowDefinition represents a workflow agent
+type WorkflowDefinition struct {
+	AgentDefinition
+	Trigger map[string]any `json:"trigger,omitempty"`
+}
+
+// CodeConfigurationAPI represents the code_configuration block in the API request
+type CodeConfigurationAPI struct {
+	Runtime              string   `json:"runtime"`
+	EntryPoint           []string `json:"entry_point"`
+	DependencyResolution string   `json:"dependency_resolution,omitempty"`
+}
+
+// ContainerConfigurationAPI represents the container_configuration block in the API request.
+// Used for container deploy mode to specify the pre-built container image.
+type ContainerConfigurationAPI struct {
+	Image                string `json:"image"`
+	RegistryConnectionID string `json:"registry_connection_id,omitempty"`
+}
+
+// SessionConfigurationAPI represents the session_configuration block in the API request.
+// It controls hosted-agent session runtime behavior; when omitted the service applies
+// its own defaults.
+type SessionConfigurationAPI struct {
+	// IdleTimeoutSeconds maps to session_configuration.idle_timeout_seconds. Valid
+	// range is 120–3600 (inclusive). When the field is unset the whole
+	// session_configuration block is omitted and the service default (900) applies.
+	IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
+}
+
+// HostedAgentDefinition represents a hosted agent that can be either container-based
+// (with ContainerConfiguration) or code-based (with CodeConfiguration).
+// Both deploy modes now use "protocol_versions" in the serialized JSON.
+type HostedAgentDefinition struct {
+	AgentDefinition
+	ProtocolVersions       []ProtocolVersionRecord    `json:"protocol_versions,omitempty"`
+	CPU                    string                     `json:"cpu"`
+	Memory                 string                     `json:"memory"`
+	EnvironmentVariables   map[string]string          `json:"environment_variables,omitempty"`
+	ContainerConfiguration *ContainerConfigurationAPI `json:"container_configuration,omitempty"` // container deploy only
+	CodeConfiguration      *CodeConfigurationAPI      `json:"code_configuration,omitempty"`      // code deploy only
+	SessionConfiguration   *SessionConfigurationAPI   `json:"session_configuration,omitempty"`   // optional session tuning
+	Image                  string                     `json:"image,omitempty"`                   // deprecated: for backward compat deserialization only
+}
+
+// UnmarshalJSON implements custom JSON unmarshaling for HostedAgentDefinition.
+// It reads protocol versions from either "protocol_versions" or legacy "container_protocol_versions",
+// and image from either "container_configuration.image" or legacy top-level "image".
+func (d *HostedAgentDefinition) UnmarshalJSON(data []byte) error {
+	type Alias HostedAgentDefinition
+
+	var raw struct {
+		Alias
+		ContainerProtocolVersions []ProtocolVersionRecord `json:"container_protocol_versions"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	*d = HostedAgentDefinition(raw.Alias)
+
+	// Backward compat: if protocol_versions is empty, fall back to legacy container_protocol_versions
+	if len(d.ProtocolVersions) == 0 && len(raw.ContainerProtocolVersions) > 0 {
+		d.ProtocolVersions = raw.ContainerProtocolVersions
+	}
+
+	// Backward compat: if container_configuration is not set but legacy top-level image is, migrate it
+	if d.ContainerConfiguration == nil && d.Image != "" {
+		d.ContainerConfiguration = &ContainerConfigurationAPI{Image: d.Image}
+		d.Image = "" // clear deprecated field
+	}
+
+	return nil
+}
+
+// ManagedPackages describes packages to install in the managed agent sandbox.
+type ManagedPackages struct {
+	Pip []string `json:"pip,omitempty"`
+	Apt []string `json:"apt,omitempty"`
+}
+
+// ManagedEnvironment describes the runtime environment for a managed agent's Hand sandbox.
+// All fields are optional; the platform applies sensible defaults when unset.
+type ManagedEnvironment struct {
+	BaseImage            *string           `json:"base_image,omitempty"`
+	Image                *string           `json:"image,omitempty"`
+	Packages             *ManagedPackages  `json:"packages,omitempty"`
+	CPU                  *string           `json:"cpu,omitempty"`
+	Memory               *string           `json:"memory,omitempty"`
+	EgressPolicy         *string           `json:"egress_policy,omitempty"`
+	EnvironmentVariables map[string]string `json:"environment_variables,omitempty"`
+}
+
+// ManagedAgentHarnessGitHubCopilot is the discriminator sent in the managed
+// agent definition's `harness.type` field to run the agent on the GitHub
+// Copilot harness.
+//
+// This is the spelling the managed-agent spec defines, and the `_preview`
+// suffix is part of it: the harness is in preview and the service will version
+// the discriminator when it leaves preview.
+const ManagedAgentHarnessGitHubCopilot = "github_copilot_preview"
+
+// SkillReference identifies a Foundry skill available to a prompt agent.
+//
+// Version is not optional in practice. The API contract says an omitted version
+// resolves to the skill's current default, but the service currently returns a
+// 500 for a reference without one, so callers must supply the version they
+// published. Skills are published before the agent version is created, so the
+// version is always known by then.
+type SkillReference struct {
+	Type    string `json:"type"`
+	Name    string `json:"name"`
+	Version string `json:"version,omitempty"`
+}
+
+// ManagedAgentHarness is the `harness` block of a managed agent definition.
+type ManagedAgentHarness struct {
+	Type string `json:"type"`
+}
+
+// ManagedAgentDefinition represents a Foundry "managed" agent — a prompt agent
+// that names an execution harness. Managed agents declare a model plus
+// instructions and optionally tools, skills, and environment overrides. The
+// platform provisions Brain+Hand sandboxes on demand to execute the agent.
+type ManagedAgentDefinition struct {
+	AgentDefinition
+	Model string `json:"model"`
+	// Harness identifies the execution harness the platform should use to run
+	// the managed agent. Nil for a plain prompt agent, which Foundry runs directly.
+	Harness          *ManagedAgentHarness `json:"harness,omitempty"`
+	Instructions     string               `json:"instructions,omitempty"`
+	Tools            []any                `json:"tools,omitempty"`
+	ToolChoice       any                  `json:"tool_choice,omitempty"`
+	Temperature      *float64             `json:"temperature,omitempty"`
+	TopP             *float64             `json:"top_p,omitempty"`
+	Text             any                  `json:"text,omitempty"`
+	Reasoning        any                  `json:"reasoning,omitempty"`
+	Skills           []SkillReference     `json:"skills,omitempty"`
+	StructuredInputs map[string]any       `json:"structured_inputs,omitempty"`
+	Environment      *ManagedEnvironment  `json:"environment,omitempty"`
+	Files            map[string]string    `json:"files,omitempty"`
+}
+
+// VoiceModelType selects the model-inference mode for a voice agent.
+//   - "managed": Voice Live-hosted — the service runs the model on its own infra.
+//   - "self_deployed": BYOM — the service calls the customer's own Foundry deployment.
+type VoiceModelType string
+
+const (
+	VoiceModelTypeManaged      VoiceModelType = "managed"
+	VoiceModelTypeSelfDeployed VoiceModelType = "self_deployed"
+	VoiceModelTypeHostedAgent  VoiceModelType = "hosted_agent"
+)
+
+// VoiceTargetAgentReference is the data-plane target_agent object on a managed
+// voice wrapper. Name identifies the hosted agent that receives Voice Bridge
+// turns; Version optionally pins the wrapper to one immutable hosted version.
+type VoiceTargetAgentReference struct {
+	Name    string `json:"name"`
+	Version string `json:"version,omitempty"`
+}
+
+// VoiceConversationEngine is the data-plane conversation_engine object on a
+// managed Voice wrapper.
+type VoiceConversationEngine struct {
+	Type    string `json:"type"`
+	Name    string `json:"name"`
+	Version string `json:"version,omitempty"`
+}
+
+// VoiceAudioFormat describes a PCM audio stream format (e.g. audio/pcm @ 24 kHz).
+type VoiceAudioFormat struct {
+	Type string `json:"type"`
+	Rate *int   `json:"rate,omitempty"`
+}
+
+// VoiceTurnDetection configures server-side voice-activity detection so the
+// agent auto-responds when the caller stops speaking.
+type VoiceTurnDetection struct {
+	Type              string   `json:"type"`
+	Threshold         *float64 `json:"threshold,omitempty"`
+	PrefixPaddingMs   *int     `json:"prefix_padding_ms,omitempty"`
+	SilenceDurationMs *int     `json:"silence_duration_ms,omitempty"`
+	CreateResponse    *bool    `json:"create_response,omitempty"`
+	Eagerness         *string  `json:"eagerness,omitempty"`
+	SpeechDurationMs  *int     `json:"speech_duration_ms,omitempty"`
+	RemoveFillerWords *bool    `json:"remove_filler_words,omitempty"`
+	InterruptResponse *bool    `json:"interrupt_response,omitempty"`
+	Languages         []string `json:"languages,omitempty"`
+	AutoTruncate      *bool    `json:"auto_truncate,omitempty"`
+}
+
+// VoiceTranscription enables user-speech transcription events on the input stream.
+type VoiceTranscription struct {
+	Model    string  `json:"model,omitempty"`
+	Language *string `json:"language,omitempty"`
+	Prompt   *string `json:"prompt,omitempty"`
+}
+
+// VoiceNoiseReduction configures input audio noise reduction.
+type VoiceNoiseReduction struct {
+	Type string `json:"type"`
+}
+
+// VoiceInputConfig is the input (caller -> agent) audio configuration.
+type VoiceInputConfig struct {
+	Format           *VoiceAudioFormat    `json:"format,omitempty"`
+	NoiseReduction   *VoiceNoiseReduction `json:"noise_reduction,omitempty"`
+	EchoCancellation map[string]any       `json:"echo_cancellation,omitempty"`
+	TurnDetection    *VoiceTurnDetection  `json:"turn_detection,omitempty"`
+	Transcription    *VoiceTranscription  `json:"transcription,omitempty"`
+}
+
+// VoiceConfig selects the output voice. Type is "openai" for realtime voices
+// (single lowercase word, e.g. "alloy") or "azure_standard" for Azure Neural
+// voices (e.g. "en-US-Ava:DragonHDLatestNeural").
+type VoiceConfig struct {
+	Type   string  `json:"type"`
+	Name   string  `json:"name"`
+	Style  *string `json:"style,omitempty"`
+	Pitch  *string `json:"pitch,omitempty"`
+	Rate   *string `json:"rate,omitempty"`
+	Locale *string `json:"locale,omitempty"`
+	Volume *string `json:"volume,omitempty"`
+}
+
+// VoiceOutputConfig is the output (agent -> caller) audio configuration for the
+// unified /agents voice API. The voice name is a string and provider details are
+// sibling fields.
+type VoiceOutputConfig struct {
+	Format      *VoiceAudioFormat `json:"format,omitempty"`
+	Voice       string            `json:"voice,omitempty"`
+	VoiceType   string            `json:"voice_type,omitempty"`
+	VoiceLocale string            `json:"voice_locale,omitempty"`
+	Style       *string           `json:"style,omitempty"`
+	Pitch       *string           `json:"pitch,omitempty"`
+	Rate        *string           `json:"rate,omitempty"`
+	Volume      *string           `json:"volume,omitempty"`
+	Speed       *float64          `json:"speed,omitempty"`
+}
+
+// VoiceAudioConfig bundles the input and output audio configuration.
+type VoiceAudioConfig struct {
+	Input  *VoiceInputConfig  `json:"input,omitempty"`
+	Output *VoiceOutputConfig `json:"output,omitempty"`
+}
+
+// VoiceAgentDefinition is the data-plane definition body for a declarative
+// prompt voice agent. Its Kind is always AgentKindVoice ("voice").
+type VoiceAgentDefinition struct {
+	AgentDefinition
+	ModelType          VoiceModelType             `json:"model_type,omitempty"`
+	Model              string                     `json:"model,omitempty"`
+	TargetAgent        *VoiceTargetAgentReference `json:"target_agent,omitempty"`
+	ConversationEngine *VoiceConversationEngine   `json:"conversation_engine,omitempty"`
+	Instructions       string                     `json:"instructions,omitempty"`
+	StructuredInputs   map[string]any             `json:"structured_inputs,omitempty"`
+	Audio              *VoiceAudioConfig          `json:"audio,omitempty"`
+	OutputModalities   []string                   `json:"output_modalities,omitempty"`
+	Store              *bool                      `json:"store,omitempty"`
+	Tools              []map[string]any           `json:"tools,omitempty"`
+	Avatar             map[string]any             `json:"avatar,omitempty"`
+	Greeting           map[string]any             `json:"greeting,omitempty"`
+	Handoff            map[string]any             `json:"handoff,omitempty"`
+	ToolChoice         any                        `json:"tool_choice,omitempty"`
+	ParallelToolCalls  *bool                      `json:"parallel_tool_calls,omitempty"`
+	MaxOutputTokens    any                        `json:"max_output_tokens,omitempty"`
+	Include            []string                   `json:"include,omitempty"`
+}
+
+// TelephonyBindingRequest creates an agent telephony binding.
+type TelephonyBindingRequest struct {
+	Provider        string           `json:"provider"`
+	Identifier      string           `json:"identifier"`
+	ConnectionName  string           `json:"connection_name,omitempty"`
+	TransferTargets []map[string]any `json:"transfer_targets,omitempty"`
+}
+
+// TelephonyBinding describes a Foundry-side phone number binding.
+type TelephonyBinding struct {
+	ID              string           `json:"id,omitempty"`
+	Provider        string           `json:"provider,omitempty"`
+	Identifier      string           `json:"identifier,omitempty"`
+	Status          string           `json:"status,omitempty"`
+	Connection      string           `json:"connection,omitempty"`
+	ConnectionName  string           `json:"connection_name,omitempty"`
+	TransferTargets []map[string]any `json:"transfer_targets,omitempty"`
+	ETag            string           `json:"etag,omitempty"`
+}
+
+// CreateAgentVersionRequest represents a request to create an agent version
+type CreateAgentVersionRequest struct {
+	Description       *string           `json:"description,omitempty"`
+	Metadata          map[string]string `json:"metadata,omitempty"`
+	Definition        any               `json:"definition"` // Can be any of the agent definition types
+	DigitalWorkerType DigitalWorkerType `json:"digital_worker_type,omitempty"`
+}
+
+// CreateAgentRequest represents a request to create an agent
+type CreateAgentRequest struct {
+	Name          string         `json:"name"`
+	AgentEndpoint *AgentEndpoint `json:"agent_endpoint,omitempty"`
+	AgentCard     *AgentCard     `json:"agent_card,omitempty"`
+	CreateAgentVersionRequest
+}
+
+// UpdateAgentRequest represents a request to update an agent
+type UpdateAgentRequest struct {
+	Description *string           `json:"description,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+	Definition  any               `json:"definition"` // Can be any of the agent definition types
+}
+
+// PatchAgentRequest represents a partial update to agent-level fields.
+// Only the fields set here are sent; Definition is intentionally excluded
+// to avoid accidentally clearing it.
+type PatchAgentRequest struct {
+	AgentEndpoint *AgentEndpoint `json:"agent_endpoint,omitempty"`
+	AgentCard     *AgentCard     `json:"agent_card,omitempty"`
+}
+
+// AgentIdentityInfo represents the instance identity assigned to an agent version.
+type AgentIdentityInfo struct {
+	PrincipalID string `json:"principal_id"`
+	ClientID    string `json:"client_id"`
+}
+
+// BlueprintInfo represents the blueprint identity assigned to an agent version.
+type BlueprintInfo struct {
+	PrincipalID string `json:"principal_id"`
+	ClientID    string `json:"client_id"`
+}
+
+// BlueprintReference describes the blueprint backing an agent version.
+type BlueprintReference struct {
+	Type        string `json:"type"`
+	BlueprintID string `json:"blueprint_id"`
+}
+
+// AgentVersionObject represents an agent version
+type AgentVersionObject struct {
+	Object             string              `json:"object"`
+	ID                 string              `json:"id"`
+	Name               string              `json:"name"`
+	Version            string              `json:"version"`
+	Description        *string             `json:"description,omitempty"`
+	Metadata           map[string]string   `json:"metadata,omitempty"`
+	CreatedAt          int64               `json:"created_at"`
+	Definition         any                 `json:"definition"` // Can be any of the agent definition types
+	Status             string              `json:"status,omitempty"`
+	Error              *AgentVersionError  `json:"error,omitempty"`
+	InstanceIdentity   *AgentIdentityInfo  `json:"instance_identity,omitempty"`
+	Blueprint          *BlueprintInfo      `json:"blueprint,omitempty"`
+	BlueprintReference *BlueprintReference `json:"blueprint_reference,omitempty"`
+	AgentGUID          string              `json:"agent_guid,omitempty"`
+	DigitalWorkerType  DigitalWorkerType   `json:"digital_worker_type,omitempty"`
+	// RequestID is populated from the x-request-id response header (not from JSON).
+	RequestID string `json:"-"`
+}
+
+// AgentVersionError represents an error returned by the service for a failed agent version.
+type AgentVersionError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// AgentObject represents an agent
+type AgentObject struct {
+	Object             string              `json:"object"`
+	ID                 string              `json:"id"`
+	Name               string              `json:"name"`
+	State              string              `json:"state,omitempty"`
+	AgentEndpoint      *AgentEndpoint      `json:"agent_endpoint,omitempty"`
+	AgentCard          *AgentCard          `json:"agent_card,omitempty"`
+	InstanceIdentity   *AgentIdentityInfo  `json:"instance_identity,omitempty"`
+	Blueprint          *BlueprintInfo      `json:"blueprint,omitempty"`
+	BlueprintReference *BlueprintReference `json:"blueprint_reference,omitempty"`
+	DigitalWorkerType  DigitalWorkerType   `json:"digital_worker_type,omitempty"`
+	Versions           struct {
+		Latest AgentVersionObject `json:"latest"`
+	} `json:"versions"`
+}
+
+// CommonListObjectProperties represents common properties for list responses
+type CommonListObjectProperties struct {
+	Object  string `json:"object"`
+	FirstID string `json:"first_id,omitempty"`
+	LastID  string `json:"last_id,omitempty"`
+	HasMore bool   `json:"has_more"`
+}
+
+// AgentList represents a list of agents
+type AgentList struct {
+	Data []AgentObject `json:"data"`
+	CommonListObjectProperties
+}
+
+// AgentVersionList represents a list of agent versions
+type AgentVersionList struct {
+	Data []AgentVersionObject `json:"data"`
+	CommonListObjectProperties
+}
+
+// DeleteAgentResponse represents the response when deleting an agent
+type DeleteAgentResponse struct {
+	Object  string `json:"object"`
+	Name    string `json:"name"`
+	Deleted bool   `json:"deleted"`
+}
+
+// DeleteAgentVersionResponse represents the response when deleting an agent version
+type DeleteAgentVersionResponse struct {
+	Object  string `json:"object"`
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	Deleted bool   `json:"deleted"`
+}
+
+// AgentEventHandlerFilter represents filter conditions for event handlers
+type AgentEventHandlerFilter struct {
+	AgentVersions []string `json:"agent_versions"`
+}
+
+// AgentEventHandlerDestination is the base for event handler destinations
+type AgentEventHandlerDestination struct {
+	Type AgentEventHandlerDestinationType `json:"type"`
+}
+
+// EvalsDestination represents an evals destination for event handlers
+type EvalsDestination struct {
+	AgentEventHandlerDestination
+	EvalID        string `json:"eval_id"`
+	MaxHourlyRuns *int32 `json:"max_hourly_runs,omitempty"`
+}
+
+// AgentEventHandlerRequest represents a request to create an event handler
+type AgentEventHandlerRequest struct {
+	Name        string                       `json:"name"`
+	Metadata    map[string]string            `json:"metadata,omitempty"`
+	EventTypes  []AgentEventType             `json:"event_types"`
+	Filter      *AgentEventHandlerFilter     `json:"filter,omitempty"`
+	Destination AgentEventHandlerDestination `json:"destination"`
+}
+
+// AgentEventHandlerObject represents an event handler
+type AgentEventHandlerObject struct {
+	Object      string                       `json:"object"`
+	ID          string                       `json:"id"`
+	Name        string                       `json:"name"`
+	Metadata    map[string]string            `json:"metadata,omitempty"`
+	CreatedAt   int64                        `json:"created_at"`
+	EventTypes  []AgentEventType             `json:"event_types"`
+	Filter      *AgentEventHandlerFilter     `json:"filter,omitempty"`
+	Destination AgentEventHandlerDestination `json:"destination"`
+}
+
+// DeleteAgentEventHandlerResponse represents the response when deleting an event handler
+type DeleteAgentEventHandlerResponse struct {
+	Object  string `json:"object"`
+	Name    string `json:"name"`
+	Deleted bool   `json:"deleted"`
+}
+
+// ListAgentQueryParameters represents query parameters for listing agents
+type ListAgentQueryParameters struct {
+	Kind   *AgentKind `json:"kind,omitempty"`
+	Limit  *int32     `json:"limit,omitempty"`
+	After  *string    `json:"after,omitempty"`
+	Before *string    `json:"before,omitempty"`
+	Order  *string    `json:"order,omitempty"`
+}
+
+// ToolType represents the type of tool
+type ToolType string
+
+const (
+	ToolTypeFunction                   ToolType = "function"
+	ToolTypeFileSearch                 ToolType = "file_search"
+	ToolTypeComputerUsePreview         ToolType = "computer_use_preview"
+	ToolTypeWebSearchPreview           ToolType = "web_search_preview"
+	ToolTypeMCP                        ToolType = "mcp"
+	ToolTypeCodeInterpreter            ToolType = "code_interpreter"
+	ToolTypeImageGeneration            ToolType = "image_generation"
+	ToolTypeLocalShell                 ToolType = "local_shell"
+	ToolTypeBingGrounding              ToolType = "bing_grounding"
+	ToolTypeBrowserAutomationPreview   ToolType = "browser_automation_preview"
+	ToolTypeFabricDataagentPreview     ToolType = "fabric_dataagent_preview"
+	ToolTypeSharepointGroundingPreview ToolType = "sharepoint_grounding_preview"
+	ToolTypeAzureAISearch              ToolType = "azure_ai_search"
+	ToolTypeOpenAPI                    ToolType = "openapi"
+	ToolTypeBingCustomSearchPreview    ToolType = "bing_custom_search_preview"
+	ToolTypeAzureFunction              ToolType = "azure_function"
+	ToolTypeCaptureStructuredOutputs   ToolType = "capture_structured_outputs"
+	ToolTypeA2APreview                 ToolType = "a2a_preview"
+	ToolTypeMemorySearch               ToolType = "memory_search"
+)
+
+// Tool represents an OpenAI tool
+type Tool struct {
+	Type ToolType `json:"type"`
+}
+
+// FunctionTool defines a function in your own code the model can choose to call
+type FunctionTool struct {
+	Tool
+	Name        string  `json:"name"`
+	Description *string `json:"description,omitempty"`
+	Parameters  any     `json:"parameters"`
+	Strict      *bool   `json:"strict"`
+}
+
+// FileSearchTool enables searching for information across vector stores
+type FileSearchTool struct {
+	Tool
+	VectorStoreIds []string        `json:"vector_store_ids"`
+	MaxNumResults  *int32          `json:"max_num_results,omitempty"`
+	RankingOptions *RankingOptions `json:"ranking_options,omitempty"`
+	Filters        any             `json:"filters,omitempty"` // Can be ComparisonFilter or CompoundFilter
+}
+
+// CodeInterpreterTool runs Python code to help generate a response
+type CodeInterpreterTool struct {
+	Tool
+	Container any `json:"container"` // Can be string (container ID) or CodeInterpreterToolAuto object
+}
+
+// ImageGenTool generates images using a model like gpt-image-1
+type ImageGenTool struct {
+	Tool
+	Model             *string `json:"model,omitempty"`              // Default: "gpt-image-1"
+	Quality           *string `json:"quality,omitempty"`            // low, medium, high, auto
+	Size              *string `json:"size,omitempty"`               // 1024x1024, 1024x1536, 1536x1024, auto
+	OutputFormat      *string `json:"output_format,omitempty"`      // png, webp, jpeg
+	OutputCompression *int32  `json:"output_compression,omitempty"` // 0-100
+	Moderation        *string `json:"moderation,omitempty"`         // auto, low
+	Background        *string `json:"background,omitempty"`         // transparent, opaque, auto
+	InputImageMask    any     `json:"input_image_mask,omitempty"`   // Object with image_url and/or file_id
+	PartialImages     *int32  `json:"partial_images,omitempty"`     // 0-3
+}
+
+// WebSearchPreviewTool performs web searches (preview feature)
+type WebSearchPreviewTool struct {
+	Tool
+	UserLocation      *Location `json:"user_location,omitempty"`       // OpenAI.Location object
+	SearchContextSize *string   `json:"search_context_size,omitempty"` // low, medium, high
+}
+
+// LocalShellTool allows the model to execute shell commands in a local environment
+type LocalShellTool struct {
+	Tool
+}
+
+// MCPTool for Model Context Protocol tools
+type MCPTool struct {
+	Tool
+	ServerLabel         string            `json:"server_label"`
+	ServerURL           string            `json:"server_url"`
+	Headers             map[string]string `json:"headers,omitempty"`
+	AllowedTools        any               `json:"allowed_tools,omitempty"`    // Can be []string or object with tool_names
+	RequireApproval     any               `json:"require_approval,omitempty"` // Can be string ("always"/"never") or object with always/never properties
+	ProjectConnectionID *string           `json:"project_connection_id,omitempty"`
+}
+
+// ComputerUsePreviewTool for computer use capabilities (preview feature)
+type ComputerUsePreviewTool struct {
+	Tool
+	Environment   string `json:"environment"`    // windows, mac, linux, ubuntu, browser
+	DisplayWidth  int32  `json:"display_width"`  // Required
+	DisplayHeight int32  `json:"display_height"` // Required
+}
+
+// BingGroundingAgentTool for Bing grounding search functionality
+type BingGroundingAgentTool struct {
+	Tool
+	BingGrounding BingGroundingSearchToolParameters `json:"bing_grounding"`
+}
+
+// AzureAISearchAgentTool for Azure AI Search functionality
+type AzureAISearchAgentTool struct {
+	Tool
+	AzureAISearch AzureAISearchToolResource `json:"azure_ai_search"`
+}
+
+// SharepointAgentTool for SharePoint grounding functionality
+type SharepointAgentTool struct {
+	Tool
+	SharepointGroundingPreview SharepointGroundingToolParameters `json:"sharepoint_grounding_preview"`
+}
+
+// MicrosoftFabricAgentTool for Microsoft Fabric data agent functionality
+type MicrosoftFabricAgentTool struct {
+	Tool
+	FabricDataagentPreview FabricDataAgentToolParameters `json:"fabric_dataagent_preview"`
+}
+
+// OpenApiAgentTool for OpenAPI-based tools
+type OpenApiAgentTool struct {
+	Tool
+	OpenAPI OpenApiFunctionDefinition `json:"openapi"`
+}
+
+// BingCustomSearchAgentTool for Bing custom search functionality
+type BingCustomSearchAgentTool struct {
+	Tool
+	BingCustomSearch BingCustomSearchToolParameters `json:"bing_custom_search_preview"`
+}
+
+// BrowserAutomationAgentTool for browser automation functionality
+type BrowserAutomationAgentTool struct {
+	Tool
+	BrowserAutomation BrowserAutomationToolParameters `json:"browser_automation_preview"`
+}
+
+// AzureFunctionAgentTool for Azure Function integration
+type AzureFunctionAgentTool struct {
+	Tool
+	AzureFunction AzureFunctionDefinition `json:"azure_function"`
+}
+
+// CaptureStructuredOutputsTool for capturing structured outputs
+type CaptureStructuredOutputsTool struct {
+	Tool
+	Outputs StructuredOutputDefinition `json:"outputs"`
+}
+
+// A2ATool for agent-to-agent communication (preview feature)
+type A2ATool struct {
+	Tool
+	BaseURL             *string `json:"base_url,omitempty"`
+	AgentCardPath       *string `json:"agent_card_path,omitempty"`
+	ProjectConnectionID *string `json:"project_connection_id,omitempty"`
+}
+
+// MemorySearchTool for searching memory/knowledge bases
+type MemorySearchTool struct {
+	Tool
+	MemoryStoreName string               `json:"memory_store_name"`
+	Scope           string               `json:"scope"`
+	SearchOptions   *MemorySearchOptions `json:"search_options,omitempty"`
+	UpdateDelay     *string              `json:"update_delay,omitempty"` // duration format
+}
+
+// RankingOptions represents ranking options for file search
+type RankingOptions struct {
+	Ranker         *string  `json:"ranker,omitempty"`          // auto, default-2024-11-15
+	ScoreThreshold *float32 `json:"score_threshold,omitempty"` // number between 0 and 1
+}
+
+// ComparisonFilter represents a filter for comparing an attribute key to a value
+type ComparisonFilter struct {
+	Type  string `json:"type"` // eq, ne, gt, gte, lt, lte
+	Key   string `json:"key"`
+	Value any    `json:"value"` // string, number, or boolean
+}
+
+// CompoundFilter represents a filter that combines multiple filters
+type CompoundFilter struct {
+	Type    string `json:"type"`    // and, or
+	Filters []any  `json:"filters"` // Array of ComparisonFilter or CompoundFilter
+}
+
+// Location represents a user location for web search
+type Location struct {
+	Type string `json:"type"` // Currently only "approximate" is supported
+}
+
+// ApproximateLocation represents an approximate user location
+type ApproximateLocation struct {
+	Location
+	Country *string `json:"country,omitempty"`
+	City    *string `json:"city,omitempty"`
+}
+
+// MemorySearchOptions represents options for memory search
+type MemorySearchOptions struct {
+	MaxMemories *int32 `json:"max_memories,omitempty"`
+}
+
+// ToolProjectConnection represents a project connection for tools
+type ToolProjectConnection struct {
+	ID string `json:"id"`
+}
+
+// ToolProjectConnectionList represents a list of project connections
+type ToolProjectConnectionList struct {
+	ProjectConnections []ToolProjectConnection `json:"project_connections"`
+}
+
+// BingGroundingSearchConfiguration represents Bing search configuration
+type BingGroundingSearchConfiguration struct {
+	ProjectConnectionID string  `json:"project_connection_id"`
+	Market              *string `json:"market,omitempty"`
+	SetLang             *string `json:"set_lang,omitempty"`
+	Count               *int32  `json:"count,omitempty"`
+}
+
+// BingGroundingSearchToolParameters represents parameters for Bing grounding search
+type BingGroundingSearchToolParameters struct {
+	ProjectConnections   ToolProjectConnectionList          `json:"project_connections"`
+	SearchConfigurations []BingGroundingSearchConfiguration `json:"search_configurations"`
+}
+
+// AzureAISearchQueryType represents query types for Azure AI Search
+type AzureAISearchQueryType string
+
+const (
+	AzureAISearchQueryTypeSimple   AzureAISearchQueryType = "simple"
+	AzureAISearchQueryTypeSemantic AzureAISearchQueryType = "semantic"
+	AzureAISearchQueryTypeVector   AzureAISearchQueryType = "vector"
+	AzureAISearchQueryTypeHybrid   AzureAISearchQueryType = "hybrid"
+)
+
+// AISearchIndexResource represents an AI Search index resource
+type AISearchIndexResource struct {
+	ProjectConnectionID string                  `json:"project_connection_id"`
+	IndexName           *string                 `json:"indexName,omitempty"`
+	QueryType           *AzureAISearchQueryType `json:"queryType,omitempty"`
+	TopK                *int32                  `json:"topK,omitempty"`
+	Filter              *string                 `json:"filter,omitempty"`
+	IndexAssetID        *string                 `json:"indexAssetId,omitempty"`
+}
+
+// AzureAISearchToolResource represents Azure AI Search tool configuration
+type AzureAISearchToolResource struct {
+	IndexList []AISearchIndexResource `json:"indexList,omitempty"`
+}
+
+// SharepointGroundingToolParameters represents parameters for SharePoint grounding
+type SharepointGroundingToolParameters struct {
+	ProjectConnections []ToolProjectConnection `json:"project_connections,omitempty"`
+}
+
+// FabricDataAgentToolParameters represents parameters for Microsoft Fabric data agent
+type FabricDataAgentToolParameters struct {
+	ProjectConnections []ToolProjectConnection `json:"project_connections,omitempty"`
+}
+
+// OpenApiAuthType represents authentication types for OpenAPI
+type OpenApiAuthType string
+
+const (
+	OpenApiAuthTypeAnonymous         OpenApiAuthType = "anonymous"
+	OpenApiAuthTypeProjectConnection OpenApiAuthType = "project_connection"
+	OpenApiAuthTypeManagedIdentity   OpenApiAuthType = "managed_identity"
+)
+
+// OpenApiAuthDetails represents authentication details for OpenAPI
+type OpenApiAuthDetails struct {
+	Type OpenApiAuthType `json:"type"`
+}
+
+// OpenApiFunctionDefinition represents an OpenAPI function definition
+type OpenApiFunctionDefinition struct {
+	Name          string             `json:"name"`
+	Description   *string            `json:"description,omitempty"`
+	Spec          any                `json:"spec"` // JSON Schema object
+	Auth          OpenApiAuthDetails `json:"auth"`
+	DefaultParams []string           `json:"default_params,omitempty"`
+	Functions     []OpenApiFunction  `json:"functions,omitempty"`
+}
+
+// OpenApiFunction represents a function in OpenAPI definition
+type OpenApiFunction struct {
+	Name        string  `json:"name"`
+	Description *string `json:"description,omitempty"`
+	Parameters  any     `json:"parameters"` // JSON Schema object
+}
+
+// BingCustomSearchConfiguration represents Bing custom search configuration
+type BingCustomSearchConfiguration struct {
+	ProjectConnectionID string  `json:"project_connection_id"`
+	InstanceName        string  `json:"instance_name"`
+	Market              *string `json:"market,omitempty"`
+	SetLang             *string `json:"set_lang,omitempty"`
+	Count               *int64  `json:"count,omitempty"`
+	Freshness           *string `json:"freshness,omitempty"`
+}
+
+// BingCustomSearchToolParameters represents parameters for Bing custom search
+type BingCustomSearchToolParameters struct {
+	SearchConfigurations []BingCustomSearchConfiguration `json:"search_configurations"`
+}
+
+// BrowserAutomationToolConnectionParameters represents connection parameters for browser automation
+type BrowserAutomationToolConnectionParameters struct {
+	ID string `json:"id"`
+}
+
+// BrowserAutomationToolParameters represents parameters for browser automation
+type BrowserAutomationToolParameters struct {
+	ProjectConnection BrowserAutomationToolConnectionParameters `json:"project_connection"`
+}
+
+// AzureFunctionStorageQueue represents an Azure function storage queue
+type AzureFunctionStorageQueue struct {
+	QueueServiceEndpoint string `json:"queue_service_endpoint"`
+	QueueName            string `json:"queue_name"`
+}
+
+// AzureFunctionBinding represents binding for Azure functions
+type AzureFunctionBinding struct {
+	Type         string                    `json:"type"` // storage_queue
+	StorageQueue AzureFunctionStorageQueue `json:"storage_queue"`
+}
+
+// AzureFunction represents an Azure function definition
+type AzureFunction struct {
+	Name        string  `json:"name"`
+	Description *string `json:"description,omitempty"`
+	Parameters  any     `json:"parameters"` // JSON Schema object
+}
+
+// AzureFunctionDefinition represents the complete Azure function definition
+type AzureFunctionDefinition struct {
+	Function      AzureFunction        `json:"function"`
+	InputBinding  AzureFunctionBinding `json:"input_binding"`
+	OutputBinding AzureFunctionBinding `json:"output_binding"`
+}
+
+// StructuredOutputDefinition represents a structured output definition
+type StructuredOutputDefinition struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Schema      map[string]any `json:"schema"`
+	Strict      *bool          `json:"strict"`
+}
+
+// FlexibleTimestamp is a string that can be unmarshalled from either a JSON
+// string or a JSON number (Unix epoch seconds or milliseconds). This handles
+// APIs that may return modified_time as either format.
+type FlexibleTimestamp string
+
+// UnmarshalJSON unmarshals FlexibleTimestamp from either a JSON string or a
+// JSON number (Unix epoch seconds or milliseconds).
+func (ft *FlexibleTimestamp) UnmarshalJSON(data []byte) error {
+	// Try string first (the common/expected case).
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		*ft = FlexibleTimestamp(s)
+		return nil
+	}
+
+	// Try number (Unix epoch seconds or milliseconds).
+	var n float64
+	if err := json.Unmarshal(data, &n); err == nil {
+		// Interpret as seconds first.
+		sec, frac := math.Modf(n)
+		t := time.Unix(int64(sec), int64(frac*1e9)).UTC()
+
+		// If the result is far in the future, the value is
+		// likely in milliseconds.
+		if t.Year() > 3000 {
+			ms := int64(n)
+			t = time.Unix(
+				ms/1000,
+				(ms%1000)*int64(time.Millisecond),
+			).UTC()
+		}
+
+		*ft = FlexibleTimestamp(t.Format(time.RFC3339Nano))
+		return nil
+	}
+
+	return fmt.Errorf("modified_time: expected string or number, got %s", string(data))
+}
+
+// MarshalJSON marshals FlexibleTimestamp as a JSON string.
+func (ft FlexibleTimestamp) MarshalJSON() ([]byte, error) {
+	return json.Marshal(string(ft))
+}
+
+// String returns the string representation of FlexibleTimestamp.
+func (ft FlexibleTimestamp) String() string {
+	return string(ft)
+}
+
+// SessionFileInfo represents a file or directory entry in a session.
+type SessionFileInfo struct {
+	Name         string             `json:"name"`
+	Path         string             `json:"path"`
+	IsDirectory  bool               `json:"is_dir"`
+	Size         int64              `json:"size,omitempty"`
+	Mode         int                `json:"mode,omitempty"`
+	LastModified *FlexibleTimestamp `json:"modified_time,omitempty"`
+}
+
+// SessionFileList represents the response from listing session files.
+type SessionFileList struct {
+	Path    string            `json:"path"`
+	Entries []SessionFileInfo `json:"entries"`
+}
+
+// ---------------------------------------------------------------------------
+// Session Lifecycle Models
+// ---------------------------------------------------------------------------
+
+// AgentSessionStatus represents the status of an agent session.
+type AgentSessionStatus string
+
+const (
+	AgentSessionStatusCreating AgentSessionStatus = "creating"
+	AgentSessionStatusActive   AgentSessionStatus = "active"
+	AgentSessionStatusIdle     AgentSessionStatus = "idle"
+	AgentSessionStatusUpdating AgentSessionStatus = "updating"
+	AgentSessionStatusFailed   AgentSessionStatus = "failed"
+	AgentSessionStatusDeleting AgentSessionStatus = "deleting"
+	AgentSessionStatusDeleted  AgentSessionStatus = "deleted"
+	AgentSessionStatusExpired  AgentSessionStatus = "expired"
+)
+
+// VersionIndicator determines which agent version backs a session.
+type VersionIndicator struct {
+	Type         string `json:"type"`
+	AgentVersion string `json:"agent_version,omitempty"`
+}
+
+// AgentSessionResource represents an agent session.
+type AgentSessionResource struct {
+	AgentSessionID   string             `json:"agent_session_id"`
+	VersionIndicator VersionIndicator   `json:"version_indicator"`
+	Status           AgentSessionStatus `json:"status"`
+	CreatedAt        int64              `json:"created_at"`
+	LastAccessedAt   int64              `json:"last_accessed_at"`
+	ExpiresAt        int64              `json:"expires_at"`
+}
+
+// CreateAgentSessionRequest is the request body for creating a session.
+type CreateAgentSessionRequest struct {
+	AgentSessionID   *string           `json:"agent_session_id,omitempty"`
+	VersionIndicator *VersionIndicator `json:"version_indicator,omitempty"`
+}
+
+// SessionListResult is the paged result for session list operations.
+type SessionListResult struct {
+	Data            []AgentSessionResource `json:"data"`
+	PaginationToken *string                `json:"pagination_token,omitempty"`
+}

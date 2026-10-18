@@ -1,0 +1,294 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package maven
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+
+	osexec "os/exec"
+
+	"github.com/azure/azure-dev/cli/azd/pkg/exec"
+	"github.com/azure/azure-dev/cli/azd/pkg/osutil"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools"
+)
+
+var _ tools.ExternalTool = (*Cli)(nil)
+
+type Cli struct {
+	commandRunner   exec.CommandRunner
+	projectPath     string
+	rootProjectPath string
+
+	// Lazily initialized. Access through mvnCmd.
+	mvnCmdStr  string
+	mvnCmdInit osutil.LazyRetryInit
+}
+
+func (m *Cli) Name() string {
+	return "Maven"
+}
+
+func (m *Cli) InstallUrl() string {
+	return "https://maven.apache.org"
+}
+
+func (m *Cli) CheckInstalled(ctx context.Context) error {
+	_, err := m.mvnCmd()
+	if err != nil {
+		return err
+	}
+
+	if ver, err := m.extractVersion(ctx); err == nil {
+		log.Printf("maven version: %s", ver)
+	}
+
+	return nil
+}
+
+func (m *Cli) SetPath(projectPath string, rootProjectPath string) {
+	m.projectPath = projectPath
+	m.rootProjectPath = rootProjectPath
+}
+
+func (m *Cli) mvnCmd() (string, error) {
+	err := m.mvnCmdInit.Do(func() error {
+		mvnCmd, err := getMavenPath(m.projectPath, m.rootProjectPath)
+		if err != nil {
+			return err
+		}
+
+		m.mvnCmdStr = mvnCmd
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return m.mvnCmdStr, nil
+}
+
+func getMavenPath(projectPath string, rootProjectPath string) (string, error) {
+	mvnw, err := getMavenWrapperPath(projectPath, rootProjectPath)
+	if mvnw != "" {
+		return mvnw, nil
+	}
+
+	if err != nil {
+		return "", fmt.Errorf("failed finding mvnw in repository path: %w", err)
+	}
+
+	mvn, err := osexec.LookPath("mvn")
+	if err == nil {
+		return mvn, nil
+	}
+
+	if !errors.Is(err, osexec.ErrNotFound) {
+		return "", fmt.Errorf("failed looking up mvn in PATH: %w", err)
+	}
+
+	return "", errors.New(
+		"maven could not be found. Install either Maven or Maven Wrapper by " +
+			"visiting https://maven.apache.org/ or https://maven.apache.org/wrapper/",
+	)
+}
+
+// getMavenWrapperPath finds the path to mvnw in the project directory, up to the root project directory.
+//
+// An error is returned if an unexpected error occurred while finding.
+// If mvnw is not found, an empty string is returned with
+// no error.
+func getMavenWrapperPath(projectPath string, rootProjectPath string) (string, error) {
+	searchDir, err := filepath.Abs(projectPath)
+	if err != nil {
+		return "", err
+	}
+
+	root, err := filepath.Abs(rootProjectPath)
+	log.Printf("root: %s\n", root)
+
+	if err != nil {
+		return "", err
+	}
+
+	for {
+		log.Printf("searchDir: %s\n", searchDir)
+
+		mvnw, err := osexec.LookPath(filepath.Join(searchDir, "mvnw"))
+		if err == nil {
+			log.Printf("found mvnw as: %s\n", mvnw)
+			return mvnw, nil
+		}
+
+		if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, osexec.ErrNotFound) {
+			return "", err
+		}
+
+		searchDir = filepath.Dir(searchDir)
+
+		// Past root, terminate search and return not found
+		if len(searchDir) < len(root) {
+			return "", nil
+		}
+	}
+}
+
+// mavenVersionRegexp captures the version number of maven from the output of "mvn --version"
+//
+// the output of mvn --version looks something like this:
+// Apache Maven 3.9.1 (2e178502fcdbffc201671fb2537d0cb4b4cc58f8)
+// Maven home: C:\Tools\apache-maven-3.9.1
+// Java version: 17.0.6, vendor: Microsoft, runtime: C:\Program Files\Microsoft\jdk-17.0.6.10-hotspot
+// Default locale: en_US, platform encoding: Cp1252
+// OS name: "windows 11", version: "10.0", arch: "amd64", family: "windows"
+var mavenVersionRegexp = regexp.MustCompile(`Apache Maven (.*) \(`)
+
+func (cli *Cli) extractVersion(ctx context.Context) (string, error) {
+	mvnCmd, err := cli.mvnCmd()
+	if err != nil {
+		return "", err
+	}
+
+	runArgs := exec.NewRunArgs(mvnCmd, "--version")
+	res, err := cli.commandRunner.Run(ctx, runArgs)
+	if err != nil {
+		return "", fmt.Errorf("failed to run %s --version: %w", mvnCmd, err)
+	}
+
+	parts := mavenVersionRegexp.FindStringSubmatch(res.Stdout)
+	if len(parts) != 2 {
+		return "", fmt.Errorf("could not parse %s --version output, did not match expected format", mvnCmd)
+	}
+
+	return parts[1], nil
+}
+
+func (cli *Cli) Compile(ctx context.Context, projectPath string, env []string) error {
+	mvnCmd, err := cli.mvnCmd()
+	if err != nil {
+		return err
+	}
+
+	runArgs := exec.NewRunArgs(mvnCmd, "compile").WithCwd(projectPath).WithEnv(env)
+	_, err = cli.commandRunner.Run(ctx, runArgs)
+	if err != nil {
+		return fmt.Errorf("mvn compile on project '%s' failed: %w", projectPath, err)
+	}
+
+	return nil
+}
+
+func (cli *Cli) Package(ctx context.Context, projectPath string, env []string) error {
+	mvnCmd, err := cli.mvnCmd()
+	if err != nil {
+		return err
+	}
+
+	// Maven's package phase includes tests by default. Skip it explicitly.
+	runArgs := exec.NewRunArgs(mvnCmd, "package", "-DskipTests").WithCwd(projectPath).WithEnv(env)
+	_, err = cli.commandRunner.Run(ctx, runArgs)
+	if err != nil {
+		return fmt.Errorf("mvn package on project '%s' failed: %w", projectPath, err)
+	}
+
+	return nil
+}
+
+func (cli *Cli) ResolveDependencies(ctx context.Context, projectPath string, env []string) error {
+	mvnCmd, err := cli.mvnCmd()
+	if err != nil {
+		return err
+	}
+	runArgs := exec.NewRunArgs(mvnCmd, "dependency:resolve").WithCwd(projectPath).WithEnv(env)
+	_, err = cli.commandRunner.Run(ctx, runArgs)
+	if err != nil {
+		return fmt.Errorf("mvn dependency:resolve on project '%s' failed: %w", projectPath, err)
+	}
+
+	return nil
+}
+
+var ErrPropertyNotFound = errors.New("property not found")
+
+func (cli *Cli) GetProperty(ctx context.Context, propertyPath string, projectPath string) (string, error) {
+	mvnCmd, err := cli.mvnCmd()
+	if err != nil {
+		return "", err
+	}
+	runArgs := exec.NewRunArgs(mvnCmd,
+		"help:evaluate",
+		// cspell: disable-next-line Dexpression and DforceStdout are maven command line arguments
+		"-Dexpression="+propertyPath, "-q", "-DforceStdout").WithCwd(projectPath)
+	res, err := cli.commandRunner.Run(ctx, runArgs)
+	if err != nil {
+		return "", fmt.Errorf("mvn help:evaluate on project '%s' failed: %w", projectPath, err)
+	}
+
+	result := strings.TrimSpace(res.Stdout)
+	if result == "null object or invalid expression" {
+		return "", ErrPropertyNotFound
+	}
+
+	return result, nil
+}
+
+func (cli *Cli) EffectivePom(ctx context.Context, pomPath string) (string, error) {
+	mvnCmd, err := cli.mvnCmd()
+	if err != nil {
+		return "", err
+	}
+	pomDir := filepath.Dir(pomPath)
+	// Link to "-pl" related doc: https://maven.apache.org/ref/3.1.0/maven-embedder/cli.html
+	runArgs := exec.NewRunArgs(mvnCmd, "help:effective-pom", "-f", pomPath, "-pl", filepath.Base(pomPath)).WithCwd(pomDir)
+	result, err := cli.commandRunner.Run(ctx, runArgs)
+	if err != nil {
+		return "", fmt.Errorf("mvn help:effective-pom on project '%s' failed: %w", pomPath, err)
+	}
+	return getEffectivePomStringFromConsoleOutput(result.Stdout)
+}
+
+var projectStart = regexp.MustCompile(`^\s*<project `) // the space can not be deleted.
+var projectEnd = regexp.MustCompile(`^\s*</project>\s*$`)
+
+func getEffectivePomStringFromConsoleOutput(consoleOutput string) (string, error) {
+	var builder strings.Builder
+	scanner := bufio.NewScanner(strings.NewReader(consoleOutput))
+	projectStarted := false
+	projectEnded := false
+	for scanner.Scan() {
+		line := scanner.Text()
+		if projectStart.MatchString(line) {
+			projectStarted = true
+		} else if projectEnd.MatchString(line) {
+			projectEnded = true
+		}
+		if projectStarted {
+			builder.WriteString(line)
+		}
+		if projectEnded {
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("failed to scan console output: %w", err)
+	}
+	result := builder.String()
+	if result == "" {
+		return "", fmt.Errorf("failed to get effective pom from console: empty content")
+	}
+	return result, nil
+}
+
+func NewCli(commandRunner exec.CommandRunner) *Cli {
+	return &Cli{
+		commandRunner: commandRunner,
+	}
+}

@@ -1,46 +1,87 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
 package telemetry
 
 import (
 	"context"
-	"os"
-	"sync"
 	"testing"
 
 	"github.com/azure/azure-dev/cli/azd/internal"
+	appinsightsexporter "github.com/azure/azure-dev/cli/azd/internal/telemetry/appinsights-exporter"
+	"github.com/azure/azure-dev/cli/azd/test/ostest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestGetTelemetrySystem(t *testing.T) {
+	t.Setenv("AZD_CONFIG_DIR", t.TempDir())
+
+	devEndpointConfig, err := appinsightsexporter.NewEndpointConfig(devConnectionString)
+	require.NoError(t, err)
+	prodEndpointConfig, err := appinsightsexporter.NewEndpointConfig(prodConnectionString)
+	require.NoError(t, err)
+
 	type args struct {
 		version                     string
 		disableTelemetryEnvVarValue string
 	}
 	tests := []struct {
-		name       string
-		args       args
-		expectNil  bool
-		expectIKey string
+		name         string
+		args         args
+		expectNil    bool
+		expectConfig appinsightsexporter.EndpointConfig
 	}{
-		{"DevVersion", args{"0.0.0-dev.0 (commit 0000000000000000000000000000000000000000)", "unset"}, false, devInstrumentationKey},
-		{"DevVersionTelemetryEnabled", args{"0.0.0-dev.0 (commit 0000000000000000000000000000000000000000)", "yes"}, false, devInstrumentationKey},
-		{"DevVersionTelemetryDisabled", args{"0.0.0-dev.0 (commit 0000000000000000000000000000000000000000)", "no"}, true, devInstrumentationKey},
+		{
+			"DevVersion",
+			args{"0.0.0-dev.0 (commit 0000000000000000000000000000000000000000)", "unset"},
+			false,
+			devEndpointConfig,
+		},
+		{
+			"DevVersionTelemetryEnabled",
+			args{"0.0.0-dev.0 (commit 0000000000000000000000000000000000000000)", "yes"},
+			false,
+			devEndpointConfig,
+		},
+		{
+			"DevVersionTelemetryDisabled",
+			args{"0.0.0-dev.0 (commit 0000000000000000000000000000000000000000)", "no"},
+			true,
+			devEndpointConfig,
+		},
 
-		// Currently, prod version should always be disabled.
-		{"ProdVersion", args{"1.0.0 (commit 13ec2b11aa755b11640fa16b8664cb8741d5d300)", "no"}, true, prodInstrumentationKey},
-		{"ProdVersion", args{"1.0.0 (commit 13ec2b11aa755b11640fa16b8664cb8741d5d300)", "unset"}, true, prodInstrumentationKey},
-		{"ProdVersion", args{"1.0.0 (commit 13ec2b11aa755b11640fa16b8664cb8741d5d300)", "yes"}, true, prodInstrumentationKey},
+		{
+			"ProdVersion_telemetryDisabled",
+			args{"1.0.0 (commit 13ec2b11aa755b11640fa16b8664cb8741d5d300)", "no"},
+			true,
+			prodEndpointConfig,
+		},
+		{
+			"ProdVersion_telemetryUnset",
+			args{"1.0.0 (commit 13ec2b11aa755b11640fa16b8664cb8741d5d300)", "unset"},
+			false,
+			prodEndpointConfig,
+		},
+		{
+			"ProdVersion_telemetryEnabled",
+			args{"1.0.0 (commit 13ec2b11aa755b11640fa16b8664cb8741d5d300)", "yes"},
+			false,
+			prodEndpointConfig,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			defer resetTelemetryForTest()
+
 			orig := internal.Version
 			defer func() { internal.Version = orig }()
 			internal.Version = tt.args.version
 
 			if tt.args.disableTelemetryEnvVarValue == "unset" {
-				os.Unsetenv(collectTelemetryEnvVar)
+				ostest.Unsetenv(t, collectTelemetryEnvVar)
 			} else {
-				os.Setenv(collectTelemetryEnvVar, tt.args.disableTelemetryEnvVarValue)
+				ostest.Setenv(t, collectTelemetryEnvVar, tt.args.disableTelemetryEnvVarValue)
 			}
 
 			ts := GetTelemetrySystem()
@@ -49,21 +90,23 @@ func TestGetTelemetrySystem(t *testing.T) {
 				assert.Nil(t, ts)
 			} else {
 				require.NotNil(t, ts)
-				assert.Equal(t, tt.expectIKey, ts.instrumentationKey)
+				assert.Equal(t, tt.expectConfig, ts.config)
 				assert.NotNil(t, ts.GetTelemetryQueue())
 				assert.NotNil(t, ts.NewUploader(true))
 
-				err := ts.Shutdown(context.Background())
+				err := ts.Shutdown(t.Context())
 				assert.NoError(t, err)
 			}
-
-			os.Unsetenv(collectTelemetryEnvVar)
-			once = sync.Once{}
 		})
 	}
 }
 
 func TestTelemetrySystem_RunBackgroundUpload(t *testing.T) {
+	resetTelemetryForTest()
+	t.Cleanup(resetTelemetryForTest)
+	t.Setenv("AZD_CONFIG_DIR", t.TempDir())
+	t.Setenv(collectTelemetryEnvVar, "yes")
+
 	type args struct {
 		ctx                context.Context
 		enableDebugLogging bool
@@ -76,9 +119,9 @@ func TestTelemetrySystem_RunBackgroundUpload(t *testing.T) {
 		simulateUploadInProgress bool
 		args                     args
 	}{
-		{"Debug", false, args{context.Background(), true}},
-		{"NonDebug", false, args{context.Background(), false}},
-		{"UploadInProgress", true, args{context.Background(), false}},
+		{"Debug", false, args{t.Context(), true}},
+		{"NonDebug", false, args{t.Context(), false}},
+		{"UploadInProgress", true, args{t.Context(), false}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

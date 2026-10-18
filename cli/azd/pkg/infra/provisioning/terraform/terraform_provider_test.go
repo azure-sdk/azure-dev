@@ -1,213 +1,331 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
 package terraform
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
-	"path"
+	"os"
+	osexec "os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/azure/azure-dev/cli/azd/pkg/account"
+	"github.com/azure/azure-dev/cli/azd/pkg/azapi"
+	"github.com/azure/azure-dev/cli/azd/pkg/cloud"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment"
 	"github.com/azure/azure-dev/cli/azd/pkg/exec"
-	"github.com/azure/azure-dev/cli/azd/pkg/infra"
-	. "github.com/azure/azure-dev/cli/azd/pkg/infra/provisioning"
+	"github.com/azure/azure-dev/cli/azd/pkg/infra/provisioning"
+	"github.com/azure/azure-dev/cli/azd/pkg/prompt"
+	terraformTools "github.com/azure/azure-dev/cli/azd/pkg/tools/terraform"
 	"github.com/azure/azure-dev/cli/azd/test/mocks"
 
-	execmock "github.com/azure/azure-dev/cli/azd/test/mocks/exec"
+	"github.com/azure/azure-dev/cli/azd/test/mocks/mockaccount"
+	"github.com/azure/azure-dev/cli/azd/test/mocks/mockenv"
+	"github.com/azure/azure-dev/cli/azd/test/mocks/mockexec"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
 func TestTerraformPlan(t *testing.T) {
-	progressLog := []string{}
-	interactiveLog := []bool{}
-	progressDone := make(chan bool)
-
-	mockContext := mocks.NewMockContext(context.Background())
+	skipIfTerraformNotInstalled(t)
+	mockContext := mocks.NewMockContext(t.Context())
 	prepareGenericMocks(mockContext.CommandRunner)
 	preparePlanningMocks(mockContext.CommandRunner)
 
-	infraProvider := createTerraformProvider(*mockContext.Context)
-	planningTask := infraProvider.Plan(*mockContext.Context)
-
-	go func() {
-		for progressReport := range planningTask.Progress() {
-			progressLog = append(progressLog, progressReport.Message)
-		}
-		progressDone <- true
-	}()
-
-	go func() {
-		for planningInteractive := range planningTask.Interactive() {
-			interactiveLog = append(interactiveLog, planningInteractive)
-		}
-	}()
-
-	deploymentPlan, err := planningTask.Await()
-	<-progressDone
+	infraProvider := createTerraformProvider(t, mockContext)
+	deployment, deploymentPlan, err := infraProvider.plan(*mockContext.Context)
 
 	require.Nil(t, err)
-	require.NotNil(t, deploymentPlan.Deployment)
+	require.NotNil(t, deployment)
 
 	consoleLog := mockContext.Console.Output()
 
-	require.Len(t, consoleLog, 4)
-	require.Contains(t, consoleLog[0], "Initializing terraform...")
-	require.Contains(t, consoleLog[1], "Generating terraform parameters...")
-	require.Contains(t, consoleLog[2], "Validating terraform template...")
-	require.Contains(t, consoleLog[3], "Generating terraform plan...")
+	require.Len(t, consoleLog, 0)
 
-	require.Equal(t, infraProvider.env.Values["AZURE_LOCATION"], deploymentPlan.Deployment.Parameters["location"].Value)
-	require.Equal(t, infraProvider.env.Values["AZURE_ENV_NAME"], deploymentPlan.Deployment.Parameters["name"].Value)
+	require.Equal(t, infraProvider.env.Dotenv()["AZURE_LOCATION"], deployment.Parameters["location"].Value)
+	require.Equal(
+		t,
+		infraProvider.env.Dotenv()["AZURE_ENV_NAME"],
+		deployment.Parameters["environment_name"].Value,
+	)
 
-	require.NotNil(t, deploymentPlan.Details)
+	require.NotNil(t, deploymentPlan)
 
-	terraformDeploymentData := deploymentPlan.Details.(TerraformDeploymentDetails)
-	require.NotNil(t, terraformDeploymentData)
+	require.NotNil(t, deploymentPlan)
 
-	require.FileExists(t, terraformDeploymentData.ParameterFilePath)
-	require.NotEmpty(t, terraformDeploymentData.ParameterFilePath)
-	require.NotEmpty(t, terraformDeploymentData.localStateFilePath)
-}
-
-func TestTerraformDeploy(t *testing.T) {
-	progressLog := []string{}
-	interactiveLog := []bool{}
-	progressDone := make(chan bool)
-
-	mockContext := mocks.NewMockContext(context.Background())
-	prepareGenericMocks(mockContext.CommandRunner)
-	preparePlanningMocks(mockContext.CommandRunner)
-	prepareDeployMocks(mockContext.CommandRunner)
-
-	infraProvider := createTerraformProvider(*mockContext.Context)
-
-	envPath := path.Join(infraProvider.projectPath, ".azure", infraProvider.env.Values["AZURE_ENV_NAME"])
-
-	deploymentPlan := DeploymentPlan{
-		Details: TerraformDeploymentDetails{
-			ParameterFilePath:  path.Join(envPath, "main.tfvars.json"),
-			PlanFilePath:       path.Join(envPath, "main.tfplan"),
-			localStateFilePath: path.Join(envPath, "terraform.tfstate"),
-		},
-	}
-
-	scope := infra.NewSubscriptionScope(*mockContext.Context, infraProvider.env.Values["AZURE_LOCATION"], infraProvider.env.GetSubscriptionId(), infraProvider.env.GetEnvName())
-	deployTask := infraProvider.Deploy(*mockContext.Context, &deploymentPlan, scope)
-
-	go func() {
-		for deployProgress := range deployTask.Progress() {
-			progressLog = append(progressLog, deployProgress.Message)
-		}
-		progressDone <- true
-	}()
-
-	go func() {
-		for deployInteractive := range deployTask.Interactive() {
-			interactiveLog = append(interactiveLog, deployInteractive)
-		}
-	}()
-
-	deployResult, err := deployTask.Await()
-	<-progressDone
-
-	require.Nil(t, err)
-	require.NotNil(t, deployResult)
-
-	require.Equal(t, deployResult.Deployment.Outputs["AZURE_LOCATION"].Value, infraProvider.env.Values["AZURE_LOCATION"])
-	require.Equal(t, deployResult.Deployment.Outputs["RG_NAME"].Value, fmt.Sprintf("rg-%s", infraProvider.env.GetEnvName()))
+	require.FileExists(t, deploymentPlan.ParameterFilePath)
+	require.NotEmpty(t, deploymentPlan.ParameterFilePath)
+	require.NotEmpty(t, deploymentPlan.localStateFilePath)
 }
 
 func TestTerraformDestroy(t *testing.T) {
-	mockContext := mocks.NewMockContext(context.Background())
+	skipIfTerraformNotInstalled(t)
+	// Clear CI variables so this interactive-destroy test does not inherit the runner's CI state and take
+	// the non-interactive preview branch (which would skip deletion and fail the assertions below).
+	clearCIEnv(t)
+	mockContext := mocks.NewMockContext(t.Context())
 	prepareGenericMocks(mockContext.CommandRunner)
 	preparePlanningMocks(mockContext.CommandRunner)
 	prepareDestroyMocks(mockContext.CommandRunner)
 
-	progressLog := []string{}
-	interactiveLog := []bool{}
-	progressDone := make(chan bool)
-
-	infraProvider := createTerraformProvider(*mockContext.Context)
-	deployment := Deployment{}
-
-	destroyOptions := NewDestroyOptions(false, false)
-	destroyTask := infraProvider.Destroy(*mockContext.Context, &deployment, destroyOptions)
-
-	go func() {
-		for destroyProgress := range destroyTask.Progress() {
-			progressLog = append(progressLog, destroyProgress.Message)
-		}
-		progressDone <- true
-	}()
-
-	go func() {
-		for destroyInteractive := range destroyTask.Interactive() {
-			interactiveLog = append(interactiveLog, destroyInteractive)
-		}
-	}()
-
-	destroyResult, err := destroyTask.Await()
-	<-progressDone
+	infraProvider := createTerraformProvider(t, mockContext)
+	destroyOptions := provisioning.NewDestroyOptions(false, false)
+	destroyResult, err := infraProvider.Destroy(*mockContext.Context, destroyOptions)
 
 	require.Nil(t, err)
 	require.NotNil(t, destroyResult)
 
-	require.Equal(t, destroyResult.Outputs["AZURE_LOCATION"].Value, infraProvider.env.Values["AZURE_LOCATION"])
-	require.Equal(t, destroyResult.Outputs["RG_NAME"].Value, fmt.Sprintf("rg-%s", infraProvider.env.GetEnvName()))
+	require.Contains(t, destroyResult.InvalidatedEnvKeys, "AZURE_LOCATION")
+	require.Contains(t, destroyResult.InvalidatedEnvKeys, "RG_NAME")
 }
 
-func TestTerraformGetDeployment(t *testing.T) {
-	progressLog := []string{}
-	interactiveLog := []bool{}
-	progressDone := make(chan bool)
+// TestTerraformDestroyCIPreviewsWithoutDeleting verifies that in a CI/CD environment (even without an
+// explicit --no-prompt) `azd down` without --force previews the destroy plan and does NOT delete anything.
+// terraform's interactive destroy confirmation would otherwise block on stdin and hang. See issue #4317.
+func TestTerraformDestroyCIPreviewsWithoutDeleting(t *testing.T) {
+	skipIfTerraformNotInstalled(t)
+	t.Setenv("TF_BUILD", "True") // simulate an Azure Pipelines (CI) run
 
-	mockContext := mocks.NewMockContext(context.Background())
+	mockContext := mocks.NewMockContext(t.Context())
 	prepareGenericMocks(mockContext.CommandRunner)
 	preparePlanningMocks(mockContext.CommandRunner)
-	prepareDeployMocks(mockContext.CommandRunner)
 
-	infraProvider := createTerraformProvider(*mockContext.Context)
-	scope := infra.NewSubscriptionScope(*mockContext.Context, infraProvider.env.Values["AZURE_LOCATION"], infraProvider.env.GetSubscriptionId(), infraProvider.env.GetEnvName())
-	getDeploymentTask := infraProvider.GetDeployment(*mockContext.Context, scope)
+	// The preview path must initialize the backend first so `terraform plan -destroy` works on a fresh agent.
+	initCalled := false
+	mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
+		return args.Cmd == "terraform" && strings.Contains(command, "init")
+	}).RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+		initCalled = true
+		require.Contains(t, args.Args, "-input=false")
+		// A teardown must not upgrade providers/modules or rewrite the lock file (#4317).
+		require.NotContains(t, args.Args, "-upgrade")
+		return exec.RunResult{Stdout: "Terraform has been successfully initialized!"}, nil
+	})
 
-	go func() {
-		for progressReport := range getDeploymentTask.Progress() {
-			progressLog = append(progressLog, progressReport.Message)
-		}
-		progressDone <- true
-	}()
+	// The core of #4317: the preview must actually run `terraform plan -destroy` (read-only) rather than
+	// silently returning SkippedDeletion. Registered after preparePlanningMocks so it wins (LIFO) for the
+	// destroy-plan call.
+	planDestroyCalled := false
+	mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
+		return args.Cmd == "terraform" &&
+			strings.Contains(command, "plan") && strings.Contains(command, "-destroy")
+	}).RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+		planDestroyCalled = true
+		require.Contains(t, args.Args, "-destroy")
+		return exec.RunResult{Stdout: "Plan: 0 to add, 0 to change, 1 to destroy."}, nil
+	})
 
-	go func() {
-		for deploymentInteractive := range getDeploymentTask.Interactive() {
-			interactiveLog = append(interactiveLog, deploymentInteractive)
-		}
-	}()
+	infraProvider := createTerraformProvider(t, mockContext)
 
-	getDeploymentResult, err := getDeploymentTask.Await()
-	<-progressDone
+	destroyOptions := provisioning.NewDestroyOptions(false, false)
+	destroyResult, err := infraProvider.Destroy(*mockContext.Context, destroyOptions)
 
-	require.Nil(t, err)
-	require.NotNil(t, getDeploymentResult.Deployment)
-
-	require.Equal(t, getDeploymentResult.Deployment.Outputs["AZURE_LOCATION"].Value, infraProvider.env.Values["AZURE_LOCATION"])
-	require.Equal(t, getDeploymentResult.Deployment.Outputs["RG_NAME"].Value, fmt.Sprintf("rg-%s", infraProvider.env.GetEnvName()))
-
+	require.NoError(t, err)
+	require.NotNil(t, destroyResult)
+	require.True(t, destroyResult.SkippedDeletion)
+	require.True(t, initCalled)
+	require.True(t, planDestroyCalled)
+	require.Empty(t, destroyResult.InvalidatedEnvKeys)
 }
 
-func createTerraformProvider(ctx context.Context) *TerraformProvider {
-	projectDir := "../../../../test/samples/resourcegroupterraform"
-	options := Options{
+// TestTerraformDestroyNoPromptPreviewsWithoutDeleting verifies that --no-prompt outside CI (for example an
+// AI agent or an explicit --no-prompt in a script) also previews the destroy plan and does NOT delete,
+// rather than hanging on terraform's confirmation.
+func TestTerraformDestroyNoPromptPreviewsWithoutDeleting(t *testing.T) {
+	skipIfTerraformNotInstalled(t)
+	clearCIEnv(t)
+
+	mockContext := mocks.NewMockContext(t.Context())
+	prepareGenericMocks(mockContext.CommandRunner)
+	preparePlanningMocks(mockContext.CommandRunner)
+
+	infraProvider := createTerraformProvider(t, mockContext)
+	mockContext.Console.SetNoPromptMode(true)
+
+	// Assert the preview actually runs `terraform plan -destroy`; without this the test would pass even if
+	// the provider returned SkippedDeletion without previewing anything.
+	planDestroyCalled := false
+	mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
+		return args.Cmd == "terraform" &&
+			strings.Contains(command, "plan") && strings.Contains(command, "-destroy")
+	}).RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+		planDestroyCalled = true
+		require.Contains(t, args.Args, "-destroy")
+		return exec.RunResult{Stdout: "Plan: 0 to add, 0 to change, 1 to destroy."}, nil
+	})
+
+	destroyOptions := provisioning.NewDestroyOptions(false, false)
+	destroyResult, err := infraProvider.Destroy(*mockContext.Context, destroyOptions)
+
+	require.NoError(t, err)
+	require.NotNil(t, destroyResult)
+	require.True(t, destroyResult.SkippedDeletion)
+	require.True(t, planDestroyCalled)
+	require.Empty(t, destroyResult.InvalidatedEnvKeys)
+}
+
+// TestTerraformDestroyCIForceDeletes verifies that --force in CI (without --no-prompt) still initializes the
+// backend and tears resources down. This closes the "backend initialization required" gap for a standalone
+// teardown pipeline running `azd down --force` on a fresh agent (#4317).
+func TestTerraformDestroyCIForceDeletes(t *testing.T) {
+	skipIfTerraformNotInstalled(t)
+	t.Setenv("TF_BUILD", "True")
+
+	mockContext := mocks.NewMockContext(t.Context())
+	prepareGenericMocks(mockContext.CommandRunner)
+	preparePlanningMocks(mockContext.CommandRunner)
+	prepareDestroyMocks(mockContext.CommandRunner)
+
+	// Assert terraform init runs non-interactively for the --force CI path so that a fresh agent does not
+	// fail with "backend initialization required" before reaching destroy (#4317).
+	initCalled := false
+	mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
+		return args.Cmd == "terraform" && strings.Contains(command, "init")
+	}).RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+		initCalled = true
+		require.Contains(t, args.Args, "-input=false")
+		// A teardown must not upgrade providers/modules or rewrite the lock file (#4317).
+		require.NotContains(t, args.Args, "-upgrade")
+		return exec.RunResult{Stdout: "Terraform has been successfully initialized!"}, nil
+	})
+
+	infraProvider := createTerraformProvider(t, mockContext)
+
+	destroyOptions := provisioning.NewDestroyOptions(true, false)
+	destroyResult, err := infraProvider.Destroy(*mockContext.Context, destroyOptions)
+
+	require.NoError(t, err)
+	require.NotNil(t, destroyResult)
+	require.False(t, destroyResult.SkippedDeletion)
+	require.True(t, initCalled)
+	require.Contains(t, destroyResult.InvalidatedEnvKeys, "AZURE_LOCATION")
+	require.Contains(t, destroyResult.InvalidatedEnvKeys, "RG_NAME")
+}
+
+// TestTerraformDestroyInteractiveDeletes verifies that in an interactive terminal (not CI, not --no-prompt,
+// no --force) the behavior is unchanged: azd does not force init or preview, and terraform destroy is
+// invoked so the user answers terraform's own confirmation.
+func TestTerraformDestroyInteractiveDeletes(t *testing.T) {
+	skipIfTerraformNotInstalled(t)
+	clearCIEnv(t)
+
+	mockContext := mocks.NewMockContext(t.Context())
+	prepareGenericMocks(mockContext.CommandRunner)
+	prepareDestroyMocks(mockContext.CommandRunner)
+
+	// init must NOT be run by azd on the interactive path (unchanged from shipped behavior).
+	initCalled := false
+	mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
+		return args.Cmd == "terraform" && strings.Contains(command, "init")
+	}).RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+		initCalled = true
+		return exec.RunResult{Stdout: "Terraform has been successfully initialized!"}, nil
+	})
+
+	infraProvider := createTerraformProvider(t, mockContext)
+
+	destroyOptions := provisioning.NewDestroyOptions(false, false)
+	destroyResult, err := infraProvider.Destroy(*mockContext.Context, destroyOptions)
+
+	require.NoError(t, err)
+	require.NotNil(t, destroyResult)
+	require.False(t, destroyResult.SkippedDeletion)
+	require.False(t, initCalled)
+	require.Contains(t, destroyResult.InvalidatedEnvKeys, "AZURE_LOCATION")
+}
+
+// clearCIEnv unsets CI-related environment variables so resource.IsRunningOnCI() returns false during the
+// test. Some vars are existence-based, so they must be unset rather than emptied.
+func clearCIEnv(t *testing.T) {
+	t.Helper()
+	ciVars := []string{
+		"CI", "BUILD_ID", "GITHUB_ACTIONS", "TF_BUILD",
+		"CODEBUILD_BUILD_ID", "JENKINS_URL", "TEAMCITY_VERSION",
+		"APPVEYOR", "TRAVIS", "CIRCLECI", "GITLAB_CI",
+		"JB_SPACE_API_URL", "bamboo.buildKey", "BITBUCKET_BUILD_NUMBER",
+	}
+	for _, key := range ciVars {
+		if val, ok := os.LookupEnv(key); ok {
+			os.Unsetenv(key)
+			t.Cleanup(func() { os.Setenv(key, val) })
+		}
+	}
+}
+
+func TestTerraformState(t *testing.T) {
+	skipIfTerraformNotInstalled(t)
+	mockContext := mocks.NewMockContext(t.Context())
+	prepareGenericMocks(mockContext.CommandRunner)
+	prepareShowMocks(mockContext.CommandRunner)
+
+	infraProvider := createTerraformProvider(t, mockContext)
+	getStateResult, err := infraProvider.State(*mockContext.Context, nil)
+
+	require.Nil(t, err)
+	require.NotNil(t, getStateResult.State)
+
+	require.Equal(t, infraProvider.env.Dotenv()["AZURE_LOCATION"], getStateResult.State.Outputs["AZURE_LOCATION"].Value)
+	require.Equal(t, fmt.Sprintf("rg-%s", infraProvider.env.Name()), getStateResult.State.Outputs["RG_NAME"].Value)
+	require.Len(t, getStateResult.State.Resources, 1)
+	require.Regexp(
+		t,
+		regexp.MustCompile(`^/subscriptions/[^/]*/resourceGroups/[^/]*$`),
+		getStateResult.State.Resources[0].Id,
+	)
+}
+
+func createTerraformProvider(t *testing.T, mockContext *mocks.MockContext) *TerraformProvider {
+	projectDir := "../../../../test/functional/testdata/samples/resourcegroupterraform"
+	options := provisioning.Options{
 		Module: "main",
 	}
 
-	env := environment.EphemeralWithValues("test-env", map[string]string{
-		"AZURE_LOCATION": "westus2",
+	env := environment.NewWithValues("test-env", map[string]string{
+		"AZURE_LOCATION":        "westus2",
+		"AZURE_SUBSCRIPTION_ID": "00000000-0000-0000-0000-000000000000",
 	})
 
-	return NewTerraformProvider(ctx, env, projectDir, options)
+	resourceService := azapi.NewResourceService(mockContext.SubscriptionCredentialProvider, mockContext.ArmClientOptions)
+	accountManager := &mockaccount.MockAccountManager{
+		Subscriptions: []account.Subscription{
+			{
+				Id:   "00000000-0000-0000-0000-000000000000",
+				Name: "test",
+			},
+		},
+		Locations: []account.Location{
+			{
+				Name:                "location",
+				DisplayName:         "Test Location",
+				RegionalDisplayName: "(US) Test Location",
+			},
+		},
+	}
+
+	envManager := &mockenv.MockEnvManager{}
+	envManager.On("Save", mock.Anything, mock.Anything).Return(nil)
+
+	provider := NewTerraformProvider(
+		terraformTools.NewCli(mockContext.CommandRunner),
+		envManager,
+		env,
+		mockContext.Console,
+		&mockCurrentPrincipal{},
+		prompt.NewDefaultPrompter(env, mockContext.Console, accountManager, nil, resourceService, cloud.AzurePublic()),
+	)
+
+	err := provider.Initialize(*mockContext.Context, projectDir, options)
+	require.NoError(t, err)
+
+	return provider.(*TerraformProvider)
 }
 
-func prepareGenericMocks(commandRunner *execmock.MockCommandRunner) {
+func prepareGenericMocks(commandRunner *mockexec.MockCommandRunner) {
 	commandRunner.When(func(args exec.RunArgs, command string) bool {
 		return strings.Contains(command, "terraform version")
 	}).Respond(exec.RunResult{
@@ -217,62 +335,51 @@ func prepareGenericMocks(commandRunner *execmock.MockCommandRunner) {
 
 }
 
-func preparePlanningMocks(commandRunner *execmock.MockCommandRunner) {
+func preparePlanningMocks(commandRunner *mockexec.MockCommandRunner) {
 	commandRunner.When(func(args exec.RunArgs, command string) bool {
 		return args.Cmd == "terraform" && strings.Contains(command, "init")
 	}).Respond(exec.RunResult{
-		Stdout: string("Terraform has been successfully initialized!"),
+		Stdout: "Terraform has been successfully initialized!",
 		Stderr: "",
 	})
 
 	commandRunner.When(func(args exec.RunArgs, command string) bool {
 		return args.Cmd == "terraform" && strings.Contains(command, "validate")
 	}).Respond(exec.RunResult{
-		Stdout: string("Success! The configuration is valid."),
+		Stdout: "Success! The configuration is valid.",
 		Stderr: "",
 	})
 
 	commandRunner.When(func(args exec.RunArgs, command string) bool {
 		return args.Cmd == "terraform" && strings.Contains(command, "plan")
 	}).Respond(exec.RunResult{
-		Stdout: string("To perform exactly these actions, run the following command to apply:terraform apply"),
+		Stdout: "To perform exactly these actions, run the following command to apply:terraform apply",
 		Stderr: "",
 	})
 }
 
-func prepareDeployMocks(commandRunner *execmock.MockCommandRunner) {
-	commandRunner.When(func(args exec.RunArgs, command string) bool {
-		return args.Cmd == "terraform" && strings.Contains(command, "validate")
-	}).Respond(exec.RunResult{
-		Stdout: string("Success! The configuration is valid."),
-		Stderr: "",
-	})
+//go:embed testdata/terraform_show_mock.json
+var terraformShowMockOutput string
 
+func prepareShowMocks(commandRunner *mockexec.MockCommandRunner) {
 	commandRunner.When(func(args exec.RunArgs, command string) bool {
-		return args.Cmd == "terraform" && strings.Contains(command, "apply")
+		return args.Cmd == "terraform" && strings.Contains(command, "show")
 	}).Respond(exec.RunResult{
-		Stdout: string(""),
-		Stderr: "",
-	})
-
-	output := "{\"AZURE_LOCATION\": {\"sensitive\": false,\"type\": \"string\",\"value\": \"westus2\"},\"RG_NAME\":{\"sensitive\": false,\"type\": \"string\",\"value\": \"rg-test-env\"}}"
-	commandRunner.When(func(args exec.RunArgs, command string) bool {
-		return args.Cmd == "terraform" && strings.Contains(command, "output")
-	}).Respond(exec.RunResult{
-		Stdout: output,
+		Stdout: terraformShowMockOutput,
 		Stderr: "",
 	})
 }
 
-func prepareDestroyMocks(commandRunner *execmock.MockCommandRunner) {
+func prepareDestroyMocks(commandRunner *mockexec.MockCommandRunner) {
 	commandRunner.When(func(args exec.RunArgs, command string) bool {
 		return args.Cmd == "terraform" && strings.Contains(command, "init")
 	}).Respond(exec.RunResult{
-		Stdout: string("Terraform has been successfully initialized!"),
+		Stdout: "Terraform has been successfully initialized!",
 		Stderr: "",
 	})
 
-	output := "{\"AZURE_LOCATION\": {\"sensitive\": false,\"type\": \"string\",\"value\": \"westus2\"},\"RG_NAME\":{\"sensitive\": false,\"type\": \"string\",\"value\": \"rg-test-env\"}}"
+	//nolint:lll
+	output := `{"AZURE_LOCATION":{"sensitive": false,"type": "string","value": "westus2"},"RG_NAME":{"sensitive": false,"type": "string","value": "rg-test-env"}}`
 	commandRunner.When(func(args exec.RunArgs, command string) bool {
 		return args.Cmd == "terraform" && strings.Contains(command, "output")
 	}).Respond(exec.RunResult{
@@ -283,7 +390,166 @@ func prepareDestroyMocks(commandRunner *execmock.MockCommandRunner) {
 	commandRunner.When(func(args exec.RunArgs, command string) bool {
 		return args.Cmd == "terraform" && strings.Contains(command, "destroy")
 	}).Respond(exec.RunResult{
-		Stdout: string(""),
+		Stdout: "",
 		Stderr: "",
 	})
+}
+
+type mockCurrentPrincipal struct{}
+
+func (m *mockCurrentPrincipal) CurrentPrincipalId(_ context.Context) (string, error) {
+	return "11111111-1111-1111-1111-111111111111", nil
+}
+
+func (m *mockCurrentPrincipal) CurrentPrincipalType(_ context.Context) (provisioning.PrincipalType, error) {
+	return provisioning.UserType, nil
+}
+
+func TestIsRemoteBackendConfig(t *testing.T) {
+	skipIfTerraformNotInstalled(t)
+	tests := []struct {
+		name           string
+		backendFile    string
+		expectedRemote bool
+	}{
+		{
+			name:           "azurerm backend",
+			backendFile:    "azurerm.tf",
+			expectedRemote: true,
+		},
+		{
+			name:           "remote backend (Terraform Cloud legacy)",
+			backendFile:    "remote.tf",
+			expectedRemote: true,
+		},
+		{
+			name:           "cloud block (Terraform Cloud new syntax)",
+			backendFile:    "cloud.tf",
+			expectedRemote: true,
+		},
+		{
+			name:           "s3 backend",
+			backendFile:    "s3.tf",
+			expectedRemote: true,
+		},
+		{
+			name:           "gcs backend",
+			backendFile:    "gcs.tf",
+			expectedRemote: true,
+		},
+		{
+			name:           "consul backend",
+			backendFile:    "consul.tf",
+			expectedRemote: true,
+		},
+		{
+			name:           "http backend",
+			backendFile:    "http.tf",
+			expectedRemote: true,
+		},
+		{
+			name:           "kubernetes backend",
+			backendFile:    "kubernetes.tf",
+			expectedRemote: true,
+		},
+		{
+			name:           "local backend",
+			backendFile:    "local.tf",
+			expectedRemote: false,
+		},
+		{
+			name:           "no backend specified",
+			backendFile:    "no_backend.tf",
+			expectedRemote: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockContext := mocks.NewMockContext(t.Context())
+			prepareGenericMocks(mockContext.CommandRunner)
+
+			// Create a temporary directory for the test
+			tmpDir := t.TempDir()
+			infraDir := filepath.Join(tmpDir, "infra")
+			err := os.MkdirAll(infraDir, 0755)
+			require.NoError(t, err)
+
+			// Copy the test backend file to the temporary infra directory
+			testDataPath := filepath.Join("testdata", "backend_tests", tt.backendFile)
+			testContent, err := os.ReadFile(testDataPath)
+			require.NoError(t, err)
+
+			// #nosec G306 -- test file permissions are intentionally readable
+			//nolint:gosec // G703: test paths are controlled
+			err = os.WriteFile(filepath.Join(infraDir, "main.tf"), testContent, 0644)
+			require.NoError(t, err)
+
+			// Create a TerraformProvider instance
+			options := provisioning.Options{
+				Module: "main",
+			}
+
+			env := environment.NewWithValues("test-env", map[string]string{
+				"AZURE_LOCATION":        "westus2",
+				"AZURE_SUBSCRIPTION_ID": "00000000-0000-0000-0000-000000000000",
+			})
+
+			resourceService := azapi.NewResourceService(
+				mockContext.SubscriptionCredentialProvider,
+				mockContext.ArmClientOptions,
+			)
+			accountManager := &mockaccount.MockAccountManager{
+				Subscriptions: []account.Subscription{
+					{
+						Id:   "00000000-0000-0000-0000-000000000000",
+						Name: "test",
+					},
+				},
+				Locations: []account.Location{
+					{
+						Name:                "location",
+						DisplayName:         "Test Location",
+						RegionalDisplayName: "(US) Test Location",
+					},
+				},
+			}
+
+			envManager := &mockenv.MockEnvManager{}
+			envManager.On("Save", mock.Anything, mock.Anything).Return(nil)
+
+			provider := NewTerraformProvider(
+				terraformTools.NewCli(mockContext.CommandRunner),
+				envManager,
+				env,
+				mockContext.Console,
+				&mockCurrentPrincipal{},
+				prompt.NewDefaultPrompter(
+					env,
+					mockContext.Console,
+					accountManager,
+					nil,
+					resourceService,
+					cloud.AzurePublic(),
+				),
+			)
+
+			err = provider.Initialize(*mockContext.Context, tmpDir, options)
+			require.NoError(t, err)
+
+			tfProvider := provider.(*TerraformProvider)
+
+			// Test the isRemoteBackendConfig function
+			isRemote, err := tfProvider.isRemoteBackendConfig()
+			require.NoError(t, err)
+			require.Equal(t, tt.expectedRemote, isRemote, "Expected isRemote=%v for %s", tt.expectedRemote, tt.name)
+		})
+	}
+}
+
+func skipIfTerraformNotInstalled(t *testing.T) {
+	t.Helper()
+	if _, err := osexec.LookPath("terraform"); err != nil {
+		t.Skip("skipping: Terraform CLI is not installed")
+	}
 }

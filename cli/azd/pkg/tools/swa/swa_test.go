@@ -4,8 +4,8 @@
 package swa
 
 import (
-	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -14,24 +14,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+var testPath = filepath.Join("projectPath", "service", "path")
+
 func Test_SwaBuild(t *testing.T) {
 	ran := false
 
 	t.Run("NoErrors", func(t *testing.T) {
-		mockContext := mocks.NewMockContext(context.Background())
-		swacli := NewSwaCli(*mockContext.Context)
+		mockContext := mocks.NewMockContext(t.Context())
+		swacli := NewCli(mockContext.CommandRunner)
 
 		mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
 			return strings.Contains(command, "npx")
 		}).RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
 			ran = true
 
-			require.Equal(t, "./projectPath", args.Cwd)
+			require.Equal(t, testPath, args.Cwd)
 			require.Equal(t, []string{
-				"-y", "@azure/static-web-apps-cli@1.0.0",
-				"build",
-				"--app-location", "service/path",
-				"--output-location", "build",
+				"-y", swaCliPackage,
+				"build", "-V",
 			}, args.Args)
 
 			return exec.RunResult{
@@ -44,64 +44,81 @@ func Test_SwaBuild(t *testing.T) {
 			}, nil
 		})
 
-		err := swacli.Build(context.Background(), "./projectPath", "service/path", "build")
+		err := swacli.Build(t.Context(), testPath, nil, nil)
 		require.NoError(t, err)
 		require.True(t, ran)
 	})
 
 	t.Run("Error", func(t *testing.T) {
-		mockContext := mocks.NewMockContext(context.Background())
-		swacli := NewSwaCli(*mockContext.Context)
+		mockContext := mocks.NewMockContext(t.Context())
+		swacli := NewCli(mockContext.CommandRunner)
 
 		mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
 			return strings.Contains(command, "npx")
 		}).RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
 			ran = true
 
-			require.Equal(t, "./projectPath", args.Cwd)
+			require.Equal(t, testPath, args.Cwd)
 			require.Equal(t, []string{
-				"-y", "@azure/static-web-apps-cli@1.0.0",
-				"build",
-				"--app-location", "service/path",
-				"--output-location", "build",
+				"-y", swaCliPackage,
+				"build", "-V",
 			}, args.Args)
 
 			return exec.RunResult{
 				Stdout:   "stdout text",
 				Stderr:   "stderr text",
 				ExitCode: 1,
-			}, errors.New("example error message")
+			}, errors.New("exit code: 1")
 		})
 
-		err := swacli.Build(context.Background(), "./projectPath", "service/path", "build")
+		err := swacli.Build(t.Context(), testPath, nil, nil)
 		require.True(t, ran)
-		require.EqualError(t, err, "swa build: exit code: 1, stdout: stdout text, stderr: stderr text: example error message")
+		require.EqualError(
+			t,
+			err,
+			"swa build: exit code: 1",
+		)
 	})
+}
+
+func Test_SwaBuild_PassesEnvVars(t *testing.T) {
+	mockContext := mocks.NewMockContext(t.Context())
+	swacli := NewCli(mockContext.CommandRunner)
+
+	var capturedArgs exec.RunArgs
+	mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
+		return strings.Contains(command, "npx")
+	}).RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+		capturedArgs = args
+		return exec.RunResult{}, nil
+	})
+
+	env := []string{"VITE_API_URL=https://api.example.com", "NODE_ENV=production"}
+	err := swacli.Build(t.Context(), testPath, nil, env)
+	require.NoError(t, err)
+	require.Equal(t, env, capturedArgs.Env)
 }
 
 func Test_SwaDeploy(t *testing.T) {
 	ran := false
 
 	t.Run("NoErrors", func(t *testing.T) {
-		mockContext := mocks.NewMockContext(context.Background())
-		swacli := NewSwaCli(*mockContext.Context)
+		mockContext := mocks.NewMockContext(t.Context())
+		swacli := NewCli(mockContext.CommandRunner)
 
 		mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
 			return strings.Contains(command, "npx")
 		}).RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
 			ran = true
 
-			require.Equal(t, "./projectPath", args.Cwd)
+			require.Equal(t, testPath, args.Cwd)
 			require.Equal(t, []string{
-				"-y", "@azure/static-web-apps-cli@1.0.0",
+				"-y", swaCliPackage,
 				"deploy",
 				"--tenant-id", "tenantID",
 				"--subscription-id", "subscriptionID",
 				"--resource-group", "resourceGroupID",
 				"--app-name", "appName",
-				"--app-location", "service/path",
-				"--output-location", "build",
-				"--env", "default",
 				"--no-use-keychain",
 				"--deployment-token", "deploymentToken",
 			}, args.Args)
@@ -116,31 +133,89 @@ func Test_SwaDeploy(t *testing.T) {
 			}, nil
 		})
 
-		_, err := swacli.Deploy(context.Background(), "./projectPath", "tenantID", "subscriptionID", "resourceGroupID", "appName", "service/path", "build", "default", "deploymentToken")
+		_, err := swacli.Deploy(
+			t.Context(),
+			testPath,
+			"tenantID",
+			"subscriptionID",
+			"resourceGroupID",
+			"appName",
+			"",
+			"deploymentToken",
+			DeployOptions{},
+			nil,
+		)
 		require.NoError(t, err)
 		require.True(t, ran)
 	})
 
-	t.Run("Error", func(t *testing.T) {
-		mockContext := mocks.NewMockContext(context.Background())
-		swacli := NewSwaCli(*mockContext.Context)
+	t.Run("NoErrorsWithOptions", func(t *testing.T) {
+		mockContext := mocks.NewMockContext(t.Context())
+		swacli := NewCli(mockContext.CommandRunner)
 
 		mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
 			return strings.Contains(command, "npx")
 		}).RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
 			ran = true
 
-			require.Equal(t, "./projectPath", args.Cwd)
+			require.Equal(t, testPath, args.Cwd)
 			require.Equal(t, []string{
-				"-y", "@azure/static-web-apps-cli@1.0.0",
+				"-y", swaCliPackage,
 				"deploy",
 				"--tenant-id", "tenantID",
 				"--subscription-id", "subscriptionID",
 				"--resource-group", "resourceGroupID",
 				"--app-name", "appName",
-				"--app-location", "service/path",
-				"--output-location", "build",
-				"--env", "default",
+				"--no-use-keychain",
+				"--deployment-token", "deploymentToken",
+				"--env", "production",
+				"--app-location", "appFolderPath",
+				"--output-location", "outputRelativeFolderPath",
+			}, args.Args)
+
+			return exec.RunResult{
+				Stdout:   "",
+				Stderr:   "",
+				ExitCode: 1,
+			}, nil
+		})
+
+		_, err := swacli.Deploy(
+			t.Context(),
+			testPath,
+			"tenantID",
+			"subscriptionID",
+			"resourceGroupID",
+			"appName",
+			"production",
+			"deploymentToken",
+			DeployOptions{
+				AppFolderPath:            "appFolderPath",
+				OutputRelativeFolderPath: "outputRelativeFolderPath",
+			},
+			nil,
+		)
+		require.NoError(t, err)
+		require.True(t, ran)
+	})
+
+	t.Run("Error", func(t *testing.T) {
+		mockContext := mocks.NewMockContext(t.Context())
+		swacli := NewCli(mockContext.CommandRunner)
+
+		mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
+			return strings.Contains(command, "npx")
+		}).RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+			ran = true
+
+			require.Equal(t, testPath, args.Cwd)
+			require.Equal(t, []string{
+				"-y", swaCliPackage,
+				"deploy",
+				"--tenant-id", "tenantID",
+				"--subscription-id", "subscriptionID",
+				"--resource-group", "resourceGroupID",
+				"--app-name", "appName",
 				"--no-use-keychain",
 				"--deployment-token", "deploymentToken",
 			}, args.Args)
@@ -149,11 +224,64 @@ func Test_SwaDeploy(t *testing.T) {
 				Stdout:   "stdout text",
 				Stderr:   "stderr text",
 				ExitCode: 1,
-			}, errors.New("example error message")
+			}, errors.New("exit code: 1")
 		})
 
-		_, err := swacli.Deploy(context.Background(), "./projectPath", "tenantID", "subscriptionID", "resourceGroupID", "appName", "service/path", "build", "default", "deploymentToken")
+		_, err := swacli.Deploy(
+			t.Context(),
+			testPath,
+			"tenantID",
+			"subscriptionID",
+			"resourceGroupID",
+			"appName",
+			"",
+			"deploymentToken",
+			DeployOptions{},
+			nil,
+		)
 		require.True(t, ran)
-		require.EqualError(t, err, "swa deploy: exit code: 1, stdout: stdout text, stderr: stderr text: example error message")
+		require.EqualError(
+			t,
+			err,
+			"swa deploy: exit code: 1",
+		)
 	})
+}
+
+func Test_SwaDeploy_WithEnvironment(t *testing.T) {
+	mockContext := mocks.NewMockContext(t.Context())
+	swacli := NewCli(mockContext.CommandRunner)
+
+	var capturedArgs exec.RunArgs
+	mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
+		return strings.Contains(command, "npx")
+	}).RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+		capturedArgs = args
+		return exec.RunResult{}, nil
+	})
+
+	_, err := swacli.Deploy(
+		t.Context(),
+		testPath,
+		"tenantID",
+		"subscriptionID",
+		"resourceGroupID",
+		"appName",
+		"staging",
+		"deploymentToken",
+		DeployOptions{},
+		nil,
+	)
+	require.NoError(t, err)
+	require.Equal(t, []string{
+		"-y", swaCliPackage,
+		"deploy",
+		"--tenant-id", "tenantID",
+		"--subscription-id", "subscriptionID",
+		"--resource-group", "resourceGroupID",
+		"--app-name", "appName",
+		"--no-use-keychain",
+		"--deployment-token", "deploymentToken",
+		"--env", "staging",
+	}, capturedArgs.Args)
 }

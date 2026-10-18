@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
 package tools
 
 import (
@@ -6,27 +9,25 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	osexec "os/exec"
 )
 
-// Stores tools that have already been verified to being installed
-// This will save us time having to re-check downstream in other components
-var confirmedTools map[string]bool = map[string]bool{}
-
-// missingToolErrors wraps a set of errors discovered when
+// MissingToolErrors wraps a set of errors discovered when
 // probing for tools and implements the Error interface to pretty
 // print the underlying errors. We use this instead of the existing
 // `multierr` package we use elsewhere, because we want to control
 // the error string (the default one produced by multierr is not
 // as nice as what we do here).
-type missingToolErrors struct {
-	errs []error
+type MissingToolErrors struct {
+	Errs      []error
+	ToolNames []string
 }
 
-func (m *missingToolErrors) Error() string {
+func (m *MissingToolErrors) Error() string {
 	buf := bytes.Buffer{}
 
 	fmt.Fprintf(&buf, "required external tools are missing:")
-	for _, err := range m.errs {
+	for _, err := range m.Errs {
 		fmt.Fprintf(&buf, "\n - %s", err.Error())
 	}
 
@@ -37,7 +38,13 @@ func (m *missingToolErrors) Error() string {
 // error if one or more tools are not.
 func EnsureInstalled(ctx context.Context, tools ...ExternalTool) error {
 	var allErrors []error
+	var toolsInError []string
 	errorsEncountered := map[string]struct{}{}
+
+	confirmedTools := make(map[string]struct{})
+	if fromCtx, ok := ctx.Value(installedCheckCacheKey).(map[string]struct{}); ok && fromCtx != nil {
+		confirmedTools = fromCtx
+	}
 
 	for _, tool := range tools {
 		_, ok := confirmedTools[tool.Name()]
@@ -46,30 +53,34 @@ func EnsureInstalled(ctx context.Context, tools ...ExternalTool) error {
 			continue
 		}
 
-		has, err := tool.CheckInstalled(ctx)
-		var errSem *ErrSemver
-		if errors.As(err, &errSem) {
+		err := tool.CheckInstalled(ctx)
+		if _, ok := errors.AsType[*ErrSemver](err); ok {
 			errorMsg := err.Error()
 			if _, hasV := errorsEncountered[errorMsg]; !hasV {
 				allErrors = append(allErrors, err)
+				toolsInError = append(toolsInError, tool.Name())
 				errorsEncountered[errorMsg] = struct{}{}
 			}
+		} else if errors.Is(err, osexec.ErrNotFound) {
+			allErrors = append(
+				allErrors, fmt.Errorf("%s is not installed, see %s to install", tool.Name(), tool.InstallUrl()))
+			toolsInError = append(toolsInError, tool.Name())
 		} else if err != nil {
 			errorMsg := err.Error()
 			if _, hasV := errorsEncountered[errorMsg]; !hasV {
 				allErrors = append(allErrors, fmt.Errorf("error checking for external tool %s: %w", tool.Name(), err))
+				toolsInError = append(toolsInError, tool.Name())
+
 				errorsEncountered[errorMsg] = struct{}{}
 			}
-		} else if !has {
-			allErrors = append(allErrors, fmt.Errorf("%s is not installed, please see %s to install", tool.Name(), tool.InstallUrl()))
 		}
 
 		// Mark the current tool as confirmed
-		confirmedTools[tool.Name()] = true
+		confirmedTools[tool.Name()] = struct{}{}
 	}
 
 	if len(allErrors) > 0 {
-		return &missingToolErrors{errs: allErrors}
+		return &MissingToolErrors{Errs: allErrors, ToolNames: toolsInError}
 	}
 
 	return nil
@@ -91,4 +102,14 @@ func Unique(tools []ExternalTool) []ExternalTool {
 	}
 
 	return uniqueTools
+}
+
+type confirmCacheKey string
+
+const (
+	installedCheckCacheKey confirmCacheKey = "checkCache"
+)
+
+func WithInstalledCheckCache(ctx context.Context) context.Context {
+	return context.WithValue(ctx, installedCheckCacheKey, make(map[string]struct{}))
 }

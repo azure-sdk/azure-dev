@@ -1,123 +1,496 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
 package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"log"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/azure/azure-dev/cli/azd/pkg/exec"
 	"github.com/azure/azure-dev/cli/azd/pkg/tools"
 	"github.com/blang/semver/v4"
 )
 
-func NewDocker(ctx context.Context) *Docker {
-	return &Docker{
-		commandRunner: exec.GetCommandRunner(ctx),
+const DefaultPlatform string = "linux/amd64"
+
+var _ tools.ExternalTool = (*Cli)(nil)
+
+func NewCli(commandRunner exec.CommandRunner) *Cli {
+	return &Cli{
+		commandRunner: commandRunner,
 	}
 }
 
-type Docker struct {
+type Cli struct {
 	commandRunner exec.CommandRunner
+
+	engineOnce      sync.Once // Publishes an immutable selection; readiness checks run separately.
+	containerEngine tools.ContainerEngine
+	engineErr       error
 }
 
-// Runs a Docker build for a given Dockerfile. If the platform is not specified (empty), it defaults to amd64. If the build is successful, the function
-// returns the image id of the built image.
-func (d *Docker) Build(ctx context.Context, cwd string, dockerFilePath string, platform string, buildContext string) (string, error) {
+// ContainerEngineUnavailableError indicates that the installed engine failed its readiness check.
+// The cause may be a stopped runtime, connection failure, or insufficient permissions.
+type ContainerEngineUnavailableError struct {
+	Engine tools.ContainerEngine
+	Err    error
+}
+
+// Error returns the container engine readiness failure.
+func (e *ContainerEngineUnavailableError) Error() string {
+	return fmt.Sprintf("%s is unavailable: %v", containerEngineDisplayName(e.Engine), e.Err)
+}
+
+// Unwrap returns the underlying readiness check error.
+func (e *ContainerEngineUnavailableError) Unwrap() error {
+	return e.Err
+}
+
+// ContainerEngine returns the container engine name ("docker" or "podman"), selected once
+// per Cli from AZD_CONTAINER_RUNTIME and PATH without checking version or daemon readiness.
+// It defaults to "docker" if selection fails; CheckInstalled reports the selection error.
+// This also supports callers such as dotnet publish that do not require a local runtime.
+func (d *Cli) ContainerEngine() tools.ContainerEngine {
+	engine, _ := d.selectContainerEngine()
+	return engine
+}
+
+func (d *Cli) Login(ctx context.Context, loginServer string, username string, password string) error {
+	engineName := d.ContainerEngine()
+	runArgs := exec.NewRunArgs(
+		string(engineName), "login",
+		"--username", username,
+		"--password-stdin",
+		loginServer,
+	).WithStdIn(strings.NewReader(password))
+
+	_, err := d.commandRunner.Run(ctx, runArgs)
+	if err != nil {
+		return fmt.Errorf("failed logging into %s: %w", containerEngineDisplayName(engineName), err)
+	}
+
+	return nil
+}
+
+// Runs a Docker build for a given Dockerfile, writing the output of docker build to [stdOut] when it is
+// not nil. If the platform is not specified (empty) it defaults to amd64. If the build is successful,
+// the function returns the image id of the built image.
+func (d *Cli) Build(
+	ctx context.Context,
+	cwd string,
+	dockerFilePath string,
+	platform string,
+	target string,
+	buildContext string,
+	tagName string,
+	buildArgs []string,
+	buildSecrets []string,
+	buildEnv []string,
+	buildNetwork string,
+	buildProgress io.Writer,
+) (string, error) {
 	if strings.TrimSpace(platform) == "" {
-		platform = "amd64"
+		platform = DefaultPlatform
 	}
 
-	res, err := d.executeCommand(ctx, cwd, "build", "-q", "-f", dockerFilePath, "--platform", platform, buildContext)
+	tmpFolder, err := os.MkdirTemp(os.TempDir(), "azd-docker-build")
+	defer func() {
+		// fail to remove tmp files is not so bad as the OS will delete it
+		// eventually
+		_ = os.RemoveAll(tmpFolder)
+	}()
+
 	if err != nil {
-		return "", fmt.Errorf("building image: %s: %w", res.String(), err)
+		return "", fmt.Errorf("building image: %w", err)
+	}
+	imgIdFile := filepath.Join(tmpFolder, "imgId")
+
+	args := []string{
+		"build",
+		"-f", dockerFilePath,
+		"--platform", platform,
 	}
 
-	return strings.TrimSpace(res.Stdout), nil
+	if target != "" {
+		args = append(args, "--target", target)
+	}
+
+	if buildNetwork != "" {
+		args = append(args, "--network", buildNetwork)
+	}
+
+	if tagName != "" {
+		args = append(args, "-t", tagName)
+	}
+
+	for _, arg := range buildArgs {
+		args = append(args, "--build-arg", arg)
+	}
+
+	for _, arg := range buildSecrets {
+		args = append(args, "--secret", arg)
+	}
+	args = append(args, buildContext)
+
+	// create a file with the docker img id
+	args = append(args, "--iidfile", imgIdFile)
+
+	// Build and produce output
+	runArgs := exec.NewRunArgs(string(d.ContainerEngine()), args...).WithCwd(cwd).WithEnv(buildEnv)
+
+	if buildProgress != nil {
+		// setting stderr and stdout both, as it's been noticed
+		// that docker log goes to stderr on macOS, but stdout on Ubuntu.
+		runArgs = runArgs.WithStdOut(buildProgress).WithStdErr(buildProgress)
+	}
+
+	_, err = d.commandRunner.Run(ctx, runArgs)
+	if err != nil {
+		return "", fmt.Errorf("building image: %w", err)
+	}
+
+	imgId, err := os.ReadFile(imgIdFile)
+	if err != nil {
+		return "", fmt.Errorf("building image: %w", err)
+	}
+	return strings.TrimSpace(string(imgId)), nil
 }
 
-func (d *Docker) Tag(ctx context.Context, cwd string, imageName string, tag string) error {
-	res, err := d.executeCommand(ctx, cwd, "tag", imageName, tag)
+func (d *Cli) Tag(ctx context.Context, cwd string, imageName string, tag string) error {
+	_, err := d.executeCommand(ctx, cwd, "tag", imageName, tag)
 	if err != nil {
-		return fmt.Errorf("tagging image: %s: %w", res.String(), err)
+		return fmt.Errorf("tagging image: %w", err)
 	}
 
 	return nil
 }
 
-func (d *Docker) Push(ctx context.Context, cwd string, tag string) error {
-	res, err := d.executeCommand(ctx, cwd, "push", tag)
+func (d *Cli) Push(ctx context.Context, cwd string, tag string) error {
+	_, err := d.executeCommand(ctx, cwd, "push", tag)
 	if err != nil {
-		return fmt.Errorf("pushing image: %s: %w", res.String(), err)
+		return fmt.Errorf("pushing image: %w", err)
 	}
 
 	return nil
 }
 
-func (d *Docker) versionInfo() tools.VersionInfo {
+func (d *Cli) Pull(ctx context.Context, imageName string) error {
+	_, err := d.executeCommand(ctx, "", "pull", imageName)
+	if err != nil {
+		return fmt.Errorf("pulling image: %w", err)
+	}
+
+	return nil
+}
+
+func (d *Cli) Inspect(ctx context.Context, imageName string, format string) (string, error) {
+	out, err := d.executeCommand(ctx, "", "image", "inspect", "--format", format, imageName)
+	if err != nil {
+		return "", fmt.Errorf("inspecting image: %w", err)
+	}
+
+	return out.Stdout, nil
+}
+
+// Remove deletes a local Docker image by name or ID
+func (d *Cli) Remove(ctx context.Context, imageName string) error {
+	_, err := d.executeCommand(ctx, "", "rmi", imageName)
+	if err != nil {
+		return fmt.Errorf("removing image %s: %w", imageName, err)
+	}
+
+	return nil
+}
+
+func (d *Cli) versionInfo() tools.VersionInfo {
 	return tools.VersionInfo{
 		MinimumVersion: semver.Version{
 			Major: 17,
 			Minor: 9,
 			Patch: 0},
-		UpdateCommand: "Visit https://docs.docker.com/engine/release-notes/ to upgrade",
+		UpdateCommand: "Visit https://docs.docker.com/engine/release-notes/ or " +
+			"https://podman.io/getting-started/installation to upgrade",
 	}
 }
 
-func (d *Docker) extractDockerVersionSemVer(cliOutput string) (semver.Version, error) {
-	ver := regexp.MustCompile(`\d+\.\d+\.\d+`).FindString(cliOutput)
+func (d *Cli) podmanVersionInfo() tools.VersionInfo {
+	return tools.VersionInfo{
+		MinimumVersion: semver.Version{
+			Major: 3,
+			Minor: 0,
+			Patch: 0},
+		UpdateCommand: "Visit https://podman.io/getting-started/installation to upgrade",
+	}
+}
 
-	// Skip leading zeroes to allow inexact parsing for version formats that are not truly SemVer compliant.
-	// Example: docker has versions like 17.09.0 (non semver) instead of 17.9.0 (semver)
-	versionSplit := strings.Split(ver, ".")
-	for key, val := range versionSplit {
-		verInt, err := strconv.Atoi(val)
+// dockerVersionRegexp is a regular expression which matches the text printed by "docker --version"
+// and captures the version and build components.
+var dockerVersionStringRegexp = regexp.MustCompile(`Docker version ([^,]*), build ([a-f0-9]*)`)
+
+// podmanVersionStringRegexp is a regular expression which matches the text printed by "podman --version"
+// and captures the version component.
+var podmanVersionStringRegexp = regexp.MustCompile(`podman version (\S+)`)
+
+// dockerVersionReleaseBuildRegexp is a regular expression which matches the three part version number
+// from a docker version from an official release. The major and minor components are captured.
+var dockerVersionReleaseBuildRegexp = regexp.MustCompile(`^(\d+).(\d+).\d+`)
+
+// dockerVersionMasterBuildRegexp is a regular expression which matches the three part version number
+// from a docker version from a release from master. Each version component is captured independently.
+var dockerVersionMasterBuildRegexp = regexp.MustCompile(`^master-dockerproject-(\d+)-(\d+)-(\d+)`)
+
+// isSupportedDockerVersion returns true if the version string appears to be for a docker version
+// of 17.09 or later and false if it does not.
+func isSupportedDockerVersion(cliOutput string) (bool, error) {
+	log.Printf("determining version from docker --version string: %s", cliOutput)
+
+	matches := dockerVersionStringRegexp.FindStringSubmatch(cliOutput)
+
+	// (3 matches, the entire string, and the two captures)
+	if len(matches) != 3 {
+		return false, fmt.Errorf("could not extract version component from docker version string")
+	}
+
+	version := matches[1]
+	build := matches[2]
+
+	log.Printf("extracted docker version: %s, build: %s from version string", version, build)
+
+	// For official release builds, the version number looks something like:
+	//
+	// 17.09.0-ce or 20.10.17+azure-1
+	//
+	// Note this is not a semver (the leading zero in the second component of the 17.09 string is not allowed per semver)
+	// so we need to take this apart ourselves.
+	if releaseVersionMatches := dockerVersionReleaseBuildRegexp.FindStringSubmatch(version); releaseVersionMatches != nil {
+		major, err := strconv.Atoi(releaseVersionMatches[1])
 		if err != nil {
-			return semver.Version{}, err
+			return false, fmt.Errorf(
+				"failed to convert major version component %s to an integer: %w",
+				releaseVersionMatches[1],
+				err,
+			)
 		}
-		versionSplit[key] = strconv.Itoa(verInt)
+
+		minor, err := strconv.Atoi(releaseVersionMatches[2])
+		if err != nil {
+			return false, fmt.Errorf(
+				"failed to convert minor version component %s to an integer: %w",
+				releaseVersionMatches[2],
+				err,
+			)
+		}
+
+		return (major > 17 || (major == 17 && minor >= 9)), nil
 	}
 
-	semver, err := semver.Parse(strings.Join(versionSplit, "."))
-	if err != nil {
-		return semver, err
-	}
-	return semver, nil
+	// For builds which come out of master, we'll assume any build from 2018 or later will work
+	// (since we support 17.09 which was released in September of 2017)
+	if masterVersionMatches := dockerVersionMasterBuildRegexp.FindStringSubmatch(version); masterVersionMatches != nil {
+		year, err := strconv.Atoi(masterVersionMatches[1])
+		if err != nil {
+			return false, fmt.Errorf(
+				"failed to convert major version component %s to an integer: %w",
+				masterVersionMatches[1],
+				err,
+			)
+		}
 
+		return year >= 2018, nil
+	}
+
+	// If we reach this point, we don't understand how to validate the version based on its scheme.
+	return false, fmt.Errorf("could not determine version from docker version string: %s", version)
 }
-func (d *Docker) CheckInstalled(ctx context.Context) (bool, error) {
-	found, err := tools.ToolInPath("docker")
-	if !found {
-		return false, err
+
+// isSupportedPodmanVersion returns true if the version string appears to be for a podman version
+// of 3.0 or later (podman 3.0 was released in 2021 with stable docker compatibility)
+func isSupportedPodmanVersion(cliOutput string) (bool, error) {
+	log.Printf("determining version from podman --version string: %s", cliOutput)
+
+	matches := podmanVersionStringRegexp.FindStringSubmatch(cliOutput)
+
+	// (2 matches, the entire string, and the version capture)
+	if len(matches) != 2 {
+		return false, fmt.Errorf("could not extract version component from podman version string")
 	}
-	dockerRes, err := tools.ExecuteCommand(ctx, "docker", "--version")
+
+	versionStr := matches[1]
+	log.Printf("extracted podman version: %s from version string", versionStr)
+
+	// Podman uses semantic versioning, so we can parse it directly
+	version, err := semver.Parse(versionStr)
 	if err != nil {
-		return false, fmt.Errorf("checking %s version: %w", d.Name(), err)
+		return false, fmt.Errorf("failed to parse podman version %s: %w", versionStr, err)
 	}
-	dockerSemver, err := d.extractDockerVersionSemVer(dockerRes)
+
+	// Require podman 3.0 or later for stable docker compatibility
+	minVersion := semver.Version{Major: 3, Minor: 0, Patch: 0}
+	return version.GTE(minVersion), nil
+}
+func (d *Cli) CheckInstalled(ctx context.Context) error {
+	engineName, err := d.selectContainerEngine()
 	if err != nil {
-		return false, fmt.Errorf("converting to semver version fails: %w", err)
+		return err
 	}
-	updateDetail := d.versionInfo()
-	if dockerSemver.LT(updateDetail.MinimumVersion) {
-		return false, &tools.ErrSemver{ToolName: d.Name(), VersionInfo: updateDetail}
-	}
-	return true, nil
+
+	return d.validateContainerEngine(ctx, engineName)
 }
 
-func (d *Docker) InstallUrl() string {
+func (d *Cli) selectContainerEngine() (tools.ContainerEngine, error) {
+	d.engineOnce.Do(func() {
+		d.containerEngine, d.engineErr = d.detectContainerEngine()
+	})
+	return d.containerEngine, d.engineErr
+}
+
+func (d *Cli) detectContainerEngine() (tools.ContainerEngine, error) {
+	containerRuntime := tools.ContainerEngine(os.Getenv("AZD_CONTAINER_RUNTIME"))
+	if containerRuntime != "" {
+		if containerRuntime != tools.ContainerEngineDocker && containerRuntime != tools.ContainerEnginePodman {
+			return tools.ContainerEngineDocker, fmt.Errorf(
+				"unsupported container runtime '%s' specified in AZD_CONTAINER_RUNTIME. "+
+					"Supported values: docker, podman",
+				containerRuntime)
+		}
+		return containerRuntime, nil
+	}
+
+	if d.commandRunner.ToolInPath(string(tools.ContainerEngineDocker)) == nil {
+		return tools.ContainerEngineDocker, nil
+	}
+	if d.commandRunner.ToolInPath(string(tools.ContainerEnginePodman)) == nil {
+		return tools.ContainerEnginePodman, nil
+	}
+	return tools.ContainerEngineDocker, fmt.Errorf(
+		"neither docker nor podman is installed. " +
+			"Please install Docker: https://aka.ms/azure-dev/docker-install " +
+			"or Podman: https://aka.ms/azure-dev/podman-install")
+}
+
+// validateContainerEngine checks version and readiness without caching failures or holding a lock.
+func (d *Cli) validateContainerEngine(ctx context.Context, engineName tools.ContainerEngine) error {
+	// Check version
+	versionOutput, err := tools.ExecuteCommand(ctx, d.commandRunner, string(engineName), "--version")
+	if err != nil {
+		return fmt.Errorf("checking %s version: %w", engineName, err)
+	}
+	log.Printf("%s version: %s", engineName, versionOutput)
+
+	var supported bool
+	var versionInfo tools.VersionInfo
+	switch engineName {
+	case tools.ContainerEngineDocker:
+		supported, err = isSupportedDockerVersion(versionOutput)
+		versionInfo = d.versionInfo()
+	case tools.ContainerEnginePodman:
+		supported, err = isSupportedPodmanVersion(versionOutput)
+		versionInfo = d.podmanVersionInfo()
+	default:
+		return fmt.Errorf("unknown container engine: %s", engineName)
+	}
+
+	if err != nil {
+		return err
+	}
+	if !supported {
+		return &tools.ErrSemver{ToolName: containerEngineDisplayName(engineName), VersionInfo: versionInfo}
+	}
+
+	// Check if daemon/service is running
+	if _, err := tools.ExecuteCommand(ctx, d.commandRunner, string(engineName), "ps"); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		// The command runner may report a process exit without wrapping cancellation.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.Join(err, ctxErr)
+		}
+		return &ContainerEngineUnavailableError{
+			Engine: engineName,
+			Err:    err,
+		}
+	}
+
+	return nil
+}
+
+func (d *Cli) InstallUrl() string {
+	if d.ContainerEngine() == tools.ContainerEnginePodman {
+		return "https://aka.ms/azure-dev/podman-install"
+	}
 	return "https://aka.ms/azure-dev/docker-install"
 }
 
-func (d *Docker) Name() string {
+func (d *Cli) Name() string {
+	return containerEngineDisplayName(d.ContainerEngine())
+}
+
+func containerEngineDisplayName(engineName tools.ContainerEngine) string {
+	if engineName == tools.ContainerEnginePodman {
+		return "Podman"
+	}
 	return "Docker"
 }
 
-func (d *Docker) executeCommand(ctx context.Context, cwd string, args ...string) (exec.RunResult, error) {
-	runArgs := exec.NewRunArgs("docker", args...).
-		WithCwd(cwd).
-		WithEnrichError(true)
+// IsContainerdEnabled checks if Docker is using containerd as the image store
+func (d *Cli) IsContainerdEnabled(ctx context.Context) (bool, error) {
+	engineName := d.ContainerEngine()
+	// Containerd image store is only applicable to Docker, not Podman
+	if engineName == tools.ContainerEnginePodman {
+		return false, nil
+	}
+
+	result, err := d.commandRunner.Run(ctx,
+		exec.NewRunArgs(string(engineName), "system", "info", "--format", "{{.DriverStatus}}"))
+	if err != nil {
+		return false, fmt.Errorf("checking docker driver status: %w", err)
+	}
+
+	driverStatus := strings.TrimSpace(result.Stdout)
+
+	// Check for containerd snapshotter which indicates containerd image store is enabled
+	return strings.Contains(driverStatus, "io.containerd.snapshotter.v1"), nil
+}
+
+func (d *Cli) executeCommand(ctx context.Context, cwd string, args ...string) (exec.RunResult, error) {
+	runArgs := exec.NewRunArgs(string(d.ContainerEngine()), args...).
+		WithCwd(cwd)
 
 	return d.commandRunner.Run(ctx, runArgs)
+}
+
+// SplitDockerImage splits the image into the name and tag.
+// If the image does not have a tag or is invalid, the full string is returned as name, and tag will be empty.
+func SplitDockerImage(fullImg string) (name string, tag string) {
+	split := -1
+	// the colon separator can appear in two places:
+	// 1. between the image and the tag, image:tag
+	// 2. between the host and the port, in which case, it would be host:port/image:tag to be valid.
+	for i, r := range fullImg {
+		switch r {
+		case ':':
+			split = i
+		case '/':
+			// if we see a path separator, we know that the previously found
+			// colon is not the image:tag separator, since a tag cannot have a path separator
+			split = -1
+		}
+	}
+
+	if split == -1 || split == len(fullImg)-1 {
+		return fullImg, ""
+	}
+
+	return fullImg[:split], fullImg[split+1:]
 }

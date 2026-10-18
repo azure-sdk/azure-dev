@@ -1,0 +1,246 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package cmd
+
+import (
+	"fmt"
+	"net/url"
+	"regexp"
+	"strings"
+
+	"azureaiagent/internal/exterrors"
+	"azureaiagent/internal/pkg/agents/agent_api"
+	"azureaiagent/internal/pkg/agents/agent_yaml"
+)
+
+// agentEndpointHostHint is the example Foundry host suffix shown in validation
+// error messages. Actual host membership is checked via isFoundryHost (project_endpoint.go).
+const agentEndpointHostHint = ".services.ai.azure.com"
+
+// agentEndpointHint is the suggestion appended to most --agent-endpoint validation errors.
+// `azd ai agent show` persistently prints the agent endpoint URL, so it's the right
+// thing to point users at any time after a deploy.
+const agentEndpointHint = "run `azd ai agent show` to see the agent endpoint URL"
+
+// agentEndpointPathRegex matches the full Foundry agent-endpoint path. Captures:
+//
+//	[1] project name (URL-escaped),
+//	[2] agent name (URL-escaped),
+//	[3] protocol tail ("invocations", "a2a", or "openai/responses").
+//
+// The "openai/v1/responses" tail is also accepted and rebuilt to the canonical
+// query-parameter form when invoked.
+var agentEndpointPathRegex = regexp.MustCompile(
+	`^/api/projects/([^/]+)/agents/([^/]+)/endpoint/protocols/` +
+		`(invocations|a2a|openai/v1/responses|openai/responses)/?$`,
+)
+
+// parsedAgentEndpoint describes a deployed agent invocation endpoint.
+type parsedAgentEndpoint struct {
+	// ProjectEndpoint is the Foundry project root: https://<acct>.services.ai.azure.com/api/projects/<proj>.
+	ProjectEndpoint string
+	AgentName       string
+	Protocol        agent_api.AgentProtocol
+	// APIVersion is the api-version query parameter from the URL, or empty if absent.
+	APIVersion string
+}
+
+// parseAgentEndpoint parses the full agent invocation URL printed by `azd ai agent show`.
+//
+// Accepted shapes:
+//
+//	https://<acct>.services.ai.azure.com/api/projects/<proj>/agents/<name>/endpoint/protocols/invocations[?api-version=…]
+//	https://<acct>.services.ai.azure.com/api/projects/<proj>/agents/<name>/endpoint/protocols/openai/responses?api-version=v1
+//
+// The host must be a `*.services.ai.azure.com` Foundry host. The path must include the
+// protocol-specific suffix; the protocol is derived from the URL.
+func parseAgentEndpoint(rawURL string) (*parsedAgentEndpoint, error) {
+	if strings.TrimSpace(rawURL) == "" {
+		return nil, exterrors.Validation(
+			exterrors.CodeInvalidParameter,
+			"--agent-endpoint requires a non-empty URL",
+			agentEndpointHint,
+		)
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, exterrors.Validation(
+			exterrors.CodeInvalidParameter,
+			fmt.Sprintf("invalid --agent-endpoint URL: %v", err),
+			agentEndpointHint,
+		)
+	}
+
+	if !strings.EqualFold(u.Scheme, "https") {
+		return nil, exterrors.Validation(
+			exterrors.CodeInvalidParameter,
+			"--agent-endpoint must use https",
+			agentEndpointHint,
+		)
+	}
+
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return nil, exterrors.Validation(
+			exterrors.CodeInvalidParameter,
+			"--agent-endpoint host must not be empty",
+			agentEndpointHint,
+		)
+	}
+	if !isFoundryHost(host) {
+		return nil, exterrors.Validation(
+			exterrors.CodeInvalidParameter,
+			fmt.Sprintf("--agent-endpoint host %q is not a Foundry host (*%s)", u.Hostname(), agentEndpointHostHint),
+			agentEndpointHint,
+		)
+	}
+
+	// Reject explicit ports — Foundry endpoints always use the default HTTPS port,
+	// and silently dropping a non-default port would route requests to a different origin.
+	if u.Port() != "" {
+		return nil, exterrors.Validation(
+			exterrors.CodeInvalidParameter,
+			fmt.Sprintf("--agent-endpoint host %q must not include a port", u.Host),
+			agentEndpointHint+" (no explicit port)",
+		)
+	}
+
+	// Match the full path against the canonical Foundry agent-endpoint shape and pull
+	// the project name, agent name, and protocol tail out in one pass.
+	matches := agentEndpointPathRegex.FindStringSubmatch(u.EscapedPath())
+	if matches == nil {
+		return nil, exterrors.Validation(
+			exterrors.CodeInvalidParameter,
+			"--agent-endpoint path must match /api/projects/<project>/agents/<name>/endpoint/protocols/<protocol>",
+			agentEndpointHint,
+		)
+	}
+	projectSegment, agentSegment, protocolTail := matches[1], matches[2], matches[3]
+
+	projectName, err := url.PathUnescape(projectSegment)
+	if err != nil || projectName == "" || strings.ContainsAny(projectName, "/\\") {
+		return nil, exterrors.Validation(
+			exterrors.CodeInvalidParameter,
+			"--agent-endpoint project segment is invalid",
+			agentEndpointHint,
+		)
+	}
+
+	agentName, err := url.PathUnescape(agentSegment)
+	if err != nil || agent_yaml.ValidateAgentName(agentName) != nil {
+		return nil, exterrors.Validation(
+			exterrors.CodeInvalidAgentName,
+			fmt.Sprintf("--agent-endpoint agent name %q is invalid", agentSegment),
+			"agent names must start and end with an alphanumeric character, "+
+				"may contain hyphens in the middle, and be 1-63 characters long",
+		)
+	}
+
+	var protocol agent_api.AgentProtocol
+	switch protocolTail {
+	case "invocations":
+		protocol = agent_api.AgentProtocolInvocations
+	case "a2a":
+		protocol = agent_api.AgentProtocolA2A
+	case "openai/responses", "openai/v1/responses":
+		protocol = agent_api.AgentProtocolResponses
+	}
+
+	// Reject an explicit but empty api-version query parameter; the default fallback would
+	// otherwise silently invoke a different version than the user pasted.
+	apiVersion := ""
+	query := u.Query()
+	if values, present := query["api-version"]; present {
+		if len(values) == 0 || values[0] == "" {
+			return nil, exterrors.Validation(
+				exterrors.CodeInvalidParameter,
+				"--agent-endpoint api-version query parameter is empty",
+				"include a non-empty api-version value or omit the parameter to use the default",
+			)
+		}
+		apiVersion = values[0]
+	}
+
+	projectEndpoint := fmt.Sprintf("https://%s/api/projects/%s", host, projectSegment)
+
+	return &parsedAgentEndpoint{
+		ProjectEndpoint: projectEndpoint,
+		AgentName:       agentName,
+		Protocol:        protocol,
+		APIVersion:      apiVersion,
+	}, nil
+}
+
+// buildResponsesURL builds the Foundry "openai/responses" protocol URL for an agent.
+// apiVersion is URL-encoded so unusual characters cannot break out of the query value.
+func buildResponsesURL(projectEndpoint, agentName, apiVersion string) string {
+	if apiVersion == "" {
+		apiVersion = DefaultAgentAPIVersion
+	}
+	return fmt.Sprintf(
+		"%s/agents/%s/endpoint/protocols/openai/responses?api-version=%s",
+		projectEndpoint, agentName, url.QueryEscape(apiVersion),
+	)
+}
+
+// buildInvocationsURL builds the Foundry "invocations" protocol URL for an agent.
+// When sid is non-empty, an agent_session_id query parameter is appended (URL-encoded).
+func buildInvocationsURL(projectEndpoint, agentName, apiVersion, sid string) string {
+	invURL := fmt.Sprintf(
+		"%s/agents/%s/endpoint/protocols/invocations?api-version=%s",
+		projectEndpoint, agentName, url.QueryEscape(apiVersion),
+	)
+	if sid != "" {
+		invURL += "&agent_session_id=" + url.QueryEscape(sid)
+	}
+	return invURL
+}
+
+// buildInvocationLifecycleURL builds the Invocation retrieval URL.
+func buildInvocationLifecycleURL(
+	projectEndpoint string,
+	agentName string,
+	invocationID string,
+	apiVersion string,
+) string {
+	if apiVersion == "" {
+		apiVersion = DefaultAgentAPIVersion
+	}
+	return fmt.Sprintf(
+		"%s/agents/%s/endpoint/protocols/invocations/%s?api-version=%s",
+		projectEndpoint,
+		agentName,
+		url.PathEscape(invocationID),
+		url.QueryEscape(apiVersion),
+	)
+}
+
+// buildInvocationCancelURL builds the Invocation cancellation URL.
+func buildInvocationCancelURL(projectEndpoint, agentName, invocationID, apiVersion string) string {
+	lifecycleURL := buildInvocationLifecycleURL(projectEndpoint, agentName, invocationID, apiVersion)
+	parts := strings.SplitN(lifecycleURL, "?", 2)
+	return parts[0] + "/cancel?" + parts[1]
+}
+
+// buildA2AInvokeURL builds the Foundry "a2a" protocol URL for an agent. When sid
+// is non-empty, an agent_session_id query parameter is appended (URL-encoded) so
+// the request routes to the same agent session, matching the invocations protocol.
+//
+// NOTE: The A2A endpoint path tail (protocols/a2a) follows the same convention as
+// the responses/invocations endpoints. It is centralized here so it can be
+// adjusted in one place if the Foundry A2A contract differs.
+func buildA2AInvokeURL(projectEndpoint, agentName, apiVersion, sid string) string {
+	if apiVersion == "" {
+		apiVersion = DefaultAgentAPIVersion
+	}
+	endpointURL := fmt.Sprintf(
+		"%s/agents/%s/endpoint/protocols/a2a?api-version=%s",
+		projectEndpoint, agentName, url.QueryEscape(apiVersion),
+	)
+	if sid != "" {
+		endpointURL += "&agent_session_id=" + url.QueryEscape(sid)
+	}
+	return endpointURL
+}

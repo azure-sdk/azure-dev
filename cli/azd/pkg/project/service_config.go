@@ -1,194 +1,239 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
 package project
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"path/filepath"
-	"strings"
+	"sync"
 
-	"github.com/azure/azure-dev/cli/azd/pkg/environment"
+	"github.com/azure/azure-dev/cli/azd/pkg/apphost"
+	"github.com/azure/azure-dev/cli/azd/pkg/ext"
 	"github.com/azure/azure-dev/cli/azd/pkg/infra/provisioning"
-	"github.com/azure/azure-dev/cli/azd/pkg/input"
-	"github.com/azure/azure-dev/cli/azd/pkg/tools/azcli"
-	"github.com/azure/azure-dev/cli/azd/pkg/tools/docker"
-	"github.com/azure/azure-dev/cli/azd/pkg/tools/swa"
+	"github.com/azure/azure-dev/cli/azd/pkg/osutil"
 )
+
+// hookRegistrationGuard protects hook registration state with a mutex.
+// It is heap-allocated so that shallow copies of ServiceConfig share the
+// guard by pointer rather than copying the sync.Mutex value.
+type hookRegistrationGuard struct {
+	mu           sync.Mutex
+	registration *configuredHookRegistration
+}
 
 type ServiceConfig struct {
 	// Reference to the parent project configuration
-	Project *ProjectConfig `yaml:"omitempty"`
+	Project *ProjectConfig `yaml:"-"`
 	// The friendly name/key of the project from the azure.yaml file
-	Name string
+	Name string `yaml:"-"`
+	// The azure resource group to deploy the service to
+	ResourceGroupName osutil.ExpandableString `yaml:"resourceGroup,omitempty"`
 	// The name used to override the default azure resource name
-	ResourceName string `yaml:"resourceName"`
+	ResourceName osutil.ExpandableString `yaml:"resourceName,omitempty"`
+	// The ARM api version to use for the service. If not specified, the latest version is used.
+	ApiVersion string `yaml:"apiVersion,omitempty"`
 	// The relative path to the project folder from the project root
-	RelativePath string `yaml:"project"`
+	RelativePath string `yaml:"project,omitempty"`
 	// The azure hosting model to use, ex) appservice, function, containerapp
-	Host string `yaml:"host"`
+	Host ServiceTargetKind `yaml:"host"`
 	// The programming language of the project
-	Language string `yaml:"language"`
+	Language ServiceLanguageKind `yaml:"language,omitempty"`
 	// The output path for build artifacts
-	OutputPath string `yaml:"dist"`
-	// The infrastructure module path relative to the root infra folder to use for this project
-	Module string `yaml:"module"`
-	// The optional docker options
-	Docker DockerProjectOptions `yaml:"docker"`
+	OutputPath string `yaml:"dist,omitempty"`
+	// The source image to use for container based applications
+	Image osutil.ExpandableString `yaml:"image,omitempty"`
+	// The optional docker options for configuring the output image
+	Docker DockerProjectOptions `yaml:"docker,omitempty"`
+	// The optional K8S / AKS options
+	K8s AksOptions `yaml:"k8s,omitempty"`
+	// Infrastructure module path relative to the root infra folder
+	Module string `yaml:"module,omitempty"`
 	// The infrastructure provisioning configuration
-	Infra provisioning.Options `yaml:"infra"`
+	Infra provisioning.Options `yaml:"infra,omitempty"`
+	// Hook configuration for service
+	Hooks HooksConfig `yaml:"hooks,omitempty"`
+	// Dependencies on other services and resources
+	Uses []string `yaml:"uses,omitempty"`
+	// Options specific to the DotNetContainerApp target. These are set by the importer and
+	// can not be controlled via the project file today.
+	DotNetContainerApp *DotNetContainerAppOptions `yaml:"-,omitempty"`
+	// Custom configuration for the service target
+	Config map[string]any `yaml:"config,omitempty"`
+	// Computed lazily by useDotnetPublishForDockerBuild and cached. This is true when the project
+	// is a dotnet project and there is not an explicit Dockerfile in the project directory.
+	useDotNetPublishForDockerBuild *bool
+	// Environment variables to set for the service
+	Environment osutil.ExpandableMap `yaml:"env,omitempty"`
+	// Condition for deploying the service. When evaluated, the service is only deployed if the value
+	// is a truthy boolean (1, true, TRUE, True, yes). If not defined, the service is enabled by default.
+	Condition osutil.ExpandableString `yaml:"condition,omitempty"`
+	// Whether to build the service remotely. Only applicable to function app services.
+	// When set to nil (unset), the default behavior based on language is used.
+	RemoteBuild *bool `yaml:"remoteBuild,omitempty"`
 
-	handlers map[Event][]ServiceLifecycleEventHandlerFn
+	// AdditionalProperties captures any unknown YAML fields for extension support
+	AdditionalProperties map[string]any `yaml:",inline"`
+
+	*ext.EventDispatcher[ServiceLifecycleEventArgs] `yaml:"-"`
+
+	hookGuard *hookRegistrationGuard `yaml:"-"`
+
+	// Turns service into a service that is only to be built but not deployed.
+	// This is currently used by Aspire.
+	BuildOnly bool `yaml:"-"`
 }
 
-type ServiceLifecycleEventArgs struct {
-	Project *ProjectConfig
-	Service *ServiceConfig
-	Args    map[string]any
+type configuredHookRegistration struct {
+	signature string
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
-// Function definition for project events
-type ServiceLifecycleEventHandlerFn func(ctx context.Context, args ServiceLifecycleEventArgs) error
+type DotNetContainerAppOptions struct {
+	Manifest    *apphost.Manifest
+	AppHostPath string
+	ProjectName string
+	// ContainerImage is non-empty when a prebuilt container image is being used.
+	ContainerImage string
+	// ContainerFiles is a list of files to include in the container image.
+	ContainerFiles map[string]ContainerFile
+}
+
+type ContainerFile struct {
+	ServiceConfig *ServiceConfig
+	Sources       []string
+	Destination   string
+}
 
 // Path returns the fully qualified path to the project
 func (sc *ServiceConfig) Path() string {
+	if filepath.IsAbs(sc.RelativePath) {
+		return sc.RelativePath
+	}
 	return filepath.Join(sc.Project.Path, sc.RelativePath)
 }
 
-// GetService constructs a parsed Service object from the Service configuration
-func (sc *ServiceConfig) GetService(ctx context.Context, project *Project, env *environment.Environment, scope *environment.DeploymentScope) (*Service, error) {
-	framework, err := sc.GetFrameworkService(ctx, env)
+// IsEnabled evaluates the service condition and returns whether the service should be deployed.
+// If no condition is specified, the service is enabled by default.
+// The condition is evaluated as a boolean where truthy values are: 1, true, TRUE, True, yes, YES, Yes
+// All other values are considered false.
+// Returns an error if the condition template is malformed.
+func (sc *ServiceConfig) IsEnabled(getenv func(string) string) (bool, error) {
+	if sc.Condition.Empty() {
+		return true, nil
+	}
+
+	value, err := sc.Condition.Envsubst(getenv)
 	if err != nil {
-		return nil, fmt.Errorf("creating framework service: %w", err)
+		return false, fmt.Errorf("malformed deployment condition template: %w", err)
 	}
 
-	serviceTarget, err := sc.GetServiceTarget(ctx, env, scope)
-	if err != nil {
-		return nil, fmt.Errorf("creating service target: %w", err)
-	}
-
-	return &Service{
-		Project:   project,
-		Config:    sc,
-		Framework: *framework,
-		Target:    *serviceTarget,
-		Scope:     scope,
-	}, nil
+	return isConditionTrue(value), nil
 }
 
-// GetServiceTarget constructs a ServiceTarget from the underlying service configuration
-func (sc *ServiceConfig) GetServiceTarget(ctx context.Context, env *environment.Environment, scope *environment.DeploymentScope) (*ServiceTarget, error) {
-	var target ServiceTarget
-
-	azCli := azcli.GetAzCli(ctx)
-
-	switch sc.Host {
-	case "", string(AppServiceTarget):
-		target = NewAppServiceTarget(sc, env, scope, azCli)
-	case string(ContainerAppTarget):
-		target = NewContainerAppTarget(sc, env, scope, azCli, docker.NewDocker(ctx), input.GetConsole(ctx))
-	case string(AzureFunctionTarget):
-		target = NewFunctionAppTarget(sc, env, scope, azCli)
-	case string(StaticWebAppTarget):
-		target = NewStaticWebAppTarget(sc, env, scope, azCli, swa.NewSwaCli(ctx))
+// isConditionTrue parses a string value as a boolean condition.
+// Returns true for: "1", "true", "TRUE", "True", "yes", "YES", "Yes"
+// Returns false for all other values.
+func isConditionTrue(value string) bool {
+	switch value {
+	case "1", "true", "TRUE", "True", "yes", "YES", "Yes":
+		return true
 	default:
-		return nil, fmt.Errorf("unsupported host '%s' for service '%s'", sc.Host, sc.Name)
+		return false
 	}
-
-	return &target, nil
 }
 
-// GetFrameworkService constructs a framework service from the underlying service configuration
-func (sc *ServiceConfig) GetFrameworkService(ctx context.Context, env *environment.Environment) (*FrameworkService, error) {
-	var frameworkService FrameworkService
-
-	switch sc.Language {
-	case "", "dotnet", "csharp", "fsharp":
-		frameworkService = NewDotNetProject(ctx, sc, env)
-	case "py", "python":
-		frameworkService = NewPythonProject(ctx, sc, env)
-	case "js", "ts":
-		frameworkService = NewNpmProject(ctx, sc, env)
-	default:
-		return nil, fmt.Errorf("unsupported language '%s' for service '%s'", sc.Language, sc.Name)
+// ensureHookGuard lazily initializes the hookRegistrationGuard.
+// This must be called before any concurrent access; in practice, hook
+// registration always starts during single-threaded service setup.
+func (sc *ServiceConfig) ensureHookGuard() *hookRegistrationGuard {
+	if sc.hookGuard == nil {
+		sc.hookGuard = &hookRegistrationGuard{}
 	}
-
-	// For containerized applications we use a nested framework service
-	if sc.Host == string(ContainerAppTarget) {
-		sourceFramework := frameworkService
-		frameworkService = NewDockerProject(sc, env, docker.NewDocker(ctx), sourceFramework)
-	}
-
-	return &frameworkService, nil
+	return sc.hookGuard
 }
 
-// Adds an event handler for the specified event name
-func (sc *ServiceConfig) AddHandler(name Event, handler ServiceLifecycleEventHandlerFn) error {
-	newHandler := fmt.Sprintf("%v", handler)
-	events := sc.handlers[name]
+// EnsureHooksRegistered ensures azure.yaml-configured service hooks are registered at most once
+// for the current hook signature and registration context lifetime.
+// Returns the registration context and true if hooks should be registered, or nil and false if
+// registration should be skipped (already registered with matching signature and active context).
+func (sc *ServiceConfig) EnsureHooksRegistered(
+	parentCtx context.Context,
+	signature string,
+) (context.Context, bool) {
+	g := sc.ensureHookGuard()
+	g.mu.Lock()
+	defer g.mu.Unlock()
 
-	for _, ref := range events {
-		existingHandler := fmt.Sprintf("%v", ref)
-
-		if newHandler == existingHandler {
-			return fmt.Errorf("event handler has already been registered for %s event", name)
-		}
+	if g.registration != nil &&
+		g.registration.signature == signature &&
+		g.registration.ctx.Err() == nil {
+		return nil, false
 	}
 
-	events = append(events, handler)
-	sc.handlers[name] = events
+	if g.registration != nil {
+		g.registration.cancel()
+	}
 
-	return nil
+	//nolint:gosec // G118 - cancel is stored and called by Reset/Rollback
+	registrationCtx, cancel := context.WithCancel(parentCtx)
+	g.registration = &configuredHookRegistration{
+		signature: signature,
+		ctx:       registrationCtx,
+		cancel:    cancel,
+	}
+
+	return registrationCtx, true
 }
 
-// Removes the event handler for the specified event name
-func (sc *ServiceConfig) RemoveHandler(name Event, handler ServiceLifecycleEventHandlerFn) error {
-	newHandler := fmt.Sprintf("%v", handler)
-	events := sc.handlers[name]
-	for i, ref := range events {
-		existingHandler := fmt.Sprintf("%v", ref)
+// RollbackHookRegistration clears the current hook registration after a failed install.
+func (sc *ServiceConfig) RollbackHookRegistration(signature string) {
+	g := sc.ensureHookGuard()
+	g.mu.Lock()
+	defer g.mu.Unlock()
 
-		if newHandler == existingHandler {
-			sc.handlers[name] = append(events[:i], events[i+1:]...)
-			return nil
-		}
+	if g.registration == nil || g.registration.signature != signature {
+		return
 	}
 
-	return fmt.Errorf("specified handler was not found in %s event registrations", name)
+	g.registration.cancel()
+	g.registration = nil
 }
 
-// Raises the specified event and calls any registered event handlers
-func (sc *ServiceConfig) RaiseEvent(ctx context.Context, name Event, args map[string]any) error {
-	handlerErrors := []error{}
+// ResetHookRegistration removes any active service-hook registration,
+// allowing hooks to be re-registered on the next middleware pass.
+func (sc *ServiceConfig) ResetHookRegistration() {
+	g := sc.ensureHookGuard()
+	g.mu.Lock()
+	defer g.mu.Unlock()
 
-	if args == nil {
-		args = make(map[string]any)
+	if g.registration == nil {
+		return
 	}
 
-	eventArgs := ServiceLifecycleEventArgs{
-		Project: sc.Project,
-		Service: sc,
-		Args:    args,
+	g.registration.cancel()
+	g.registration = nil
+}
+
+// CopyRuntimeStateTo preserves in-memory runtime state that should survive config reloads.
+func (sc *ServiceConfig) CopyRuntimeStateTo(target *ServiceConfig) {
+	if sc == nil || target == nil {
+		return
 	}
 
-	handlers := sc.handlers[name]
-
-	// TODO: Opportunity to dispatch these event handlers in parallel if needed
-	for _, handler := range handlers {
-		err := handler(ctx, eventArgs)
-		if err != nil {
-			handlerErrors = append(handlerErrors, err)
-		}
+	if sc.EventDispatcher != nil {
+		target.EventDispatcher = sc.EventDispatcher
 	}
 
-	// Build final error string if their are any failures
-	if len(handlerErrors) > 0 {
-		lines := make([]string, len(handlerErrors))
-		for i, err := range handlerErrors {
-			lines[i] = err.Error()
-		}
+	srcGuard := sc.ensureHookGuard()
+	srcGuard.mu.Lock()
+	defer srcGuard.mu.Unlock()
+	registration := srcGuard.registration
 
-		return errors.New(strings.Join(lines, ","))
-	}
-
-	return nil
+	dstGuard := target.ensureHookGuard()
+	dstGuard.mu.Lock()
+	defer dstGuard.mu.Unlock()
+	dstGuard.registration = registration
 }

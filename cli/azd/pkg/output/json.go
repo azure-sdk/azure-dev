@@ -4,19 +4,37 @@
 package output
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
+	"strings"
+	"time"
+
+	"github.com/azure/azure-dev/cli/azd/pkg/contracts"
+	"github.com/mattn/go-colorable"
 )
 
 type JsonFormatter struct {
+	Query string
 }
 
 func (f *JsonFormatter) Kind() Format {
 	return JsonFormat
 }
 
-func (f *JsonFormatter) Format(obj interface{}, writer io.Writer, _ interface{}) error {
-	b, err := json.MarshalIndent(obj, "", "  ")
+func (f *JsonFormatter) Format(obj any, writer io.Writer, _ any) error {
+	// Apply JMESPath query if specified
+	data := obj
+	if f.Query != "" {
+		var err error
+		data, err = ApplyQuery(obj, f.Query)
+		if err != nil {
+			return err
+		}
+	}
+
+	b, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -35,3 +53,41 @@ func (f *JsonFormatter) Format(obj interface{}, writer io.Writer, _ interface{})
 }
 
 var _ Formatter = (*JsonFormatter)(nil)
+var _ Queryable = (*JsonFormatter)(nil)
+
+// QueryFilter applies the JMESPath query (if any) to the given object.
+// When no query is configured, the object is returned unchanged.
+func (f *JsonFormatter) QueryFilter(obj any) (any, error) {
+	if f.Query == "" {
+		return obj, nil
+	}
+	return ApplyQuery(obj, f.Query)
+}
+
+// jsonObjectForMessage creates a json object representing a message. Any ANSI control sequences from the message are
+// removed. A trailing newline is added to the message.
+func EventForMessage(message string) contracts.EventEnvelope {
+	// Strip any ANSI colors for the message.
+	var buf bytes.Buffer
+
+	// We do not expect the io.Copy to fail since none of these sub-calls will ever return an error (other than
+	// EOF when we hit the end of the string)
+	if _, err := io.Copy(colorable.NewNonColorable(&buf), strings.NewReader(message)); err != nil {
+		panic(fmt.Sprintf("consoleMessageForMessage: did not expect error from io.Copy but got: %v", err))
+	}
+
+	// Add the newline that would have been added by fmt.Println when we wrote the message directly to the console.
+	buf.WriteByte('\n')
+
+	return newConsoleMessageEvent(buf.String())
+}
+
+func newConsoleMessageEvent(msg string) contracts.EventEnvelope {
+	return contracts.EventEnvelope{
+		Type:      contracts.ConsoleMessageEventDataType,
+		Timestamp: time.Now(),
+		Data: contracts.ConsoleMessage{
+			Message: msg,
+		},
+	}
+}

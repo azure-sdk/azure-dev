@@ -1,0 +1,22 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+//go:build !windows
+
+package osutil
+
+import (
+	"context"
+	"os"
+)
+
+// Rename is like os.Rename in every way. The context is ignored.
+func Rename(ctx context.Context, old, new string) error {
+	return os.Rename(old, new)
+}
+
+// RemoveAll removes path and any children it contains. The context is retained
+// for API parity with Windows, where it cancels retry backoff.
+func RemoveAll(_ context.Context, path string) error {
+	return os.RemoveAll(path)
+}

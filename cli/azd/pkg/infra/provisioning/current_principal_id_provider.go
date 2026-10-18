@@ -1,0 +1,69 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package provisioning
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/azure/azure-dev/cli/azd/pkg/account"
+	"github.com/azure/azure-dev/cli/azd/pkg/auth"
+	"github.com/azure/azure-dev/cli/azd/pkg/azapi"
+	"github.com/azure/azure-dev/cli/azd/pkg/azureutil"
+	"github.com/azure/azure-dev/cli/azd/pkg/environment"
+)
+
+type CurrentPrincipalIdProvider interface {
+	// CurrentPrincipalId returns the object id of the current logged in principal, or an error if it can not be
+	// determined.
+	CurrentPrincipalId(ctx context.Context) (string, error)
+	CurrentPrincipalType(ctx context.Context) (PrincipalType, error)
+}
+
+func NewPrincipalIdProvider(
+	env *environment.Environment,
+	userProfileService *azapi.UserProfileService,
+	subResolver account.SubscriptionResolver,
+	authManager *auth.Manager,
+) CurrentPrincipalIdProvider {
+	return &principalIDProvider{
+		env:                env,
+		userProfileService: userProfileService,
+		subResolver:        subResolver,
+		authManager:        authManager,
+	}
+}
+
+type principalIDProvider struct {
+	env                *environment.Environment
+	userProfileService *azapi.UserProfileService
+	subResolver        account.SubscriptionResolver
+	authManager        *auth.Manager
+}
+
+func (p *principalIDProvider) CurrentPrincipalId(ctx context.Context) (string, error) {
+	subscriptionId := p.env.GetSubscriptionId()
+	subscription, err := p.subResolver.GetSubscription(ctx, subscriptionId)
+	if err != nil {
+		return "", fmt.Errorf("getting subscription %s: %w", subscriptionId, err)
+	}
+
+	principalId, err := azureutil.GetCurrentPrincipalId(ctx, p.userProfileService, subscription.TenantId)
+	if err != nil {
+		return "", fmt.Errorf("fetching current user information: %w", err)
+	}
+
+	return principalId, nil
+}
+
+const (
+	UserType             PrincipalType = auth.UserPrincipalType
+	ServicePrincipalType PrincipalType = auth.ServicePrincipalType
+)
+
+type PrincipalType = auth.PrincipalType
+
+func (p *principalIDProvider) CurrentPrincipalType(ctx context.Context) (PrincipalType, error) {
+	return p.authManager.CurrentPrincipalType(ctx)
+}

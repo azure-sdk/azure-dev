@@ -1,7 +1,9 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
 package telemetry
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -13,11 +15,12 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	tracesdk "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
-	semconv "go.opentelemetry.io/otel/semconv/v1.6.1"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 )
 
 func TestExportSpans(t *testing.T) {
+	t.Parallel()
 	queue := InMemoryQueue{[][]byte{}}
 	exporter := NewExporter(&queue, "iKey")
 	assert.False(t, exporter.ExportedAny())
@@ -27,7 +30,7 @@ func TestExportSpans(t *testing.T) {
 	spans = append(spans, GetSpanStub().Snapshot())
 	spans = append(spans, GetSpanStub().Snapshot())
 
-	err := exporter.ExportSpans(context.Background(), spans)
+	err := exporter.ExportSpans(t.Context(), spans)
 	assert.NoError(t, err)
 	assert.Len(t, queue.queue, 1)
 	assert.True(t, exporter.ExportedAny())

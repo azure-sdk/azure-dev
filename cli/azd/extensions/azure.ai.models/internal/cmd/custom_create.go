@@ -1,0 +1,414 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package cmd
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"azure.ai.models/internal/azcopy"
+	"azure.ai.models/internal/client"
+	"azure.ai.models/pkg/models"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/azure/azure-dev/cli/azd/pkg/azdext"
+	"github.com/azure/azure-dev/cli/azd/pkg/ux"
+	"github.com/fatih/color"
+	"github.com/spf13/cobra"
+)
+
+type customCreateFlags struct {
+	Name              string
+	Version           string
+	Source            string
+	SourceFile        string
+	Description       string
+	BaseModel         string
+	WeightType        string
+	Publisher         string
+	AzcopyPath        string
+	NoWait            bool
+	LoRARank          int
+	LoRAAlpha         int
+	LoRATargetModules string
+	LoRADropout       float64
+}
+
+func newCustomCreateCommand(parentFlags *customFlags) *cobra.Command {
+	flags := &customCreateFlags{}
+
+	cmd := &cobra.Command{
+		Use:   "create",
+		Short: "Upload and register a custom model",
+		Long: `Upload model weights to Azure AI Foundry and register the model.
+
+This command performs three steps:
+  1. Requests a writable upload location (SAS URI)
+  2. Uploads model files using AzCopy
+  3. Registers the model in the custom model registry
+
+The --source flag accepts a local file/directory path or a remote blob URL with SAS token.
+For remote URLs containing special characters (& in SAS tokens), use --source-file to
+provide a file containing the URL instead.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := azdext.WithAccessToken(cmd.Context())
+
+			// --base-model is required for all weight types except DraftModel,
+			// where MRS infers the base model from the uploaded artifacts.
+			if flags.BaseModel == "" && !strings.EqualFold(flags.WeightType, "DraftModel") {
+				return fmt.Errorf("--base-model is required when --weight-type is %q", flags.WeightType)
+			}
+
+			// If --version not explicitly set, try to extract from --base-model URI
+			if !cmd.Flags().Changed("version") {
+				if v := extractVersionFromURI(flags.BaseModel); v != "" {
+					flags.Version = v
+				}
+			}
+
+			// Resolve source from --source-file if --source is not set
+			if flags.Source == "" && flags.SourceFile != "" {
+				data, err := os.ReadFile(flags.SourceFile)
+				if err != nil {
+					return fmt.Errorf("failed to read source file '%s': %w", flags.SourceFile, err)
+				}
+				flags.Source = strings.TrimSpace(string(data))
+				if flags.Source == "" {
+					return fmt.Errorf("source file '%s' is empty", flags.SourceFile)
+				}
+			}
+
+			if flags.Source == "" {
+				return fmt.Errorf("either --source or --source-file is required")
+			}
+
+			return runCustomCreate(ctx, cmd, parentFlags, flags)
+		},
+	}
+
+	cmd.Flags().StringVarP(&flags.Name, "name", "n", "", "Model name (required)")
+	cmd.Flags().StringVar(&flags.Source, "source", "", "Local path or remote URL to model files")
+	cmd.Flags().StringVar(&flags.SourceFile, "source-file", "", "Path to a file containing the source URL (useful for URLs with special characters)")
+	cmd.Flags().StringVar(&flags.Version, "version", "1", "Model version")
+	cmd.Flags().StringVar(&flags.Description, "description", "", "Model description")
+	cmd.Flags().StringVar(&flags.BaseModel, "base-model",
+		"", "Base model identifier (e.g., FW-GPT-OSS-120B or full azureml:// URI). Required unless --weight-type is DraftModel.")
+	cmd.Flags().StringVar(&flags.WeightType, "weight-type", "FullWeight", "Weight type (e.g., FullWeight, LoRA, DraftModel)")
+	cmd.Flags().StringVar(&flags.Publisher, "publisher", "", "Model publisher ID for catalog info (e.g., Fireworks)")
+	cmd.Flags().StringVar(&flags.AzcopyPath, "azcopy-path", "", "Path to azcopy binary (auto-detected if not provided)")
+	cmd.Flags().BoolVar(&flags.NoWait, "no-wait", false, "Start async registration and return immediately with the operation URL")
+	cmd.Flags().IntVar(&flags.LoRARank, "lora-rank",
+		0, "LoRA rank (r) — optional; if omitted, the value from the uploaded adapter_config.json is used")
+	cmd.Flags().IntVar(&flags.LoRAAlpha, "lora-alpha",
+		0, "LoRA scaling factor (alpha) — optional; if omitted, the value from the uploaded adapter_config.json is used")
+	cmd.Flags().StringVar(&flags.LoRATargetModules, "lora-target-modules", "",
+		"Comma-separated list of target modules (e.g., \"q_proj,v_proj,k_proj,o_proj\")")
+	cmd.Flags().Float64Var(&flags.LoRADropout, "lora-dropout", 0, "LoRA dropout rate used during training (informational)")
+
+	_ = cmd.MarkFlagRequired("name")
+
+	return cmd
+}
+
+func runCustomCreate(ctx context.Context, cmd *cobra.Command, parentFlags *customFlags, flags *customCreateFlags) error {
+	azdClient, err := azdext.NewAzdClient()
+	if err != nil {
+		return fmt.Errorf("failed to create azd client: %w", err)
+	}
+	defer azdClient.Close()
+
+	if err := azdext.WaitForDebugger(ctx, azdClient); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, azdext.ErrDebuggerAborted) {
+			return nil
+		}
+		return fmt.Errorf("failed waiting for debugger: %w", err)
+	}
+
+	// Step 0: Verify azcopy is available before making any API calls
+	azRunner, err := azcopy.NewRunner(ctx, flags.AzcopyPath)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("  Using azcopy: %s\n\n", azRunner.Path())
+
+	// Create Azure credential
+	credential, err := azidentity.NewAzureDeveloperCLICredential(&azidentity.AzureDeveloperCLICredentialOptions{
+		AdditionallyAllowedTenants: []string{"*"},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create Azure credential: %w", err)
+	}
+
+	foundryClient, err := client.NewFoundryClient(parentFlags.projectEndpoint, credential)
+	if err != nil {
+		return err
+	}
+
+	// Validate LoRA flags early, before any uploads
+	var loraConfig *models.LoRAConfig
+	if strings.EqualFold(flags.WeightType, "LoRA") {
+		var err error
+		loraConfig, err = buildLoRAConfig(cmd, flags)
+		if err != nil {
+			return err
+		}
+	} else if cmd.Flags().Changed("lora-rank") || cmd.Flags().Changed("lora-alpha") ||
+		cmd.Flags().Changed("lora-target-modules") || cmd.Flags().Changed("lora-dropout") {
+		return fmt.Errorf("--lora-* flags are only valid when --weight-type is LoRA")
+	}
+
+	// ── Step 1: Start pending upload ──
+	fmt.Printf("Creating custom model: %s (version %s)\n\n", flags.Name, flags.Version)
+
+	spinner := ux.NewSpinner(&ux.SpinnerOptions{
+		Text: "Step 1/3: Requesting upload location...",
+	})
+	if err := spinner.Start(ctx); err != nil {
+		fmt.Printf("failed to start spinner: %v\n", err)
+	}
+
+	uploadResp, err := foundryClient.StartPendingUpload(ctx, flags.Name, flags.Version)
+	_ = spinner.Stop(ctx)
+	fmt.Println()
+
+	if err != nil {
+		var apiErr *client.APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == 409 {
+			fmt.Println()
+			color.Red("✗ Model '%s' version '%s' already exists.", flags.Name, flags.Version)
+			fmt.Println()
+			color.Yellow("To fetch the latest version, use show without --version:")
+			fmt.Printf("  azd ai models show --name %s\n\n", flags.Name)
+			color.Yellow("Then create with a new version:")
+			fmt.Printf("  azd ai models create --name %s --version <next-version> ...\n", flags.Name)
+			return fmt.Errorf("model version already exists")
+		}
+		if errors.As(err, &apiErr) && apiErr.StatusCode == 403 {
+			fmt.Println()
+			color.Red("✗ Permission denied: you do not have the required role to upload custom models.")
+			fmt.Println()
+			color.Yellow("Ensure you have the appropriate role assigned for this Azure AI Foundry project.")
+			fmt.Println()
+			fmt.Println("  Prerequisites:")
+			fmt.Println("  https://learn.microsoft.com/en-us/azure/foundry/how-to/fireworks/import-custom-models?tabs=rest-api#prerequisites")
+			fmt.Println()
+			fmt.Println("  Role-based access control (RBAC) details:")
+			fmt.Println("  https://learn.microsoft.com/en-us/azure/foundry/concepts/rbac-foundry")
+			return fmt.Errorf("insufficient permissions (403)")
+		}
+		return fmt.Errorf("failed to get upload location: %w", err)
+	}
+
+	if uploadResp.BlobReferenceForConsumption == nil {
+		return fmt.Errorf("unexpected response: no blob reference returned")
+	}
+
+	blob := uploadResp.BlobReferenceForConsumption
+	color.Green("✓ Upload location ready")
+	fmt.Printf("  Blob URI: %s\n\n", blob.BlobURI)
+
+	// ── Step 2: Upload via AzCopy ──
+	fmt.Println("Step 2/3: Uploading model files...")
+	fmt.Printf("  Source: %s\n", flags.Source)
+	fmt.Println()
+
+	if err := azRunner.Copy(ctx, flags.Source, blob.Credential.SasURI); err != nil {
+		// Upload failed — print manual recovery instructions
+		fmt.Println()
+		color.Red("✗ Upload failed: %v", err)
+		fmt.Println()
+		color.Yellow("You can retry the upload manually:")
+		fmt.Println()
+		sourceHint := flags.Source
+		if !strings.HasPrefix(flags.Source, "https://") && !strings.HasPrefix(flags.Source, "http://") {
+			if info, statErr := os.Stat(flags.Source); statErr == nil && info.IsDir() {
+				sourceHint = fmt.Sprintf("%s/*", flags.Source)
+			}
+		}
+		fmt.Printf("  azcopy copy \"%s\" \"%s\" --recursive=true\n", sourceHint, blob.Credential.SasURI)
+		return fmt.Errorf("upload failed: %w", err)
+	}
+
+	fmt.Println()
+	color.Green("✓ Upload complete")
+	fmt.Println()
+
+	// ── Step 3: Register model ──
+	regSpinner := ux.NewSpinner(&ux.SpinnerOptions{
+		Text: "Step 3/3: Registering model...",
+	})
+	if err := regSpinner.Start(ctx); err != nil {
+		fmt.Printf("failed to start spinner: %v\n", err)
+	}
+
+	regReq := &models.RegisterModelRequest{
+		BlobURI:     blob.BlobURI,
+		WeightType:  flags.WeightType,
+		Description: flags.Description,
+	}
+
+	if flags.BaseModel != "" {
+		derivedURI := buildDerivedModelURI(flags.BaseModel)
+		regReq.DerivedModelInformation = &models.DerivedModelInformation{
+			BaseModel: &derivedURI,
+		}
+		regReq.Tags = map[string]string{
+			"baseArchitecture": extractBaseModelName(flags.BaseModel),
+		}
+	} else {
+		regReq.Tags = map[string]string{}
+	}
+
+	if flags.Publisher != "" {
+		regReq.CatalogInfo = &models.CatalogInfo{
+			PublisherID: flags.Publisher,
+		}
+	}
+
+	// Attach pre-validated LoRA config (may be nil if user provided no LoRA-specific values)
+	if loraConfig != nil {
+		regReq.LoRAConfig = loraConfig
+	}
+
+	operationURL, err := foundryClient.RegisterModelAsync(ctx, flags.Name, flags.Version, regReq)
+	_ = regSpinner.Stop(ctx)
+	fmt.Println()
+
+	if err != nil {
+		// Upload succeeded but register failed — print recovery instructions
+		color.Red("✗ Registration failed: %v", err)
+		return fmt.Errorf("registration failed: %w", err)
+	}
+
+	color.Green("✓ Registration started")
+	fmt.Printf("  Operation URL: %s\n\n", operationURL)
+
+	if flags.NoWait {
+		color.Yellow("--no-wait specified; skipping validation polling.")
+		fmt.Println("You can check the operation status manually using the operation URL above.")
+		return nil
+	}
+
+	pollSpinner := ux.NewSpinner(&ux.SpinnerOptions{
+		Text: "Validating and registering model (this may take a few minutes)...",
+	})
+	if err := pollSpinner.Start(ctx); err != nil {
+		fmt.Printf("failed to start spinner: %v\n", err)
+	}
+
+	model, err := foundryClient.PollOperation(ctx, operationURL, 5*time.Second)
+	_ = pollSpinner.Stop(ctx)
+	fmt.Println()
+
+	if err != nil {
+		color.Red("✗ Registration failed: %v", err)
+		return fmt.Errorf("registration failed: %w", err)
+	}
+
+	// ── Success ──
+	color.Green("✓ Model registered successfully!")
+	fmt.Println()
+	fmt.Println(strings.Repeat("─", 50))
+	fmt.Printf("  Name:        %s\n", model.Name)
+	fmt.Printf("  Version:     %s\n", model.Version)
+	if model.Description != "" {
+		fmt.Printf("  Description: %s\n", model.Description)
+	}
+	if model.SystemData != nil && model.SystemData.CreatedAt != "" {
+		fmt.Printf("  Created:     %s\n", model.SystemData.CreatedAt)
+	}
+	fmt.Println(strings.Repeat("─", 50))
+
+	return nil
+}
+
+// buildDerivedModelURI returns the base-model value as a full azureml:// URI.
+// If the value is already a full URI, it is returned as-is.
+// Otherwise it is treated as a model name and wrapped in the default registry path.
+func buildDerivedModelURI(baseModel string) string {
+	if strings.HasPrefix(baseModel, "azureml://") {
+		return baseModel
+	}
+	return fmt.Sprintf("azureml://registries/azureml-fireworks/models/%s/versions/1", baseModel)
+}
+
+// extractBaseModelName extracts the model name from a base-model value.
+// If the value is an azureml:// URI (e.g. azureml://registries/azureml-fireworks/models/FW-GPT-OSS-120B/versions/1),
+// extracts and returns the model name segment ("FW-GPT-OSS-120B").
+// Otherwise returns the value as-is.
+func extractBaseModelName(baseModel string) string {
+	if !strings.HasPrefix(baseModel, "azureml://") {
+		return baseModel
+	}
+	// URI format: azureml://registries/{reg}/models/{name}/versions/{ver}
+	parts := strings.Split(baseModel, "/")
+	for i, p := range parts {
+		if p == "models" && i+1 < len(parts) {
+			return parts[i+1]
+		}
+	}
+	return baseModel
+}
+
+// extractVersionFromURI extracts the version segment from an azureml:// URI.
+// e.g. "azureml://registries/azureml-fireworks/models/FW-Qwen3-14B/versions/2" → "2"
+// Returns empty string if not an azureml URI or version not found.
+func extractVersionFromURI(uri string) string {
+	if !strings.HasPrefix(uri, "azureml://") {
+		return ""
+	}
+	parts := strings.Split(uri, "/")
+	for i, p := range parts {
+		if p == "versions" && i+1 < len(parts) {
+			return parts[i+1]
+		}
+	}
+	return ""
+}
+
+// buildLoRAConfig validates LoRA flags and builds a LoRAConfig for the registration request.
+// All LoRA fields are optional; when omitted, MRS reads them from the uploaded adapter_config.json.
+func buildLoRAConfig(cmd *cobra.Command, flags *customCreateFlags) (*models.LoRAConfig, error) {
+	if cmd.Flags().Changed("lora-rank") && flags.LoRARank <= 0 {
+		return nil, fmt.Errorf("--lora-rank must be a positive integer when specified")
+	}
+	if cmd.Flags().Changed("lora-alpha") && flags.LoRAAlpha <= 0 {
+		return nil, fmt.Errorf("--lora-alpha must be a positive integer when specified")
+	}
+
+	config := &models.LoRAConfig{}
+	if cmd.Flags().Changed("lora-rank") {
+		config.Rank = new(flags.LoRARank)
+	}
+	if cmd.Flags().Changed("lora-alpha") {
+		config.Alpha = new(flags.LoRAAlpha)
+	}
+
+	if flags.LoRATargetModules != "" {
+		modules := strings.Split(flags.LoRATargetModules, ",")
+		for i := range modules {
+			modules[i] = strings.TrimSpace(modules[i])
+			if modules[i] == "" {
+				return nil, fmt.Errorf("--lora-target-modules contains an empty entry")
+			}
+		}
+		config.TargetModules = modules
+	}
+
+	if cmd.Flags().Changed("lora-dropout") {
+		config.Dropout = new(flags.LoRADropout)
+	}
+
+	// If no fields were set, return nil so the request omits loraConfig entirely
+	// and MRS fully derives the configuration from adapter_config.json.
+	if config.Rank == nil && config.Alpha == nil && config.Dropout == nil && len(config.TargetModules) == 0 {
+		return nil, nil
+	}
+
+	return config, nil
+}

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
 package appinsightsexporter
 
 import (
@@ -13,13 +16,17 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	tracesdk "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
-	semconv "go.opentelemetry.io/otel/semconv/v1.6.1"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 )
 
 func TestSpanToEnvelope(t *testing.T) {
+	t.Parallel()
 	spanStub := getDefaultSpanStub()
 	success := spanStub.Snapshot()
+
+	spanStub.Status = tracesdk.Status{Code: codes.Ok, Description: "AllGood"}
+	successWithDescription := spanStub.Snapshot()
 
 	spanStub.Status = tracesdk.Status{Code: codes.Error}
 	unknownFailure := spanStub.Snapshot()
@@ -35,6 +42,7 @@ func TestSpanToEnvelope(t *testing.T) {
 		input tracesdk.ReadOnlySpan
 	}{
 		{"success", success},
+		{"successDescription", successWithDescription},
 		{"unknownFailure", unknownFailure},
 		{"preconditionFailure", preconditionFailure},
 		{"unsetSuccess", unsetSuccess},
@@ -122,22 +130,29 @@ func assertRequestData(t *testing.T, data *contracts.RequestData, span tracesdk.
 
 	if span.Status().Code == codes.Error {
 		assert.Equal(t, false, data.Success)
-		if len(span.Status().Description) > 0 {
-			assert.Equal(t, span.Status().Description, data.ResponseCode)
-		} else {
-			assert.Equal(t, "UnknownFailure", data.ResponseCode)
-		}
 	} else {
 		assert.Equal(t, true, data.Success)
+	}
+
+	if len(span.Status().Description) > 0 {
+		assert.Equal(t, span.Status().Description, data.ResponseCode)
+	} else if span.Status().Code == codes.Error {
+		assert.Equal(t, "UnknownFailure", data.ResponseCode)
+	} else {
 		assert.Equal(t, "Success", data.ResponseCode)
 	}
 }
 
-func assertAttributeInPropertiesOrMeasurement(t *testing.T, attrib attribute.KeyValue, properties map[string]string, measurements map[string]float64) {
+func assertAttributeInPropertiesOrMeasurement(
+	t *testing.T,
+	attrib attribute.KeyValue,
+	properties map[string]string,
+	measurements map[string]float64,
+) {
 	switch attrib.Value.Type() {
 	case attribute.BOOL, attribute.STRING:
 		assert.Contains(t, properties, string(attrib.Key))
-		assert.Equal(t, attrib.Value.Emit(), properties[string(attrib.Key)])
+		assert.Equal(t, attrib.Value.String(), properties[string(attrib.Key)])
 	case attribute.INT64:
 		assert.Contains(t, measurements, string(attrib.Key))
 		assert.Equal(t, float64(attrib.Value.AsInt64()), measurements[string(attrib.Key)])
@@ -145,7 +160,7 @@ func assertAttributeInPropertiesOrMeasurement(t *testing.T, attrib attribute.Key
 		assert.Contains(t, measurements, string(attrib.Key))
 		assert.Equal(t, attrib.Value.AsFloat64(), measurements[string(attrib.Key)])
 	case attribute.BOOLSLICE, attribute.INT64SLICE, attribute.FLOAT64SLICE, attribute.STRINGSLICE:
-		val, err := json.Marshal(attrib.Value)
+		val, err := json.Marshal(attrib.Value.AsInterface())
 		if err != nil {
 			assert.Fail(t, fmt.Sprintf("value cannot be marshaled to JSON: %s", err.Error()))
 		}

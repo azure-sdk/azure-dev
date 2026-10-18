@@ -1,0 +1,6 @@
+{
+    "os": "debian",
+    "osVersion": "12",
+    "isWsl": "false",
+    "terminal": "bash"
+}

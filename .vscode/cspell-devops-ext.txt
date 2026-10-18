@@ -1,0 +1,8 @@
+azuretools
+codepaths
+LASTEXITCODE
+tmrm
+toolrunner
+TOOLSDIRECTORY
+tsbuildinfo
+vsix

@@ -1,0 +1,472 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package cmd
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
+
+	"github.com/spf13/cobra"
+
+	"github.com/azure/azure-dev/cli/azd/extensions/microsoft.azd.extensions/internal"
+	"github.com/azure/azure-dev/cli/azd/extensions/microsoft.azd.extensions/internal/models"
+	"github.com/azure/azure-dev/cli/azd/pkg/azdext"
+	"github.com/azure/azure-dev/cli/azd/pkg/common"
+	"github.com/azure/azure-dev/cli/azd/pkg/extensions"
+	"github.com/azure/azure-dev/cli/azd/pkg/output"
+	"github.com/azure/azure-dev/cli/azd/pkg/ux"
+)
+
+type buildFlags struct {
+	outputPath   string
+	allPlatforms bool
+	skipInstall  bool
+}
+
+func newBuildCommand(outputPath *string) *cobra.Command {
+	flags := &buildFlags{}
+
+	buildCmd := &cobra.Command{
+		Use:   "build",
+		Short: "Build the azd extension project",
+		Long: "Builds the azd extension project for one or more platforms.\n\n" +
+			"Extension metadata validation warnings are non-fatal and are printed after the build completes.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			internal.WriteCommandHeader(
+				"Build and azd extension (azd x build)",
+				"Builds the azd extension project for one or more platforms",
+			)
+
+			if outputPath != nil {
+				flags.outputPath = *outputPath
+			}
+			defaultBuildFlags(flags)
+			err := runBuildAction(cmd.Context(), flags)
+			if err != nil {
+				return err
+			}
+
+			internal.WriteCommandSuccess("Build completed successfully!")
+			return nil
+		},
+	}
+
+	azdext.RegisterFlagOptions(buildCmd, azdext.FlagOptions{
+		Name:    "output",
+		Default: "./bin",
+		Usage:   "Path to the output directory.",
+	})
+	buildCmd.Flags().BoolVar(
+		&flags.allPlatforms, "all", false,
+		"When set builds for all os/platforms. Defaults to the current os/platform only.",
+	)
+	buildCmd.Flags().BoolVar(
+		&flags.skipInstall,
+		"skip-install", false,
+		"When set skips reinstalling extension after successful build.",
+	)
+
+	return buildCmd
+}
+
+func runBuildAction(ctx context.Context, flags *buildFlags) error {
+	// Create a new context that includes the AZD access token
+	ctx = azdext.WithAccessToken(ctx)
+
+	// Create a new AZD client
+	azdClient, err := azdext.NewAzdClient()
+	if err != nil {
+		return fmt.Errorf("failed to create azd client: %w", err)
+	}
+
+	defer azdClient.Close()
+
+	// Wait for debugger if AZD_EXT_DEBUG is set
+	if err := azdext.WaitForDebugger(ctx, azdClient); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, azdext.ErrDebuggerAborted) {
+			return nil
+		}
+		return fmt.Errorf("failed waiting for debugger: %w", err)
+	}
+
+	absOutputPath, err := filepath.Abs(flags.outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to get absolute path for output directory: %w", err)
+	}
+
+	absExtensionPath, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("failed to get absolute path for extension directory: %w", err)
+	}
+
+	// Load metadata
+	schema, err := models.LoadExtension(absExtensionPath)
+	if err != nil {
+		return fmt.Errorf("failed to load extension metadata: %w", err)
+	}
+
+	extensionPack := isExtensionPack(schema)
+
+	fmt.Println()
+	if extensionPack {
+		fmt.Printf("%s: Extension pack\n", output.WithBold("Extension Type"))
+	} else {
+		fmt.Printf("%s: %s\n", output.WithBold("Output Path"), output.WithHyperlink(absOutputPath, absOutputPath))
+	}
+
+	var buildWarnings []string
+	// Flush collected validation warnings after the live TaskList canvas completes,
+	// regardless of whether a later task fails.
+	defer func() { writeCollectedWarnings(os.Stdout, buildWarnings) }()
+
+	taskList := ux.NewTaskList(nil).
+		AddTask(ux.TaskOptions{
+			Title: "Validating extension metadata",
+			Action: func(progress ux.SetProgressFunc) (ux.TaskState, error) {
+				progress("Checking required fields...")
+
+				warnings, validationErrors := validateExtensionMetadata(schema)
+
+				progress("Validation complete")
+
+				if len(validationErrors) > 0 {
+					return ux.Error, validationFailureError(validationErrors)
+				}
+
+				if len(warnings) > 0 {
+					buildWarnings = warnings
+					return ux.Warning, fmt.Errorf("%s; see details below", validationWarningSummary(warnings))
+				}
+
+				return ux.Success, nil
+			},
+		}).
+		AddTask(ux.TaskOptions{
+			Title: "Building extension artifacts",
+			Action: func(progress ux.SetProgressFunc) (ux.TaskState, error) {
+				if extensionPack {
+					progress("Extension packs do not contain build artifacts")
+					return ux.Skipped, nil
+				}
+
+				// Create output directory if it doesn't exist
+				if _, err := os.Stat(absOutputPath); os.IsNotExist(err) {
+					if err := os.MkdirAll(absOutputPath, os.ModePerm); err != nil {
+						return ux.Error, common.NewDetailedError("Failed to create output directory", err)
+					}
+				}
+
+				var command string
+				var scriptFile string
+				if runtime.GOOS == "windows" {
+					command = "pwsh"
+					scriptFile = "build.ps1"
+				} else {
+					command = "bash"
+					scriptFile = "build.sh"
+				}
+
+				// Build the binaries
+				buildScript := filepath.Join(absExtensionPath, scriptFile)
+				if _, err := os.Stat(buildScript); err == nil {
+					/* #nosec G204 - Subprocess launched with variable */
+					cmd := exec.Command(command, scriptFile)
+					cmd.Dir = absExtensionPath
+
+					envVars := map[string]string{
+						"OUTPUT_DIR":         absOutputPath,
+						"EXTENSION_DIR":      absExtensionPath,
+						"EXTENSION_ID":       schema.Id,
+						"EXTENSION_VERSION":  schema.Version,
+						"EXTENSION_LANGUAGE": schema.Language,
+					}
+
+					// By default builds for current os/arch
+					if !flags.allPlatforms {
+						envVars["EXTENSION_PLATFORM"] = fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH)
+					}
+
+					cmd.Env = os.Environ()
+
+					for key, value := range envVars {
+						cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", key, value))
+					}
+
+					if result, err := cmd.CombinedOutput(); err != nil {
+						flags.skipInstall = true
+
+						return ux.Error, common.NewDetailedError(
+							"Build Failed",
+							fmt.Errorf("failed to build artifacts: %s, %w", string(result), err),
+						)
+					}
+				}
+
+				return ux.Success, nil
+			},
+		}).
+		AddTask(ux.TaskOptions{
+			Title: "Installing extension",
+			Action: func(progress ux.SetProgressFunc) (ux.TaskState, error) {
+				if flags.skipInstall || extensionPack {
+					return ux.Skipped, nil
+				}
+
+				azdConfigDir, err := internal.AzdConfigDir()
+				if err != nil {
+					return ux.Error, common.NewDetailedError(
+						"Failed to get azd config directory",
+						fmt.Errorf("failed to get azd config directory: %w", err),
+					)
+				}
+
+				extensionInstallDir := filepath.Join(azdConfigDir, "extensions", schema.Id)
+				extensionBinaryPrefix := strings.ReplaceAll(schema.Id, ".", "-")
+
+				if err := copyBinaryFiles(extensionBinaryPrefix, absOutputPath, extensionInstallDir); err != nil {
+					return ux.Error, common.NewDetailedError(
+						"Install failed",
+						fmt.Errorf("failed to copy files to install directory: %w", err),
+					)
+				}
+
+				// The binaries are installed, but `azd extension list` only surfaces
+				// extensions that are present in the local source registry. When the
+				// registry is missing (for example after a fresh clone or a rebuilt
+				// dev container) or does not yet contain this extension, surface a
+				// warning that points the user at `azd x publish`.
+				if warning := localRegistryWarning(azdConfigDir, schema.Id); warning != "" {
+					buildWarnings = append(buildWarnings, warning)
+					return ux.Warning, fmt.Errorf("not registered in the local registry; see details below")
+				}
+
+				return ux.Success, nil
+			},
+		})
+
+	return taskList.Run()
+}
+
+// localRegistryWarning returns a short warning when the local extension source
+// registry is missing or does not yet contain the given extension id. In those
+// cases `azd x build` installs the binaries but the extension will not show up in
+// `azd extension list`, so the message points the user at `azd x pack` followed by
+// `azd x publish`, which register it. An empty string is returned when the
+// extension is registered.
+func localRegistryWarning(azdConfigDir, extensionId string) string {
+	registryPath := filepath.Join(azdConfigDir, "registry.json")
+	registryDisplay := output.WithGrayFormat(registryPath)
+	listCmd := output.WithHighLightFormat("azd ext list")
+	registerCmds := output.WithHighLightFormat("azd x pack") + " then " + output.WithHighLightFormat("azd x publish")
+
+	if _, err := os.Stat(registryPath); errors.Is(err, os.ErrNotExist) {
+		return fmt.Sprintf(
+			"Local registry not found (%s) — extension won't appear in %s. Run %s to register it.",
+			registryDisplay, listCmd, registerCmds,
+		)
+	}
+
+	registry, err := models.LoadRegistry(registryPath)
+	if err != nil {
+		// Surface load/parse failures so the user knows the registry is unusable.
+		return fmt.Sprintf(
+			"Failed to read the local registry (%s): %v. Run %s to register the extension.",
+			registryDisplay, err, registerCmds,
+		)
+	}
+
+	for _, extension := range registry.Extensions {
+		if extension.Id == extensionId {
+			return ""
+		}
+	}
+
+	return fmt.Sprintf(
+		"%s isn't registered in the local registry (%s), so it won't appear in %s. Run %s to register it.",
+		output.WithHighLightFormat(extensionId), registryDisplay, listCmd, registerCmds,
+	)
+}
+
+func copyBinaryFiles(extensionId, sourcePath, destPath string) error {
+	if _, err := os.Stat(destPath); os.IsNotExist(err) {
+		if err := os.MkdirAll(destPath, os.ModePerm); err != nil {
+			return fmt.Errorf("failed to create install directory: %w", err)
+		}
+	}
+
+	// On Windows, kill any running extension processes to release file locks
+	if runtime.GOOS == "windows" {
+		killExtensionProcesses(extensionId, destPath)
+	}
+
+	return filepath.Walk(sourcePath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Only process files in the root of the source path
+		if filepath.Dir(path) != sourcePath {
+			return nil
+		}
+
+		// Check if the file name starts with the extensionId and is either .exe or has no extension
+		if info.Mode().IsRegular() {
+			fileName := info.Name()
+			if strings.HasPrefix(fileName, extensionId) {
+				ext := filepath.Ext(fileName)
+				if ext == ".exe" || ext == "" {
+					destFilePath := filepath.Join(destPath, fileName)
+					if err := internal.CopyFile(path, destFilePath); err != nil {
+						return fmt.Errorf("failed to copy file %s to %s: %w", path, destFilePath, err)
+					}
+					// Set execute permissions on the copied binary
+					if err := os.Chmod(destFilePath, 0755); err != nil {
+						return fmt.Errorf("failed to set execute permissions on %s: %w", destFilePath, err)
+					}
+				}
+			}
+		}
+
+		return nil
+	})
+}
+
+// validateExtensionMetadata returns validation warnings and errors for the given extension schema.
+// Errors include missing required fields and capability-specific metadata that would create
+// unusable extensions. Warnings flag recommended metadata that improves the extension experience.
+func validateExtensionMetadata(schema *models.ExtensionSchema) (warnings, errs []string) {
+	extensionPack := isExtensionPack(schema)
+
+	// Required fields - missing values are errors.
+	if schema.Id == "" {
+		errs = append(errs, "Missing required field: id")
+	}
+	if schema.Version == "" {
+		errs = append(errs, "Missing required field: version")
+	}
+	if len(schema.Capabilities) == 0 && !extensionPack {
+		errs = append(errs, "Missing required field: capabilities")
+	}
+	if schema.DisplayName == "" {
+		errs = append(errs, "Missing required field: displayName")
+	}
+	if schema.Description == "" {
+		errs = append(errs, "Missing required field: description")
+	}
+
+	// Capability-specific recommendations.
+	hasCustomCommands := slices.Contains(schema.Capabilities, extensions.CustomCommandCapability)
+	hasServiceTarget := slices.Contains(schema.Capabilities, extensions.ServiceTargetProviderCapability)
+
+	// Missing namespace is fatal for custom-commands extensions: bindExtension
+	// uses the last '.'-segment of Namespace as the cobra command name, so an
+	// empty namespace silently installs an unreachable command. The init wizard
+	// always populates namespace, so this only triggers on hand-edited files.
+	if hasCustomCommands && schema.Namespace == "" {
+		errs = append(errs,
+			"Missing 'namespace' field in extension.yaml - "+
+				"required by the 'custom-commands' capability. "+
+				"Set it to the prefix users will type after 'azd' (e.g. 'demo' to expose 'azd demo <command>').",
+		)
+	}
+
+	// Kept as a warning: the init wizard doesn't yet prompt for providers, so
+	// promoting this to an error would block every service-target-provider scaffold.
+	if hasServiceTarget && len(schema.Providers) == 0 {
+		warnings = append(warnings,
+			"Missing 'providers' field in extension.yaml - "+
+				"required by the 'service-target-provider' capability. "+
+				"List the providers your extension contributes (each entry needs a name, type, and description).",
+		)
+	}
+
+	if schema.Usage == "" && !extensionPack {
+		warnings = append(warnings,
+			"Missing 'usage' field in extension.yaml - shown to users as a usage hint in 'azd <namespace> --help'.",
+		)
+	}
+
+	return warnings, errs
+}
+
+// isExtensionPack detects dependency-only extension packs. The extension registry
+// treats versions with dependencies and no artifacts as packs; local extension.yaml
+// manifests do not have an explicit pack discriminator, so this intentionally
+// infers pack mode only when dependencies are present and executable metadata is absent.
+func isExtensionPack(schema *models.ExtensionSchema) bool {
+	isPack := len(schema.Dependencies) > 0 &&
+		len(schema.Capabilities) == 0 &&
+		schema.Namespace == "" &&
+		schema.Language == "" &&
+		schema.EntryPoint == ""
+	if isPack {
+		log.Printf(
+			"debug: detected extension pack manifest for %s because it has dependencies and no executable metadata",
+			schema.Id,
+		)
+	}
+
+	return isPack
+}
+
+func validationFailureError(validationErrors []string) error {
+	return common.NewDetailedError(
+		"Validation failed",
+		fmt.Errorf(
+			"extension contains validation failures: %s",
+			strings.Join(validationErrors, "; "),
+		),
+	)
+}
+
+func validationWarningSummary(warnings []string) string {
+	noun := "warning"
+	if len(warnings) != 1 {
+		noun = "warnings"
+	}
+
+	return fmt.Sprintf("%d validation %s", len(warnings), noun)
+}
+
+// escapePowerShellSingleQuotes escapes single quotes for use in PowerShell single-quoted strings.
+func escapePowerShellSingleQuotes(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
+// killExtensionProcesses terminates any running extension processes on Windows
+// to release file locks before copying new binaries.
+func killExtensionProcesses(extensionBinaryPrefix, installDir string) {
+	// Kill by process name pattern (e.g., jongio-azd-copilot-windows-amd64)
+	for _, arch := range []string{"windows-amd64", "windows-arm64"} {
+		procName := extensionBinaryPrefix + "-" + arch
+		//nolint:gosec // G204: procName is derived from extension metadata; single quotes are escaped
+		_ = exec.Command("powershell", "-NoProfile", "-Command",
+			"Stop-Process -Name '"+escapePowerShellSingleQuotes(procName)+"' -Force -ErrorAction SilentlyContinue").Run()
+	}
+
+	// Kill any processes running from the install directory.
+	// Pass installDir as a parameter to avoid injection from special characters.
+	if installDir != "" {
+		//nolint:gosec // G204: installDir is derived from config and passed as an argument, not interpolated
+		_ = exec.Command("powershell", "-NoProfile", "-Command",
+			"param([string]$p) Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($p) }"+
+				" | Stop-Process -Force -ErrorAction SilentlyContinue",
+			installDir,
+		).Run()
+	}
+}
+
+func defaultBuildFlags(flags *buildFlags) {
+	if flags.outputPath == "" {
+		flags.outputPath = "bin"
+	}
+}

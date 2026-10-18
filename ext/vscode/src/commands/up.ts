@@ -1,45 +1,47 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-import * as vscode from 'vscode';
-import * as path from 'path';
 import { IActionContext } from "@microsoft/vscode-azext-utils";
-import { localize } from '../localize';
-import { quickPickWorkspaceFolder } from '../utils/quickPickWorkspaceFolder';
-import { getAzDevTerminalTitle, pickAzureYamlFile, selectApplicationTemplate, showReadmeFile } from './cmdUtil';
+import { composeArgs, withArg } from '@microsoft/vscode-processutils';
+import * as vscode from 'vscode';
+import { TelemetryId } from '../telemetry/telemetryId';
 import { createAzureDevCli } from '../utils/azureDevCli';
 import { executeAsTask } from '../utils/executeAsTask';
-import { TelemetryId } from '../telemetry/telemetryId';
+import { isAzureDevCliModel, isTreeViewModel, TreeViewModel } from '../utils/isTreeViewModel';
+import { AzureDevCliApplication } from '../views/workspace/AzureDevCliApplication';
+import { getAzDevTerminalTitle, getWorkingFolder, validateFileSystemUri } from './cmdUtil';
 
-export async function up(context: IActionContext, selectedFile?: vscode.Uri): Promise<void> {
-    let folder: vscode.WorkspaceFolder | undefined = (selectedFile ? vscode.workspace.getWorkspaceFolder(selectedFile) : undefined);
-    if (!folder) {
-        folder = await quickPickWorkspaceFolder(context, localize('azure-dev.commands.cli.init.needWorkspaceFolder', "To run '{0}' command you must first open a folder or workspace in VS Code", 'up'));
+/**
+ * A tuple representing the arguments that must be passed to the `up` command when executed via {@link vscode.commands.executeCommand}
+ */
+export type UpCommandArguments = [ vscode.Uri | TreeViewModel | undefined, boolean? ];
+
+export async function up(context: IActionContext, selectedItem?: vscode.Uri | TreeViewModel, fromAgent: boolean = false): Promise<void> {
+    context.telemetry.properties.fromAgent = fromAgent.toString();
+
+    let selectedFile: vscode.Uri | undefined;
+    if (isTreeViewModel(selectedItem)) {
+        selectedFile = selectedItem.unwrap<AzureDevCliApplication>().context.configurationFile;
+    } else if (isAzureDevCliModel(selectedItem)) {
+        selectedFile = selectedItem.context.configurationFile;
+    } else {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+        selectedFile = selectedItem!;
     }
+
+    // Validate that selectedFile is valid for file system operations
+    validateFileSystemUri(context, selectedFile, selectedItem, 'up');
+
+    const workingFolder = await getWorkingFolder(context, selectedFile);
 
     const azureCli = await createAzureDevCli(context);
-    let command = azureCli.commandBuilder
-        .withArg('up');
-    let workingDir = folder.uri;
-
-    const azureYamlFile = await pickAzureYamlFile(context);
-    if (azureYamlFile) {
-        // Workspace has already been initialized, no need to specify a template
-        workingDir = vscode.Uri.file(path.dirname(azureYamlFile.fsPath));
-    } else {
-        const templateUrl = await selectApplicationTemplate(context);
-        command = command.withNamedArg('-t', {value: templateUrl, quoting: vscode.ShellQuoting.Strong});
-    }
+    const args = composeArgs(
+        withArg('up'),
+    )();
 
     // Don't wait
-    void executeAsTask(command.build(), getAzDevTerminalTitle(), {
+    void executeAsTask(azureCli.invocation, args, getAzDevTerminalTitle(), azureCli.spawnOptions(workingFolder), {
+        focus: true,
         alwaysRunNew: true,
-        cwd: workingDir.fsPath,
-        env: azureCli.env
-    }, TelemetryId.UpCli).then(() => {
-        // Only show README if we are initializing a new workspace/application
-        if (!azureYamlFile) {
-            void showReadmeFile(workingDir.fsPath);
-        }
-    });
+    }, TelemetryId.UpCli);
 }

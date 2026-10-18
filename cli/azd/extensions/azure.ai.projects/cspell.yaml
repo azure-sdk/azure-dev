@@ -1,0 +1,11 @@
+import: ../../.vscode/cspell.yaml
+words:
+  - alnum
+  - exterrors
+  - foundryproject
+  - idempotently
+  - ondisk
+  - purgeable
+  - recordproxy
+  # Contributors
+  - hemarina

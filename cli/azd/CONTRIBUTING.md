@@ -1,122 +1,217 @@
 # Contributing to `azd`
 
-## Prerequisites
+Hello there 👋! Thank you for showing interest in contributing to `azd`.
 
-`azd` is written in Golang and requires Go 1.19 or above:
+## Guidelines
 
-- [Go](https://go.dev/dl/)
+- [Code Style Guide](./docs/style-guidelines/azd-style-guide.md)
+- [Extensions Style Guide](./docs/extensions/extensions-style-guide.md)
+- [Adding New Commands](./docs/style-guidelines/new-azd-command.md)
+- [Guiding Principles](./docs/style-guidelines/guiding-principles.md)
 
-If you don't have a preferred editor for Go code, we recommend [Visual Studio Code](https://code.visualstudio.com/Download). We have a `settings.json` file checked in, so if you launch `code` from within `cli/azd` you should get our customizations.
+In general, to make contributions a smooth and easy experience, we encourage the following:
 
-It also requires the `az` CLI:
+- Check existing issues for [bugs][bug issues] or [enhancements][enhancement issues].
+- Open an issue if things aren't working as expected, or if an enhancement is being proposed.
+- Start a conversation on the issue if you are thinking of submitting a pull request.
+- Pull requests must be **linked to an issue** (e.g., add `Fixes #123` to the PR description). PRs without a linked issue will be flagged by our automated checks. Issues in the current milestone get priority review; if yours isn't prioritized yet, tag **@RickWinter** or **@kristenwomack** and we'll help get it sorted.
+- The `azd` team will work with you to review the changes and provide feedback. Once the pull request is accepted, a member will merge the changes. Thank you for taking time out of your day to help improve our community!
 
-- [AZ CLI](https://docs.microsoft.com/cli/azure/)
+## Building `azd`
 
-We have some additional linting tools that we run in CI, and you will want to be able to run locally:
+Prerequisites:
 
-- [golangci-lint](https://golangci-lint.run/usage/install/#local-installation)
+- [Go](https://go.dev/dl/) 1.26.1
 
-In order to run some of the tests, you'll need the toolchain for all the languages we support:
-
-- [NodeJS](https://nodejs.org/en/download/)
-- [Python](https://www.python.org/downloads)
-- [DotNet CLI](https://get.dot.net)
-
-Also, you'll want to install Docker (as we use that for some of our tests)
-
-- [Docker](https://docs.docker.com/desktop/#download-and-install)
-
-## Submitting A Change
-
-We use a fork based workflow for `azd`. Here are simple steps:
-
-1. Fork `azure/azure-dev` on GitHub.
-2. Create a branch named `<some-description>` (e.g. `fix-123` for a bug fix or `add-deploy-command`) in your forked Git repository.
-3. Push the branch to your fork on GitHub.
-4. Open a pull request in GitHub.
-
-Here is a more [in-depth guide to forks in GitHub](https://guides.github.com/activities/forking/).
-
-As part of CI validation, we run a series of live tests which provision and deprovision Azure resources. For external contributors, these tests will not run automatically, but someone on the team will be able to run them for your PR on your behalf.
-
-## Debugging
-
-In VS Code you can create a launch.json that runs the tool with a specified set of arguments and in a specific folder, for example:
-
-```json
-{
-    "name": "dev-azd (launch)",
-    "type": "go",
-    "request": "launch",
-    "mode": "debug",
-    "program": "${workspaceFolder}",
-    "args": [
-        "restore"
-    ],
-    "cwd": "${workspaceFolder}"
-},
-```
-
-## Testing
-
-We use `gotestsum`, which is a simple tool that wraps `go test` except with better formatting output. Install the tool by running `go install gotest.tools/gotestsum@latest`.
-
-### Run all unit tests
-
-`gotestsum -- -short ./...`
-
-### Run all end-to-end tests
+Build:
 
 ```bash
+cd cli/azd
 go build
-gotestsum -- -timeout 20m -run Test_CLI ./...
 ```
 
-This runs all end-to-end tests that run `azd` locally and deploy live resources. Run `go build`  first to ensure the integration tests target
-the latest `azd` binary built.
+Run the newly produced `azd` or `azd.exe` binary:
 
-### Run all tests (including end-to-end tests)
+- Unix-like systems: `./azd`
+- Windows: `.\azd.exe`
+
+### Dev Install (build + add to PATH)
+
+Mage is included in `cli/azd/go.mod`. Run it with `go tool mage`; you do not need to install it separately.
 
 ```bash
-go build
-gotestsum -- -timeout 20m ./...
+cd cli/azd
+go tool mage dev:install
 ```
 
-### Run a specific test
+This builds `azd-dev` (to avoid conflicting with a production `azd` install) with version
+info from `cli/version.txt` and the current git commit, installs it to `~/.azd/bin/`, and
+automatically adds that directory to your PATH if it isn't already there.
 
-`gotestsum -- -timeout 20m -run Test_CLI_RestoreCommand ./...`
+### Preflight (all quality checks)
 
-This can be useful for running specific end-to-end tests that cover the relevant scenarios.
+Run all pre-commit checks (formatting, copyright headers, linting, spell check for Go and docs/misc files, build, unit tests) in one command:
 
-## Linting
+```bash
+cd cli/azd
+go tool mage preflight
+```
 
-Run `golangci-lint run ./...`
+> **Tip**: If you're using GitHub Copilot, the `/azd-preflight` skill runs `go tool mage preflight` and auto-fixes any issues it discovers.
 
-> On Windows you may need to add `C:\Program Files\Git\usr\bin` to `%PATH%`
+### Re-recording functional test cassettes
 
-## Spell checking
+> **Note**: Re-recording is typically a core-maintainer workflow and requires an Azure subscription. External contributors can run the tests in the default playback mode, which replays stored cassettes and needs no Azure access.
 
-1. Install [cspell](https://cspell.org/)
-2. CD to /cli/azd
-3. Run `cspell lint "**/*.go" --relative --config ./.vscode/cspell.yaml`
+Re-record stale functional test recordings against a live Azure subscription:
+
+```bash
+cd cli/azd
+go tool mage record                          # re-record all playback tests
+go tool mage record -filter=Test_CLI_Quota   # re-record only matching tests
+```
+
+Core maintainers configure the test subscription and tenant once via `azd config`:
+
+```bash
+azd config set defaults.test.subscription <SUBSCRIPTION_ID>
+azd config set defaults.test.tenant <TENANT_ID>
+```
+
+These values are stored in your user-level azd config and persist across sessions. You can also set them via environment variables (`AZD_TEST_AZURE_SUBSCRIPTION_ID`, `AZD_TEST_TENANT_ID`), which take precedence. Any Azure subscription you have access to works; the `defaults.test.*` namespace is kept separate from the top-level `defaults.*` so test config does not affect regular `azd` usage. See the [recording guide](./docs/recording-functional-tests-guide.md) for details.
+
+Run tests:
+
+```bash
+go test ./... -short
+```
+
+Run tests (including end-to-end [functional][functional tests] tests)
+
+```bash
+go test ./...
+```
+
+### PowerShell engineering script tests
+
+PowerShell tests under `eng/scripts` use Pester. From the repository root, install the same Pester version pinned in the
+[`cli-ci` workflow](../../.github/workflows/cli-ci.yml), then run the test file:
+
+```powershell
+Install-Module -Name Pester -RequiredVersion <version-from-cli-ci.yml> -Force -Scope CurrentUser
+
+# And using ./eng/scripts/Test-CliReleaseReadiness.Tests.ps1, as an example:
+Invoke-Pester -Path ./eng/scripts/Test-CliReleaseReadiness.Tests.ps1 -Output Detailed
+```
+
+Run cspell (install [cspell](https://cspell.org/)):
+
+```bash
+# Go source (from cli/azd/)
+cspell lint "**/*.go" --relative --config ./.vscode/cspell.yaml
+
+# Docs and misc files (from repo root)
+cd ../..
+cspell lint "**/*" --relative --config ./.vscode/cspell.misc.yaml
+cd cli/azd
+```
+
+Run linter (install [golangci-lint](https://golangci-lint.run/welcome/install/#local-installation)):
+
+```bash
+golangci-lint run ./...
+```
+
+Run code modernization check ([go fix](https://go.dev/blog/gofix)):
+
+```bash
+go fix -diff ./...
+```
+
+If `go fix -diff` reports any changes, apply them with `go fix ./...` and commit the result.
+CI enforces this check — PRs with pending `go fix` suggestions will fail the lint workflow.
+
+Format and validate repository JSON schemas with Mage:
+
+```bash
+go tool mage schema:format
+go tool mage schema:check
+```
+
+### Code Coverage
+
+azd collects coverage from both unit tests and integration/functional tests. Several modes are available depending on your needs.
+
+> **Working directory**: Run all coverage commands from the **repository root** (not `cli/azd/`). The scripts handle `cd cli/azd` internally.
+
+| Mode | Command | Mage Target | Prerequisites | Speed |
+|------|---------|-------------|--------------|-------|
+| **Unit only** (recommended) | `./eng/scripts/Get-LocalCoverageReport.ps1 -ShowReport -UnitOnly` | `go tool mage coverage:unit` | None | ~5-10 min |
+| **Hybrid** (local unit + CI integration) | `./eng/scripts/Get-LocalCoverageReport.ps1 -ShowReport -MergeWithCI` | `go tool mage coverage:hybrid` | `az login` | ~6-11 min |
+| **Full local** (unit + integration) | `./eng/scripts/Get-LocalCoverageReport.ps1 -ShowReport` | `go tool mage coverage:full` | Azure subscription + service principal | ~30-60 min |
+| **CI baseline** (latest main) | `./eng/scripts/Get-CICoverageReport.ps1 -ShowReport` | `go tool mage coverage:ci` | `az login` | ~1 min |
+
+Additional Mage targets: `go tool mage coverage:html` (HTML report), `go tool mage coverage:check` (enforce 50% unit-only threshold; CI gate is 55% combined).
+Override the threshold with: `COVERAGE_MIN=55 go tool mage coverage:check`.
+
+**Typical workflow**: Use *Unit only* during development for fast feedback. After pushing a PR, use *Hybrid* or check your PR's CI coverage with `Get-CICoverageReport.ps1 -PullRequestId <N> -ShowReport`.
+
+For HTML reports: add `-Html` to any local command. For threshold checks: add `-MinCoverage <N>`.
+
+See [Code Coverage Guide](./docs/code-coverage-guide.md) for architecture details, prerequisites, and troubleshooting.
+
+> Note: On Windows you may need to add `C:\Program Files\Git\usr\bin` to `%PATH%`
+
+### Debugging (with VSCode)
+
+If you don't have a preferred editor for Go code, we recommend [Visual Studio Code](https://code.visualstudio.com/Download).
+
+Launch and debug:
+
+1. Open VSCode in either `cli/azd` (preferred) or in the root directory.
+1. In VSCode, put a breakpoint on the line of code you would like to debug.
+1. Press F5. Alternatively: Select the "Run and Debug" side pane. With the launch task set to "Debug azd cli", click on the launch button.
+1. An interactive VSCode prompt should appear. Provide the args for running `azd` in this prompt window. Press enter when you're done.
+1. `azd` should now be running inside the VSCode terminal with the debugger attached.
+
+Launch `azd` separately, then attach:
+
+1. Set `AZD_DEBUG=true` in your shell. If this environment variable is set, `azd` will pause early in its startup process and allow you to attach to it.
+1. In VSCode, run the launch task "Attach to process".
+1. Select `azd` and press enter.
+1. VSCode debugger should now be attached to the running `azd` process.
+1. In the shell with `azd` running, press enter to resume execution.
+
+> Tip: Use the VSCode terminal to perform all `azd` build and run commands.
+
+## Submitting a change
+
+1. Create a new branch: `git checkout -b my-branch-name`
+1. Make your change, add tests, and ensure tests pass
+1. Submit a pull request: `gh pr create --web` (install [gh cli][gh cli] if needed). Select "Create a fork" to set up a fork for the first time if prompted for.
 
 ## Troubleshooting
 
 ### Access is denied
 
-Windows Security may block execution of unsigned .exe files. This may happen when validating unsigned .exe files produced in a PR build.
+Windows Security may block execution of unsigned .exe files. This may happen when validating unsigned .exe files produced in
+a PR build.
 
-```
+```bash
 > azd version
 Access is denied.
->
 ```
 
-To fix: 
+To fix:
 
 1. Run `where azd` (cmd) or `(Get-Command azd).Source` (PowerShell) to get the command path
 1. Click the Start button and type `Windows Security`, select and launch the "Windows Security" application
 1. Select `Virus & threat protection` tab on the left side of the window
 1. Click the `Manage settings` link under `Virus & threat protection settings`
-1. Scroll down in the window to the `Exclusions` heading and click the `Add or remove exclusions link` 
+1. Scroll down in the window to the `Exclusions` heading and click the `Add or remove exclusions link`
 1. Select `Add an exclusion` and add the path to the exe from step 1
+
+[bug issues]: https://github.com/Azure/azure-dev/issues?q=is%3Aopen+is%3Aissue+label%3Abug
+[enhancement issues]: https://github.com/Azure/azure-dev/issues?q=is%3Aopen+is%3Aissue+label%3Aenhancement
+[functional tests]: https://github.com/Azure/azure-dev/tree/main/cli/azd/test/functional
+[gh cli]: https://github.com/cli/cli?tab=readme-ov-file#installation

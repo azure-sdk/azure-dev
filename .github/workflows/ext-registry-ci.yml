@@ -1,0 +1,70 @@
+name: ext-registry-ci
+
+on:
+  pull_request:
+    paths:
+      - "cli/azd/extensions/registry.json"
+      - "cli/azd/extensions/registry.dev.json"
+      - ".github/workflows/ext-registry-ci.yml"
+    branches: [main]
+
+# If two events are triggered within a short time in the same PR, cancel the run of the oldest event
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cli/azd
+    steps:
+      # Resolve the merge ref when the job starts instead of reusing a stale event SHA on reruns.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: cli/azd/go.mod
+          cache-dependency-path: |
+            cli/azd/go.sum
+
+      - name: Build azd
+        run: go build .
+
+      # Validates the extension registries and fails on any hard validation error. The
+      # most important case is a declared dependency constraint that no published version
+      # satisfies, which is the inconsistency a coordinated multi-extension bump can
+      # introduce, but schema, id, and artifact errors also fail here. Warnings (e.g.
+      # an absent dependency id) do not fail this step, so routine extension releases
+      # are not blocked. Runs on the same trigger as the registry files.
+      - name: Validate registry dependency consistency
+        run: |
+          if ! go test ./pkg/extensions -run '^TestRegistryFileIsValid$|^TestDevRegistryFileIsValid$' -v; then
+            echo "::error::An extension registry failed validation. See the test output above for the specific error(s)."
+            echo "Suggestion: a common cause is a dependency pinned to a version that is not yet published in the registry; ensure that version is published before updating the dependent extension."
+            exit 1
+          fi
+
+      - name: Run FigSpec snapshot test
+        id: figspec
+        run: go test ./cmd -v -run TestFigSpec
+
+      - name: Run Usage snapshot test
+        id: usage
+        run: go test ./cmd -v -run TestUsage
+
+      - name: Check snapshot test results
+        if: failure() && (steps.figspec.outcome == 'failure' || steps.usage.outcome == 'failure')
+        run: |
+          echo "::error::Snapshots may be out of date. Run the following locally to update them:"
+          echo ""
+          echo "  cd cli/azd"
+          echo "  UPDATE_SNAPSHOTS=true go test ./cmd -run 'TestFigSpec|TestUsage'"
+          exit 1

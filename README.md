@@ -1,79 +1,139 @@
-# Azure Developer CLI
+# Azure Developer CLI (`azd`)
 
-Latest builds:
+> **From code to cloud in minutes.** A developer-centric CLI to build, deploy, and operate Azure applications.
 
-| Artifact  | Version | Download |
-| ------- | ------- | -------- |
-| azd | ![azd version](https://img.shields.io/endpoint?url=https%3A%2F%2Fazuresdkreleasepreview.blob.core.windows.net%2Fazd%2Fstandalone%2Flatest%2Fshield.json) | [Windows](https://azuresdkreleasepreview.blob.core.windows.net/azd/standalone/latest/azd-windows-amd64.zip) &vert; [Linux](https://azuresdkreleasepreview.blob.core.windows.net/azd/standalone/latest/azd-linux-amd64.tar.gz) &vert; [Mac](https://azuresdkreleasepreview.blob.core.windows.net/azd/standalone/latest/azd-darwin-amd64.zip) |
-| vscode extension | ![vscode extension version](https://img.shields.io/endpoint?url=https%3A%2F%2Fazuresdkreleasepreview.blob.core.windows.net%2Fazd%2Fvscode%2Flatest%2Fshield.json) | [VSIX](https://marketplace.visualstudio.com/items?itemName=ms-azuretools.azure-dev) |
-| docker image | ![azd version](https://img.shields.io/endpoint?url=https%3A%2F%2Fazuresdkreleasepreview.blob.core.windows.net%2Fazd%2Fstandalone%2Flatest%2Fshield.json) | [`mcr.microsoft.com/azure-dev-cli-apps:latest`](https://mcr.microsoft.com/en-us/product/azure-dev-cli-apps/about)
+[![azd version](https://img.shields.io/endpoint?url=https%3A%2F%2Fazuresdkartifacts.z5.web.core.windows.net%2Fazd%2Fstandalone%2Flatest%2Fshield.json)](https://github.com/Azure/azure-dev/releases)
+[![VS Code Extension](https://img.shields.io/endpoint?url=https%3A%2F%2Fazuresdkartifacts.z5.web.core.windows.net%2Fazd%2Fvscode%2Flatest%2Fshield.json)](https://marketplace.visualstudio.com/items?itemName=ms-azuretools.azure-dev)
+[![GitHub Discussions](https://img.shields.io/github/discussions/Azure/azure-dev)](https://github.com/Azure/azure-dev/discussions)
 
-The Azure Developer CLI (`azd`) is a developer-centric command-line interface (CLI) tool for creating Azure applications. The goals of the CLI are to:
+---
 
-- reduce the time required for a developer to be productive
-- demonstrate opinionated best practices for Azure development
-- help developers understand core Azure development constructs
+## Built for you
 
-To take full advantage of the CLI, code repositories need to conform to a well defined set of conventions that will be recognized by the tooling. Please checkout the [wiki](https://github.com/Azure/azure-dev/wiki) for more information and to get started. Use [discussions](https://github.com/Azure/azure-dev/discussions) to participate in the conversation, ask questions, and see the latest announcements.
+- ⚡ **Get productive fast** — Streamlined workflows to go from code to cloud in minutes
+- 🏗️ **Azure recommended practices built-in** — Opinionated templates that follow Azure development standards
+- 🧠 **Learn as you build** — Understand core Azure constructs through hands-on experience
 
-## Install/Upgrade Azure Developer CLI
+📖 **[Get Started](https://aka.ms/azd)** · 💬 **[Join the Discussion](https://github.com/Azure/azure-dev/discussions)** · 📦 **[Browse Templates](https://azure.github.io/awesome-azd/)**
 
-Install and Upgrade using the following scripts. Re-running the script will install the latest available version.
+---
 
-For advanced install scenarios see [Azure Developer CLI Installer Scripts](cli/installer/README.md).
+## Downloads
+
+| Artifact | Version | Download |
+| -------- | ------- | -------- |
+| CLI | ![azd version](https://img.shields.io/endpoint?url=https%3A%2F%2Fazuresdkartifacts.z5.web.core.windows.net%2Fazd%2Fstandalone%2Flatest%2Fshield.json) | [Windows](https://azuresdkartifacts.z5.web.core.windows.net/azd/standalone/latest/azd-windows-amd64.zip) · [Linux](https://azuresdkartifacts.z5.web.core.windows.net/azd/standalone/latest/azd-linux-amd64.tar.gz) · [macOS](https://azuresdkartifacts.z5.web.core.windows.net/azd/standalone/latest/azd-darwin-amd64.zip) |
+| VS Code Extension | ![vscode extension version](https://img.shields.io/endpoint?url=https%3A%2F%2Fazuresdkartifacts.z5.web.core.windows.net%2Fazd%2Fvscode%2Flatest%2Fshield.json) | [Marketplace](https://marketplace.visualstudio.com/items?itemName=ms-azuretools.azure-dev) |
+
+## 🤖 AI Agents
+
+**Contributing to this repo?** See [AGENTS.md](AGENTS.md) for coding standards and [docs/](docs/README.md) for contributor documentation.
+
+**Microsoft contributor?** The repository's [`agency.toml`](agency.toml) configures [Agency](https://aka.ms/agency) with Azure DevOps and Kusto MCP tools.
+
+**Using `azd` with an AI coding assistant?** Check out the [docs](https://aka.ms/azd) and [templates](https://azure.github.io/awesome-azd/).
+
+---
+
+## Installation
+
+Install or upgrade to the latest version. For advanced scenarios, see the [installer docs](cli/installer/README.md).
 
 ### Windows
 
 ```powershell
+# Using winget (recommended)
+winget install microsoft.azd
+
+# Or Chocolatey
+choco install azd
+
+# Or install script
 powershell -ex AllSigned -c "Invoke-RestMethod 'https://aka.ms/install-azd.ps1' | Invoke-Expression"
 ```
 
-### Linux/MacOS
+### macOS
 
+```bash
+brew trust azure/azd && brew install --cask azure/azd/azd
 ```
+
+> **Note:** `brew trust azure/azd` trusts azd's Homebrew source (the `azure/azd` tap for `github.com/Azure/homebrew-azd`). Homebrew requires this before it will install casks from third-party sources.
+>
+> **Note:** If upgrading from a non-Homebrew installation, remove the existing `azd` binary first.
+
+### Linux
+
+```bash
 curl -fsSL https://aka.ms/install-azd.sh | bash
 ```
 
-## Uninstall Azure Developer CLI
+### Shell Completion
 
-### Windows
+Enable tab completion for `bash`, `zsh`, `fish`, or `powershell`:
 
-```powershell
-powershell -ex AllSigned -c "Invoke-RestMethod 'https://aka.ms/uninstall-azd.ps1' | Invoke-Expression"
+```bash
+azd completion <shell> --help
 ```
 
-### Linux/MacOS
+---
 
-```
+## Uninstall
+
+<details>
+<summary><strong>Windows</strong></summary>
+
+- **v0.5.0+**: Use "Add or remove programs" or your package manager (`winget uninstall`, `choco uninstall`)
+- **v0.4.0 and earlier**:
+  ```powershell
+  powershell -ex AllSigned -c "Invoke-RestMethod 'https://aka.ms/uninstall-azd.ps1' | Invoke-Expression"
+  ```
+
+</details>
+
+<details>
+<summary><strong>Linux / macOS</strong></summary>
+
+```bash
 curl -fsSL https://aka.ms/uninstall-azd.sh | bash
 ```
 
+Or use your package manager's uninstall command.
+
+</details>
+
+---
+
 ## Data Collection
 
-The software may collect information about you and your use of the software and send it to Microsoft. Microsoft may use this information to provide services and improve our products and services. You may turn off the telemetry as described in the repository. There are also some features in the software that may enable you and Microsoft to collect data from users of your applications. If you use these features, you must comply with applicable law, including providing appropriate notices to users of your applications together with a copy of Microsoft's privacy statement. Our privacy statement is located at https://go.microsoft.com/fwlink/?LinkID=824704. You can learn more about data collection and use in the help documentation and our privacy statement. Your use of the software operates as your consent to these practices.
+This software may collect usage data and send it to Microsoft to help improve our products. You can opt out by setting:
 
-### Telemetry Configuration
+```bash
+export AZURE_DEV_COLLECT_TELEMETRY=no
+```
 
-Telemetry collection is on by default.
+See the [Microsoft Privacy Statement](https://go.microsoft.com/fwlink/?LinkId=521839) for details.
 
-To opt out, set the environment variable `AZURE_DEV_COLLECT_TELEMETRY` to `no` in your environment.
+---
 
 ## Contributing
 
-This project welcomes contributions and suggestions.  Most contributions require you to agree to a
-Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us
-the rights to use your contribution. For details, visit https://cla.microsoft.com.
+We welcome contributions! Please see our [contributing guide](cli/azd/CONTRIBUTING.md) for details.
 
-When you submit a pull request, a CLA-bot will automatically determine whether you need to provide
-a CLA and decorate the PR appropriately (e.g., label, comment). Simply follow the instructions
-provided by the bot. You will only need to do this once across all repos using our CLA.
+Most contributions require a [Contributor License Agreement (CLA)](https://cla.microsoft.com). A bot will guide you through this when you open a PR.
 
-Please see our [contributing guide](cli/azd/CONTRIBUTING.md) for complete instructions on how you can contribute to the Azure Developer CLI.
+This project follows the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/). Questions? Contact [opencode@microsoft.com](mailto:opencode@microsoft.com).
 
-This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
-For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or
-contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
+### Template Authors
 
-## Trademark Notice
+Microsoft employees and partners contributing official templates should follow the [template standardization guidelines](https://github.com/Azure-Samples/azd-template-artifacts).
 
-Trademarks This project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft trademarks or logos is subject to and must follow Microsoft’s Trademark & Brand Guidelines. Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship. Any use of third-party trademarks or logos are subject to those third-party’s policies.
+---
+
+## Trademarks
+
+This project may contain Microsoft trademarks or logos. Use of these must follow [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks). Third-party trademarks are subject to their respective policies.
+
+## License
+
+Licensed under the [MIT](LICENSE) license.

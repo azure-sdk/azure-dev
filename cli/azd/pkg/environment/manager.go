@@ -1,0 +1,678 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package environment
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+
+	"github.com/MakeNowJust/heredoc/v2"
+	"github.com/azure/azure-dev/cli/azd/pkg/environment/azdcontext"
+	"github.com/azure/azure-dev/cli/azd/pkg/input"
+	"github.com/azure/azure-dev/cli/azd/pkg/ioc"
+	"github.com/azure/azure-dev/cli/azd/pkg/output/ux"
+	"github.com/azure/azure-dev/cli/azd/pkg/state"
+)
+
+// Description is a metadata description of an environment returned for the `azd env list` command
+type Description struct {
+	// The name of the environment
+	Name string
+	// The path to the local .env file for the environment. Useful for IDEs like VS / VSCode
+	DotEnvPath string
+	// Specifies when the environment exists locally
+	HasLocal bool
+	// Specifies when the environment exists remotely
+	HasRemote bool
+	// Specifies when the environment is the default environment
+	IsDefault bool
+}
+
+// Spec is the specification for creating a new environment
+type Spec struct {
+	Name         string
+	Subscription string
+	Location     string
+	// suggest is the name that is offered as a suggestion if we need to prompt the user for an environment name.
+	Examples []string
+}
+
+const DotEnvFileName = ".env"
+const ConfigFileName = "config.json"
+
+var (
+	// Error returned when an environment with the specified name already exists
+	ErrExists = errors.New("environment already exists")
+
+	// Error returned when an environment with a specified name cannot be found
+	ErrNotFound = errors.New("environment not found")
+
+	// Error returned when an environment name is not specified
+	ErrNameNotSpecified = errors.New("environment not specified")
+
+	// Error returned when the default environment cannot be found
+	ErrDefaultEnvironmentNotFound = errors.New("default environment not found")
+)
+
+// Manager is the interface used for managing instances of environments
+type Manager interface {
+	Create(ctx context.Context, spec Spec) (*Environment, error)
+
+	// Loads the environment with the given name.
+	// If the name is empty, the user is prompted to select or create an environment.
+	// If the environment does not exist, the user is prompted to create it.
+	LoadOrInitInteractive(ctx context.Context, name string) (*Environment, error)
+	List(ctx context.Context) ([]*Description, error)
+
+	// Get returns the existing environment with the given name.
+	// If the environment specified by the given name does not exist, ErrNotFound is returned.
+	Get(ctx context.Context, name string) (*Environment, error)
+
+	Save(ctx context.Context, env *Environment) error
+	SaveWithOptions(ctx context.Context, env *Environment, options *SaveOptions) error
+	Reload(ctx context.Context, env *Environment) error
+
+	// Delete deletes the environment from local storage.
+	Delete(ctx context.Context, name string) error
+
+	EnvPath(env *Environment) string
+	ConfigPath(env *Environment) string
+
+	// InvalidateEnvCache invalidates the state cache for the given environment
+	InvalidateEnvCache(ctx context.Context, envName string) error
+
+	// GetStateCacheManager returns the state cache manager for accessing cached state
+	GetStateCacheManager() *state.StateCacheManager
+}
+
+type manager struct {
+	local      DataStore
+	remote     DataStore
+	azdContext *azdcontext.AzdContext
+	console    input.Console
+
+	// Instance cache to ensure the same environment name returns the same *Environment instance
+	// across different scopes, enabling shared state mutation (e.g., from extensions)
+	cacheMu  sync.RWMutex
+	envCache map[string]*Environment
+
+	// saveMu serializes Save and Reload operations across goroutines so that
+	// parallel services running publish/deploy/hooks against the same
+	// *Environment cannot corrupt the on-disk .env file or interleave a
+	// partial Reload with another goroutine's writes.
+	//
+	// Lock acquisition order (MUST be consistent across all call sites):
+	//
+	//   1. manager.saveMu       (in-process sync.Mutex, serializes goroutines)
+	//   2. local flock           (cross-process OS file lock via gofrs/flock)
+	//   3. env.mu               (per-Environment sync.RWMutex, protects in-memory map)
+	//
+	// Subprocess hooks (`azd env set`) spawn a separate azd process with
+	// its own saveMu instance (in-process mutexes are not shared across
+	// process boundaries). Within the subprocess, the same acquisition
+	// order applies: saveMu → flock → env.mu. The in-process saveMu
+	// prevents concurrent Save/Reload within the SAME process; the
+	// cross-process flock prevents concurrent file I/O across DIFFERENT
+	// processes (e.g., parallel hook subprocesses). No deadlock is
+	// possible because saveMu is never shared cross-process and flock
+	// handles inter-process serialization.
+	//
+	// See also: docs/concurrency-model.md "Lock Acquisition Order" section.
+	saveMu sync.Mutex
+
+	// State cache manager for managing cached Azure resource information
+	stateCacheManager *state.StateCacheManager
+}
+
+// NewManager creates a new Manager instance
+func NewManager(
+	serviceLocator ioc.ServiceLocator,
+	azdContext *azdcontext.AzdContext,
+	console input.Console,
+	local LocalDataStore,
+	remoteConfig *state.RemoteConfig,
+) (Manager, error) {
+	var remote RemoteDataStore
+
+	// Ideally we would have liked to inject the remote data store directly into the manager,
+	// via the container but we can't do that because the remote data store is optional and the IoC
+	// container doesn't support optional interface based dependencies.
+	if remoteConfig != nil {
+		err := serviceLocator.ResolveNamed(remoteConfig.Backend, &remote)
+		if err != nil {
+			if errors.Is(err, ioc.ErrResolveInstance) {
+				return nil, fmt.Errorf(
+					"remote state configuration is invalid. The specified backend '%s' is not valid. Valid values are '%s'.",
+					remoteConfig.Backend,
+					ux.ListAsText(ValidRemoteKinds),
+				)
+			}
+
+			return nil, fmt.Errorf("resolving remote state data store: %w", err)
+		}
+	}
+
+	// Initialize state cache manager with environment directory path
+	// If azdContext is nil (no project), use empty path (cache won't be usable)
+	envDir := ""
+	if azdContext != nil {
+		envDir = azdContext.EnvironmentDirectory()
+	}
+
+	return &manager{
+		azdContext:        azdContext,
+		local:             local,
+		remote:            remote,
+		console:           console,
+		envCache:          make(map[string]*Environment),
+		stateCacheManager: state.NewStateCacheManager(envDir),
+	}, nil
+}
+
+func (m *manager) Create(ctx context.Context, spec Spec) (*Environment, error) {
+	if spec.Name != "" && !IsValidEnvironmentName(spec.Name) {
+		err := InvalidEnvironmentNameError(spec.Name)
+		m.console.Message(ctx, err.Error())
+		return nil, err
+	}
+
+	if err := m.ensureValidEnvironmentName(ctx, &spec); err != nil {
+		return nil, err
+	}
+
+	// Ensure the environment does not already exist:
+	_, err := m.Get(ctx, spec.Name)
+	switch {
+	case errors.Is(err, ErrNotFound):
+	case err != nil:
+		return nil, fmt.Errorf("checking for existing environment: %w", err)
+	default:
+		return nil, fmt.Errorf("%w: '%s'", ErrExists, spec.Name)
+	}
+
+	env := New(spec.Name)
+
+	if spec.Subscription != "" {
+		env.SetSubscriptionId(spec.Subscription)
+	}
+
+	if spec.Location != "" {
+		env.SetLocation(spec.Location)
+	}
+
+	if err := m.SaveWithOptions(ctx, env, &SaveOptions{IsNew: true}); err != nil {
+		return nil, err
+	}
+
+	return env, nil
+}
+
+func (m *manager) LoadOrInitInteractive(ctx context.Context, environmentName string) (*Environment, error) {
+	env, isNew, err := m.loadOrInitEnvironment(ctx, environmentName)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return nil, fmt.Errorf("environment %s does not exist", environmentName)
+	case err != nil:
+		return nil, err
+	}
+
+	if isNew {
+		if err := m.SaveWithOptions(ctx, env, &SaveOptions{IsNew: isNew}); err != nil {
+			return nil, err
+		}
+
+		envs, err := m.List(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("listing environments: %w", err)
+		}
+		// If this is the only environment, set it as the default environment
+		if len(envs) == 1 {
+			if err := m.azdContext.SetProjectState(azdcontext.ProjectState{DefaultEnvironment: env.Name()}); err != nil {
+				return nil, fmt.Errorf("saving default environment: %w", err)
+			}
+			m.console.Message(ctx,
+				fmt.Sprintf("\nNew environment '%s' created and set as default", env.Name()),
+			)
+		} else {
+			// Ask the user if they want to set the new environment as the default environment
+			msg := fmt.Sprintf("Set new environment '%s' as default environment?", env.Name())
+			shouldSetDefault, promptErr := m.console.Confirm(ctx, input.ConsoleOptions{
+				Message:      msg,
+				DefaultValue: true,
+			})
+
+			if promptErr != nil {
+				return nil, fmt.Errorf("prompting to set environment '%s' as default environment: %w", env.Name(), promptErr)
+			}
+
+			if shouldSetDefault {
+				if err := m.azdContext.SetProjectState(azdcontext.ProjectState{DefaultEnvironment: env.Name()}); err != nil {
+					return nil, fmt.Errorf("saving default environment: %w", err)
+				}
+				m.console.Message(ctx,
+					fmt.Sprintf("\nNew environment '%s' created and set as default.", env.Name()),
+				)
+			} else {
+				defaultEnvironment, err := m.azdContext.GetDefaultEnvironmentName()
+				if err != nil {
+					return nil, fmt.Errorf("get default environment: %w", err)
+				}
+				m.console.Message(ctx,
+					fmt.Sprintf("\nNew env '%s' created, default environment remains '%s'.", env.Name(), defaultEnvironment),
+				)
+			}
+		}
+	}
+
+	return env, nil
+}
+
+func (m *manager) loadOrInitEnvironment(ctx context.Context, environmentName string) (*Environment, bool, error) {
+	// If there's a default environment, use that
+	if environmentName == "" {
+		var err error
+		environmentName, err = m.azdContext.GetDefaultEnvironmentName()
+		if err != nil {
+			return nil, false, fmt.Errorf("getting default environment: %w", err)
+		}
+	}
+
+	if environmentName != "" {
+		env, err := m.Get(ctx, environmentName)
+		switch {
+		case errors.Is(err, ErrNotFound):
+			msg := fmt.Sprintf("Environment '%s' does not exist, would you like to create it?", environmentName)
+			shouldCreate, promptErr := m.console.Confirm(ctx, input.ConsoleOptions{
+				Message:      msg,
+				DefaultValue: true,
+			})
+			if promptErr != nil {
+				return nil, false, fmt.Errorf("prompting to create environment '%s': %w", environmentName, promptErr)
+			}
+			if !shouldCreate {
+				return nil, false, fmt.Errorf("environment '%s' not found: %w", environmentName, err)
+			}
+		case err != nil:
+			return nil, false, fmt.Errorf("loading environment '%s': %w", environmentName, err)
+		default:
+			return env, false, nil
+		}
+	}
+
+	// Two cases if we get to here:
+	// - The user has not specified an environment name, and there was no default environment set
+	// - The user has specified an environment name, but the named environment didn't exist and they told us they would
+	//   like us to create it.
+	if environmentName != "" && !IsValidEnvironmentName(environmentName) {
+		err := InvalidEnvironmentNameError(environmentName)
+		fmt.Fprintln(m.console.Handles().Stdout, err.Error())
+		return nil, false, err
+	}
+
+	// No environment name, no default environment set.
+	// Ask the user if they want to create a new environment or select an existing one
+	if environmentName == "" {
+		envs, err := m.List(ctx)
+		if err != nil {
+			return nil, false, err
+		}
+
+		// Selection, 0 is the option to create a new environment
+		selection := 0
+		choices := make([]string, 0, len(envs)+1)
+		choices = append(choices, "Create a new environment")
+		if len(envs) > 0 {
+			for _, env := range envs {
+				choices = append(choices, env.Name)
+			}
+
+			selection, err = m.console.Select(ctx, input.ConsoleOptions{
+				Message: "Select an environment to use:",
+				Options: choices,
+			})
+			if err != nil {
+				return nil, false, err
+			}
+		}
+
+		if selection > 0 {
+			// Return an existing environment
+			env, err := m.Get(ctx, choices[selection])
+			if err != nil {
+				return nil, false, err
+			}
+			if err := m.azdContext.SetProjectState(azdcontext.ProjectState{DefaultEnvironment: env.Name()}); err != nil {
+				return nil, false, fmt.Errorf("saving default environment: %w", err)
+			}
+
+			return env, false, nil
+		}
+	}
+
+	// Create the environment
+	spec := &Spec{
+		Name: environmentName,
+	}
+
+	if err := m.ensureValidEnvironmentName(ctx, spec); err != nil {
+		return nil, false, err
+	}
+
+	return New(spec.Name), true, nil
+}
+
+// ConfigPath returns the path to the environment config file
+func (m *manager) ConfigPath(env *Environment) string {
+	return m.local.ConfigPath(env)
+}
+
+// EnvPath returns the path to the environment .env file
+func (m *manager) EnvPath(env *Environment) string {
+	return m.local.EnvPath(env)
+}
+
+// List returns a list of all environments within the data store
+func (m *manager) List(ctx context.Context) ([]*Description, error) {
+	envMap := map[string]*Description{}
+	defaultEnvName, err := m.azdContext.GetDefaultEnvironmentName()
+	if err != nil {
+		defaultEnvName = ""
+	}
+
+	localEnvs, err := m.local.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("retrieving local environments, %w", err)
+	}
+
+	for _, env := range localEnvs {
+		envMap[env.Name] = &Description{
+			Name:       env.Name,
+			HasLocal:   true,
+			DotEnvPath: env.DotEnvPath,
+		}
+	}
+
+	if m.remote != nil {
+		remoteEnvs, err := m.remote.List(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("retrieving remote environments, %w", err)
+		}
+
+		for _, env := range remoteEnvs {
+			existing, has := envMap[env.Name]
+			if !has {
+				existing = &Description{
+					Name:      env.Name,
+					HasRemote: true,
+				}
+			} else {
+				existing.HasRemote = true
+			}
+			envMap[env.Name] = existing
+		}
+
+	}
+
+	allEnvs := []*Description{}
+	for _, env := range envMap {
+		env.IsDefault = env.Name == defaultEnvName
+		allEnvs = append(allEnvs, env)
+	}
+
+	slices.SortFunc(allEnvs, func(a, b *Description) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+
+	return allEnvs, nil
+}
+
+// Get returns the environment instance for the specified environment name
+func (m *manager) Get(ctx context.Context, name string) (*Environment, error) {
+	if name == "" {
+		return nil, ErrNameNotSpecified
+	}
+
+	// Check cache first
+	cached, err := m.getFromCache(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if cached != nil {
+		return cached, nil
+	}
+
+	// Not in cache, load from data store
+	localEnv, err := m.local.Get(ctx, name)
+	if err != nil {
+		if m.remote == nil {
+			return nil, err
+		}
+
+		remoteEnv, err := m.remote.Get(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+
+		// Use the same in-process lock that public Save acquires so a
+		// concurrent Save from another goroutine can't interleave with
+		// this remote-fallback hydration. Cross-process safety still
+		// comes from the flock inside local.Save.
+		if err := func() error {
+			m.saveMu.Lock()
+			defer m.saveMu.Unlock()
+			return m.local.Save(ctx, remoteEnv, nil)
+		}(); err != nil {
+			return nil, err
+		}
+
+		localEnv = remoteEnv
+	}
+
+	// Ensures local environment variable name is synced with the environment name
+	envName, ok := localEnv.LookupEnv(EnvNameEnvVarName)
+	if !ok || envName != name {
+		localEnv.DotenvSet(EnvNameEnvVarName, name)
+		if err := m.Save(ctx, localEnv); err != nil {
+			return nil, err
+		}
+	}
+
+	// Cache the instance before returning
+	m.cacheMu.Lock()
+	m.envCache[name] = localEnv
+	m.cacheMu.Unlock()
+
+	return localEnv, nil
+}
+
+// getFromCache retrieves an environment from the cache if it exists.
+// If found, the cached instance is reloaded from disk to ensure it has the latest data.
+// Returns the cached instance and any error from the reload operation.
+func (m *manager) getFromCache(ctx context.Context, name string) (*Environment, error) {
+	m.cacheMu.RLock()
+	cached, ok := m.envCache[name]
+	m.cacheMu.RUnlock()
+
+	if !ok {
+		return nil, nil
+	}
+
+	// Reload cached instance to ensure it has latest data from disk
+	if err := m.Reload(ctx, cached); err != nil {
+		return nil, err
+	}
+
+	return cached, nil
+}
+
+// Save saves the environment to the persistent data store
+func (m *manager) Save(ctx context.Context, env *Environment) error {
+	return m.SaveWithOptions(ctx, env, nil)
+}
+
+// Save saves the environment to the persistent data store with the specified options
+func (m *manager) SaveWithOptions(ctx context.Context, env *Environment, options *SaveOptions) error {
+	if options == nil {
+		options = &SaveOptions{}
+	}
+
+	// Serialize Save calls so that parallel services writing different
+	// SERVICE_<name>_* keys into the same env can't race on the .env file
+	// (the local data store reads-merges-writes the file, and the env's
+	// internal mutex protects the in-memory map but not the file I/O).
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+
+	if err := m.local.Save(ctx, env, options); err != nil {
+		return fmt.Errorf("saving local environment, %w", err)
+	}
+
+	if m.remote == nil {
+		return nil
+	}
+
+	if err := m.remote.Save(ctx, env, options); err != nil {
+		return fmt.Errorf("saving remote environment, %w", err)
+	}
+
+	return nil
+}
+
+// Reload reloads the environment from the persistent data store
+func (m *manager) Reload(ctx context.Context, env *Environment) error {
+	// Reload swaps the in-memory dotenv map; serialize against Save so that
+	// a Reload triggered by a hook in service A doesn't observe a half-written
+	// .env file produced by service B's concurrent Save.
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+	return m.local.Reload(ctx, env)
+}
+
+func (m *manager) Delete(ctx context.Context, name string) error {
+	if name == "" {
+		return ErrNameNotSpecified
+	}
+
+	err := m.local.Delete(ctx, name)
+	if err != nil {
+		return err
+	}
+
+	// Remove from cache if present
+	m.cacheMu.Lock()
+	delete(m.envCache, name)
+	m.cacheMu.Unlock()
+
+	defaultEnvName, err := m.azdContext.GetDefaultEnvironmentName()
+	if err != nil {
+		return fmt.Errorf("getting default environment: %w", err)
+	}
+
+	if defaultEnvName == name {
+		err = m.azdContext.SetProjectState(azdcontext.ProjectState{DefaultEnvironment: ""})
+		if err != nil {
+			return fmt.Errorf("clearing default environment: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// ensureValidEnvironmentName ensures the environment name is valid, if it is not, an error is printed
+// and the user is prompted for a new name.
+// In --no-prompt mode, when no name is provided, the name is auto-generated from the working directory basename.
+func (m *manager) ensureValidEnvironmentName(ctx context.Context, spec *Spec) error {
+	// In --no-prompt mode with no name provided, generate from working directory
+	if spec.Name == "" && m.console.IsNoPromptMode() {
+		// Prefer the project directory from azdContext, fall back to process working directory.
+		cwd := ""
+		if m.azdContext != nil {
+			cwd = m.azdContext.ProjectDirectory()
+		}
+
+		if cwd == "" {
+			var err error
+			cwd, err = os.Getwd()
+			if err != nil {
+				return fmt.Errorf(
+					"cannot determine working directory for default environment name: %w. "+
+						"Specify one explicitly with -e or as an argument", err)
+			}
+		}
+
+		dirName := filepath.Base(cwd)
+		cleaned := CleanName(dirName)
+
+		if cleaned == "" || cleaned == "-" || cleaned == "." || cleaned == ".." {
+			return fmt.Errorf(
+				"cannot generate valid environment name from directory '%s'. "+
+					"Specify one explicitly with -e or as an argument", dirName)
+		}
+
+		if len(cleaned) > EnvironmentNameMaxLength {
+			cleaned = cleaned[:EnvironmentNameMaxLength]
+		}
+
+		if !IsValidEnvironmentName(cleaned) {
+			return fmt.Errorf(
+				"auto-generated environment name '%s' from directory '%s' is invalid. "+
+					"Specify one explicitly with -e or as an argument", cleaned, dirName)
+		}
+
+		spec.Name = cleaned
+		m.console.Message(ctx, fmt.Sprintf("Using environment name: %s", spec.Name))
+
+		return nil
+	}
+
+	exampleText := ""
+	if len(spec.Examples) > 0 {
+		exampleText = "\n\nExamples:"
+	}
+
+	for _, example := range spec.Examples {
+		exampleText += fmt.Sprintf("\n  %s", example)
+	}
+
+	for !IsValidEnvironmentName(spec.Name) {
+		userInput, err := m.console.Prompt(ctx, input.ConsoleOptions{
+			Message: "Enter a unique environment name",
+			Help: heredoc.Doc(`
+			A unique string that can be used to differentiate copies of your application in Azure.
+
+			This value is typically used:
+			  - to generate a unique suffix (hash) to automatically name resources in Azure
+			  - by "azd down" to find all resource groups to be deleted (those with the tag "azd-env-name: environment-name")
+			More info: https://aka.ms/azd`) + exampleText,
+		})
+
+		if err != nil {
+			return fmt.Errorf("reading environment name: %w", err)
+		}
+
+		spec.Name = userInput
+
+		if !IsValidEnvironmentName(spec.Name) {
+			m.console.Message(ctx, InvalidEnvironmentNameError(spec.Name).Error())
+		}
+	}
+
+	return nil
+}
+
+// InvalidateEnvCache invalidates the state cache for the given environment
+func (m *manager) InvalidateEnvCache(ctx context.Context, envName string) error {
+	return m.stateCacheManager.Invalidate(ctx, envName)
+}
+
+// GetStateCacheManager returns the state cache manager for accessing cached state
+func (m *manager) GetStateCacheManager() *state.StateCacheManager {
+	return m.stateCacheManager
+}

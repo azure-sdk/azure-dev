@@ -1,0 +1,108 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package cmd
+
+import (
+	"fmt"
+
+	"azureaiagent/internal/helpformat"
+
+	"github.com/azure/azure-dev/cli/azd/pkg/azdext"
+	"github.com/fatih/color"
+	"github.com/spf13/cobra"
+)
+
+func NewRootCommand() *cobra.Command {
+	rootCmd, extCtx := azdext.NewExtensionRootCommand(azdext.ExtensionCommandOptions{
+		Name: "agent",
+		Use:  "agent <command> [options]",
+		Short: fmt.Sprintf(
+			"Ship prompt, hosted, and voice agents with Microsoft Foundry from your terminal. %s",
+			color.YellowString("(Preview)"),
+		),
+	})
+	rootCmd.SilenceUsage = true
+	rootCmd.Example = `  # Initialize and deploy an agent project
+  azd ai agent init
+  azd up
+
+  # Send a message to a deployed prompt or hosted agent
+  azd ai agent invoke "Hello"`
+	rootCmd.SilenceErrors = true
+	rootCmd.CompletionOptions.DisableDefaultCmd = true
+	telemetryReporter := newAgentContextReporter()
+
+	// Configure debug logging once on the root command so every subcommand
+	// inherits it (cobra.EnableTraverseRunHooks, set by the SDK, ensures this
+	// runs alongside any subcommand pre-runs). The cleanup func is intentionally
+	// discarded: log writes are unbuffered and the OS closes the file on exit.
+	sdkPreRun := rootCmd.PersistentPreRunE
+	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		if sdkPreRun != nil {
+			if err := sdkPreRun(cmd, args); err != nil {
+				return err
+			}
+		}
+		setupDebugLogging(cmd.Flags())
+		operation := telemetryOperation(cmd.CommandPath())
+		switch operation {
+		case "deploy", "init", "listen", "metadata", "version":
+		default:
+			telemetryReporter.reportProject(cmd.Context(), operation)
+		}
+		return nil
+	}
+	rootCmd.PersistentPostRun = func(cmd *cobra.Command, _ []string) {
+		// Init may create the project that supplies the resolved agent context.
+		operation := telemetryOperation(cmd.CommandPath())
+		if operation == "init" {
+			telemetryReporter.reportProject(cmd.Context(), operation)
+		}
+	}
+
+	// Show the ASCII art banner above the default help text for the root command
+	defaultHelp := rootCmd.HelpFunc()
+	rootCmd.SetHelpFunc(func(cmd *cobra.Command, args []string) {
+		if cmd == rootCmd {
+			printBanner(cmd.OutOrStdout())
+		}
+		defaultHelp(cmd, args)
+	})
+
+	rootCmd.SetHelpCommand(&cobra.Command{Hidden: true})
+
+	rootCmd.AddCommand(azdext.NewListenCommand(func(host *azdext.ExtensionHost) {
+		configureExtensionHostWithTelemetry(host, telemetryReporter)
+	}))
+	rootCmd.AddCommand(newVersionCommand())
+	rootCmd.AddCommand(newInitCommand(extCtx))
+	rootCmd.AddCommand(newAgentDependencyCommand(extCtx, "toolbox", AiToolboxHost))
+	rootCmd.AddCommand(newAgentDependencyCommand(extCtx, "connection", AiConnectionHost))
+	rootCmd.AddCommand(newRunCommand(extCtx))
+	rootCmd.AddCommand(newInvokeCommand(extCtx))
+	rootCmd.AddCommand(newMcpCommand())
+	rootCmd.AddCommand(azdext.NewMetadataCommand("1.0", "azure.ai.agents", func() *cobra.Command {
+		return rootCmd
+	}))
+	rootCmd.AddCommand(newShowCommand(extCtx))
+	rootCmd.AddCommand(newDeleteCommand(extCtx))
+	rootCmd.AddCommand(newPackCommand(extCtx))
+	rootCmd.AddCommand(newPublishCommand(extCtx))
+	rootCmd.AddCommand(newEndpointCommand(extCtx))
+	rootCmd.AddCommand(newMonitorCommand(extCtx))
+	rootCmd.AddCommand(newFilesCommand(extCtx))
+	rootCmd.AddCommand(newSessionCommand(extCtx))
+	rootCmd.AddCommand(newStateStoresCommand(extCtx))
+	rootCmd.AddCommand(newInvocationsCommand(extCtx))
+	rootCmd.AddCommand(newSampleCommand(extCtx))
+	rootCmd.AddCommand(newDoctorCommand())
+
+	rootCmd.AddCommand(newCodeCommand(extCtx))
+	rootCmd.AddCommand(newEvalCommand(extCtx))
+	rootCmd.AddCommand(newOptimizeCommand(extCtx))
+
+	helpformat.Install(rootCmd, "azd ai", agentHelpFooter)
+
+	return rootCmd
+}

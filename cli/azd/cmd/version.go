@@ -6,46 +6,82 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 
+	"github.com/azure/azure-dev/cli/azd/cmd/actions"
 	"github.com/azure/azure-dev/cli/azd/internal"
-	"github.com/azure/azure-dev/cli/azd/pkg/commands"
-	"github.com/azure/azure-dev/cli/azd/pkg/environment/azdcontext"
+	"github.com/azure/azure-dev/cli/azd/pkg/contracts"
+	"github.com/azure/azure-dev/cli/azd/pkg/input"
 	"github.com/azure/azure-dev/cli/azd/pkg/output"
+	"github.com/azure/azure-dev/cli/azd/pkg/update"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
-func versionCmd(rootOptions *internal.GlobalCommandOptions) *cobra.Command {
-	cmd := commands.Build(
-		commands.ActionFunc(versionAction),
-		rootOptions,
-		"version",
-		"Print the version number of Azure Developer CLI.",
-		&commands.BuildOptions{
-			DisableCmdUsageEvent: true,
-		},
-	)
-
-	return output.AddOutputParam(
-		cmd,
-		[]output.Format{output.JsonFormat, output.NoneFormat},
-		output.NoneFormat,
-	)
+type versionFlags struct {
+	global *internal.GlobalCommandOptions
 }
 
-func versionAction(ctx context.Context, cmd *cobra.Command, _ []string, _ *azdcontext.AzdContext) error {
-	formatter := output.GetFormatter(ctx)
-	writer := output.GetWriter(ctx)
+func (v *versionFlags) Bind(local *pflag.FlagSet, global *internal.GlobalCommandOptions) {
+	v.global = global
+}
 
-	switch formatter.Kind() {
+func newVersionFlags(cmd *cobra.Command, global *internal.GlobalCommandOptions) *versionFlags {
+	flags := &versionFlags{}
+	flags.Bind(cmd.Flags(), global)
+
+	return flags
+}
+
+type versionAction struct {
+	flags     *versionFlags
+	formatter output.Formatter
+	writer    io.Writer
+	console   input.Console
+}
+
+func newVersionAction(
+	flags *versionFlags,
+	formatter output.Formatter,
+	writer io.Writer,
+	console input.Console,
+) actions.Action {
+	return &versionAction{
+		flags:     flags,
+		formatter: formatter,
+		writer:    writer,
+		console:   console,
+	}
+}
+
+func (v *versionAction) Run(ctx context.Context) (*actions.ActionResult, error) {
+	switch v.formatter.Kind() {
 	case output.NoneFormat:
-		fmt.Printf("azd version %s\n", internal.Version)
+		channelSuffix := v.channelSuffix()
+		fmt.Fprintf(v.console.Handles().Stdout, "azd version %s%s\n", internal.Version, channelSuffix)
 	case output.JsonFormat:
-		versionSpec := internal.GetVersionSpec()
-		err := formatter.Format(versionSpec, writer, nil)
+		var result contracts.VersionResult
+		versionSpec := internal.VersionInfo()
+
+		result.Azd.Commit = versionSpec.Commit
+		result.Azd.Version = versionSpec.Version.String()
+
+		err := v.formatter.Format(result, v.writer, nil)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
-	return nil
+	return nil, nil
+}
+
+// channelSuffix returns a display suffix like " (stable)" or " (daily)".
+// Based on the running binary's version string, not the configured channel.
+func (v *versionAction) channelSuffix() string {
+	// Detect from the binary itself: if the version contains "daily.", it's a daily build.
+	if _, err := update.ParseDailyBuildNumber(internal.Version); err == nil {
+		return " (daily)"
+	}
+
+	return " (stable)"
 }

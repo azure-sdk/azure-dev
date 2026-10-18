@@ -1,0 +1,12 @@
+import: ../../.vscode/cspell.yaml
+words:
+    - Alphanum
+    - connectionless
+    - envkey
+    - exterrors
+    - projectctx
+    - retarget
+    - retargets
+    - subdocument
+    - toolsets
+    - uppercased

@@ -1,0 +1,506 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package containerregistry
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"slices"
+	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerregistry/armcontainerregistry"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
+	"github.com/azure/azure-dev/cli/azd/internal/tracing"
+	"github.com/azure/azure-dev/cli/azd/internal/tracing/fields"
+	"github.com/azure/azure-dev/cli/azd/pkg/account"
+	"github.com/azure/azure-dev/cli/azd/pkg/azsdk"
+	"github.com/google/uuid"
+	"github.com/sethvargo/go-retry"
+)
+
+const logCursorValidationBytes = 64 * 1024
+
+type logCursorFingerprint struct {
+	head []byte
+	data []byte
+}
+
+func (w *logCursorFingerprint) Write(p []byte) (int, error) {
+	if remaining := logCursorValidationBytes - len(w.head); remaining > 0 {
+		if remaining > len(p) {
+			remaining = len(p)
+		}
+		w.head = append(w.head, p[:remaining]...)
+	}
+
+	if len(p) >= logCursorValidationBytes {
+		w.data = append(w.data[:0], p[len(p)-logCursorValidationBytes:]...)
+		return len(p), nil
+	}
+
+	overflow := len(w.data) + len(p) - logCursorValidationBytes
+	if overflow > 0 {
+		copy(w.data, w.data[overflow:])
+		w.data = w.data[:len(w.data)-overflow]
+	}
+	w.data = append(w.data, p...)
+	return len(p), nil
+}
+
+func (w *logCursorFingerprint) Reset() {
+	w.head = w.head[:0]
+	w.data = w.data[:0]
+}
+
+// uniqueCorrelationPolicy is an azcore PerCall policy that overrides the x-ms-correlation-request-id header with a
+// freshly generated UUID on every outgoing HTTP request.
+//
+// The ACR data plane derives the relative blob path it returns from GetBuildSourceUploadURL
+// (tasks-source/<yyyymmdd>/<correlationId>.tar.gz) from the caller's x-ms-correlation-request-id. azd's default
+// correlation policy (azsdk.NewMsCorrelationPolicy) sets that header from the root OpenTelemetry trace id, which
+// is intentionally shared across every HTTP call made within a single azd command invocation — the Azure ARM spec
+// defines x-ms-correlation-request-id as a session-level header meant to correlate RELATED requests, so that
+// trace-derived behavior is correct for ARM in general. When multiple services upload build sources in parallel
+// under the same trace, however, each call receives the same ACR-computed blob path and overlapping writes
+// clobber each other, causing cross-contamination where one service's image ends up with another service's
+// source code. Forcing a unique correlation id per request here (for the ACR upload client only) guarantees ACR
+// hands back a distinct blob path for each upload without weakening the session-level correlation semantics for
+// every other ARM call in the command.
+//
+// This is separate from — and complementary to — the per-request uniqueness that
+// azsdk.NewMsClientRequestIdPolicy and azsdk.NewMsGraphCorrelationPolicy apply to the x-ms-client-request-id and
+// Graph client-request-id headers respectively. Those policies address a different header that the spec requires
+// to be unique per HTTP request globally; this policy addresses the ACR-specific need to also vary the
+// correlation header for parallel source uploads.
+type uniqueCorrelationPolicy struct{}
+
+func (uniqueCorrelationPolicy) Do(req *policy.Request) (*http.Response, error) {
+	req.Raw().Header.Set(azsdk.MsCorrelationIdHeader, uuid.NewString())
+	return req.Next()
+}
+
+// remoteBuildArmClientOptions returns a copy of the base arm.ClientOptions with a PerCall policy that guarantees a
+// unique x-ms-correlation-request-id per request. Used for ACR registry client calls that would otherwise collide on
+// ACR's correlation-id-derived blob path for parallel source uploads.
+func remoteBuildArmClientOptions(base *arm.ClientOptions) *arm.ClientOptions {
+	opts := arm.ClientOptions{}
+	if base != nil {
+		opts = *base
+		opts.ClientOptions.PerCallPolicies = append(
+			append([]policy.Policy{}, base.ClientOptions.PerCallPolicies...),
+			uniqueCorrelationPolicy{},
+		)
+	} else {
+		opts.ClientOptions.PerCallPolicies = []policy.Policy{uniqueCorrelationPolicy{}}
+	}
+	return &opts
+}
+
+// RemoteBuildManager provides functionality to interact with the Azure Container Registry Remote Build feature.
+type RemoteBuildManager struct {
+	credentialProvider account.SubscriptionCredentialProvider
+	armClientOptions   *arm.ClientOptions
+}
+
+// UploadBuildSource uploads the build source to the specified registry. The returned SourceUploadDefinition may be used
+// when scheduling a build to reference the uploaded source.
+func (r *RemoteBuildManager) UploadBuildSource(
+	ctx context.Context,
+	subscriptionID string,
+	resourceGroupName string,
+	registryName string,
+	buildSourcePath string,
+) (armcontainerregistry.SourceUploadDefinition, error) {
+	cred, err := r.credentialProvider.CredentialForSubscription(ctx, subscriptionID)
+	if err != nil {
+		return armcontainerregistry.SourceUploadDefinition{}, err
+	}
+
+	uploadClientOptions := remoteBuildArmClientOptions(r.armClientOptions)
+	regClient, err := armcontainerregistry.NewRegistriesClient(subscriptionID, cred, uploadClientOptions)
+	if err != nil {
+		return armcontainerregistry.SourceUploadDefinition{}, err
+	}
+
+	sourceUploadRes, err := regClient.GetBuildSourceUploadURL(ctx, resourceGroupName, registryName, nil)
+	if err != nil {
+		return armcontainerregistry.SourceUploadDefinition{}, err
+	}
+
+	blobClient, err := blockblob.NewClientWithNoCredential(*sourceUploadRes.UploadURL, &blockblob.ClientOptions{
+		ClientOptions: r.armClientOptions.ClientOptions,
+	})
+	if err != nil {
+		return armcontainerregistry.SourceUploadDefinition{}, err
+	}
+
+	dockerContext, err := os.Open(buildSourcePath)
+	if err != nil {
+		return armcontainerregistry.SourceUploadDefinition{}, err
+	}
+	defer dockerContext.Close()
+
+	_, err = blobClient.UploadFile(ctx, dockerContext, nil)
+	if err != nil {
+		return armcontainerregistry.SourceUploadDefinition{}, err
+	}
+
+	return sourceUploadRes.SourceUploadDefinition, nil
+}
+
+// RemoteBuildUnavailableError indicates that ACR explicitly refused to schedule a build.
+// Callers may attempt a local build instead. Errors after submission do not use this type.
+type RemoteBuildUnavailableError struct {
+	Err error
+}
+
+// Error returns the original scheduling error.
+func (e *RemoteBuildUnavailableError) Error() string {
+	return e.Err.Error()
+}
+
+// Unwrap preserves the original Azure service error.
+func (e *RemoteBuildUnavailableError) Unwrap() error {
+	return e.Err
+}
+
+// RemoteBuildRunError represents a terminal failure reported by an Azure Container Registry remote build.
+type RemoteBuildRunError struct {
+	Status   armcontainerregistry.RunStatus
+	buildLog string
+}
+
+// Error returns the remote build failure and its existing user-facing build log.
+func (e *RemoteBuildRunError) Error() string {
+	if e == nil {
+		return "remote build failed"
+	}
+
+	return fmt.Sprintf("remote build failed: %s", e.buildLog)
+}
+
+// DiagnosticCode returns a stable suffix for the terminal ACR run status, or an empty string for an unknown status.
+func (e *RemoteBuildRunError) DiagnosticCode() string {
+	if e == nil {
+		return ""
+	}
+
+	switch e.Status {
+	case armcontainerregistry.RunStatusFailed:
+		return "acr_run_failed"
+	case armcontainerregistry.RunStatusError:
+		return "acr_run_error"
+	case armcontainerregistry.RunStatusTimeout:
+		return "acr_run_timeout"
+	case armcontainerregistry.RunStatusCanceled:
+		return "acr_run_canceled"
+	default:
+		return ""
+	}
+}
+
+// terminalContainerRegistryRunStates is the list of states we consider terminal when waiting for a container registry run
+// to complete. Unfortunately, in the current version of the armcontainerregistry package, the poller returned by
+// BeginScheduleRun treats all states as terminal and so calling `PollUntilDone` will return even if if the run is still
+// progressing.  So we open code this polling loop ourselves.
+var terminalContainerRegistryRunStates = []armcontainerregistry.RunStatus{
+	armcontainerregistry.RunStatusCanceled,
+	armcontainerregistry.RunStatusError,
+	armcontainerregistry.RunStatusFailed,
+	armcontainerregistry.RunStatusSucceeded,
+	armcontainerregistry.RunStatusTimeout,
+}
+
+// RunDockerBuildRequestWithLogs initiates a remote build on the specified registry and streams the logs to the provided
+// writer.
+func (r *RemoteBuildManager) RunDockerBuildRequestWithLogs(
+	ctx context.Context,
+	subscriptionID, resourceGroupName, registryName string,
+	buildRequest *armcontainerregistry.DockerBuildRequest,
+	writer io.Writer,
+) error {
+	tracing.IncrementUsageAttribute(fields.RemoteBuildCount.Int(1))
+
+	cred, err := r.credentialProvider.CredentialForSubscription(ctx, subscriptionID)
+	if err != nil {
+		return err
+	}
+
+	regClient, err := armcontainerregistry.NewRegistriesClient(subscriptionID, cred, r.armClientOptions)
+	if err != nil {
+		return err
+	}
+
+	runPoller, err := regClient.BeginScheduleRun(ctx, resourceGroupName, registryName, buildRequest, nil)
+	if err != nil {
+		if responseErr, ok := errors.AsType[*azcore.ResponseError](err); ok &&
+			responseErr.ErrorCode == "TasksOperationsNotAllowed" {
+			return &RemoteBuildUnavailableError{Err: err}
+		}
+		return err
+	}
+
+	resp, err := runPoller.Poll(ctx)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var runResp armcontainerregistry.RegistriesClientScheduleRunResponse
+	if err := json.NewDecoder(resp.Body).Decode(&runResp); err != nil {
+		return err
+	}
+
+	runClient, err := armcontainerregistry.NewRunsClient(subscriptionID, cred, r.armClientOptions)
+	if err != nil {
+		return err
+	}
+
+	logRes, err := runClient.GetLogSasURL(ctx, resourceGroupName, registryName, *runResp.Properties.RunID, nil)
+	if err != nil {
+		return err
+	}
+
+	logBlobClient, err := blockblob.NewClientWithNoCredential(*logRes.LogLink, &blockblob.ClientOptions{
+		ClientOptions: r.armClientOptions.ClientOptions,
+	})
+	if err != nil {
+		return err
+	}
+
+	var buildLog bytes.Buffer
+	err = streamLogs(ctx, logBlobClient, io.MultiWriter(&buildLog, writer))
+	if err != nil {
+		return err
+	}
+
+	// Poll until the run is complete - we do this ourselves because the poller returned by BeginScheduleRun treats all
+	// states as terminal and so calling `PollUntilDone` will return even if if the run is still progressing.
+	//
+	// Since the call to streamLogs above will block until the log is complete, we expect the final status will be
+	// available shortly, and so we used an exponential backoff with a capped duration and a short initial delay.
+	return retry.Do(ctx, retry.WithCappedDuration(30*time.Second, retry.NewExponential(1*time.Second)),
+		func(ctx context.Context) error {
+			runRes, err := runClient.Get(ctx, resourceGroupName, registryName, *runResp.Properties.RunID, nil)
+			if err != nil {
+				return err
+			}
+			if runRes.Properties == nil || runRes.Properties.Status == nil {
+				return retry.RetryableError(errors.New("remote build status is missing"))
+			}
+
+			if !slices.Contains(terminalContainerRegistryRunStates, *runRes.Properties.Status) {
+				return retry.RetryableError(errors.New("remote build still in progress"))
+			}
+
+			if *runRes.Properties.Status != armcontainerregistry.RunStatusSucceeded {
+				return &RemoteBuildRunError{
+					Status:   *runRes.Properties.Status,
+					buildLog: buildLog.String(),
+				}
+			}
+
+			return nil
+		})
+}
+
+// streamLogs streams the logs from the specified blob client to the provided writer, until the log is marked as complete
+// or an error occurs. The inner polling loop is bounded to prevent runaway iteration.
+func streamLogs(ctx context.Context, blobClient *blockblob.Client, writer io.Writer) error {
+	const maxPollIterations = 1200 // ~20 minutes at 1s intervals
+
+	var written int64 = 0
+	writtenFingerprint := &logCursorFingerprint{}
+	var writtenETag *azcore.ETag
+	resetCursor := func() {
+		written = 0
+		writtenFingerprint.Reset()
+		writtenETag = nil
+	}
+	return retry.Do(ctx, retry.WithMaxRetries(10, retry.NewConstant(5*time.Second)), func(ctx context.Context) error {
+		err := func() error {
+			for iteration := 0; ; iteration++ {
+				if iteration >= maxPollIterations {
+					return fmt.Errorf(
+						"streamLogs exceeded maximum poll iterations (%d); remote build may still be running",
+						maxPollIterations,
+					)
+				}
+
+				props, err := blobClient.GetProperties(ctx, nil)
+				if err != nil {
+					return err
+				}
+
+				length := *props.ContentLength
+				if length < written {
+					// A restarted ACR build can replace its log with a shorter blob.
+					resetCursor()
+				}
+				if written > 0 && props.ETag != nil &&
+					(writtenETag == nil || *props.ETag != *writtenETag) {
+					ranges := []struct {
+						offset   int64
+						expected []byte
+					}{
+						{expected: writtenFingerprint.head},
+					}
+					tailOffset := written - int64(len(writtenFingerprint.data))
+					if tailOffset > 0 {
+						ranges = append(ranges, struct {
+							offset   int64
+							expected []byte
+						}{offset: tailOffset, expected: writtenFingerprint.data})
+					}
+
+					cursorValid := true
+					retryPoll := false
+					for _, validationRange := range ranges {
+						res, err := blobClient.DownloadStream(ctx, &blob.DownloadStreamOptions{
+							Range: azblob.HTTPRange{
+								Offset: validationRange.offset,
+								Count:  int64(len(validationRange.expected)),
+							},
+							AccessConditions: &blob.AccessConditions{
+								ModifiedAccessConditions: &blob.ModifiedAccessConditions{
+									IfMatch: props.ETag,
+								},
+							},
+						})
+						if err != nil {
+							if responseErr, ok := errors.AsType[*azcore.ResponseError](err); ok &&
+								(responseErr.StatusCode == http.StatusRequestedRangeNotSatisfiable ||
+									responseErr.StatusCode == http.StatusPreconditionFailed) {
+								select {
+								case <-ctx.Done():
+									return ctx.Err()
+								case <-time.After(1 * time.Second):
+								}
+								retryPoll = true
+								break
+							}
+							return err
+						}
+
+						actual, err := io.ReadAll(res.Body)
+						closeErr := res.Body.Close()
+						if err != nil {
+							return err
+						}
+						if closeErr != nil {
+							return closeErr
+						}
+						if !bytes.Equal(actual, validationRange.expected) {
+							cursorValid = false
+							break
+						}
+					}
+					if retryPoll {
+						continue
+					}
+
+					if !cursorValid {
+						resetCursor()
+					} else {
+						etag := *props.ETag
+						writtenETag = &etag
+					}
+				}
+				if (length - written) == 0 {
+					if props.Metadata != nil {
+						if _, has := props.Metadata["Complete"]; has {
+							return nil
+						}
+					}
+
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-time.After(1 * time.Second):
+					}
+					continue
+				}
+
+				res, err := blobClient.DownloadStream(ctx, &blob.DownloadStreamOptions{
+					Range: azblob.HTTPRange{
+						Offset: written,
+						Count:  length - written,
+					},
+					AccessConditions: &blob.AccessConditions{
+						ModifiedAccessConditions: &blob.ModifiedAccessConditions{
+							IfMatch: props.ETag,
+						},
+					},
+				})
+				if err != nil {
+					if responseErr, ok := errors.AsType[*azcore.ResponseError](err); ok &&
+						(responseErr.StatusCode == http.StatusRequestedRangeNotSatisfiable ||
+							responseErr.StatusCode == http.StatusPreconditionFailed) {
+						// The blob changed after HEAD. A rejected range proves the cursor
+						// is no longer valid, even if the replacement grows before our next poll.
+						if responseErr.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+							resetCursor()
+						}
+						select {
+						case <-ctx.Done():
+							return ctx.Err()
+						case <-time.After(1 * time.Second):
+						}
+						continue
+					}
+					return err
+				}
+
+				err = func() error {
+					defer res.Body.Close()
+					copied, err := io.Copy(io.MultiWriter(writer, writtenFingerprint), res.Body)
+					if err != nil {
+						return err
+					}
+					written += copied
+					if props.ETag != nil {
+						etag := *props.ETag
+						writtenETag = &etag
+					}
+					return nil
+				}()
+				if err != nil {
+					return err
+				}
+			}
+		}()
+		if azErr, ok := errors.AsType[*azcore.ResponseError](err); ok {
+			if azErr.StatusCode == http.StatusNotFound {
+				resetCursor()
+				// Mark log not found as a retryable error, we assume that the blob client was formed around a result from
+				// the queue job request and the fact that the log is not found means that the log is not yet available, not
+				// that it will never be available.
+				return retry.RetryableError(err)
+			}
+			// Wrap non-404 HTTP errors with additional context about the operation and URL.
+			return fmt.Errorf("streaming remote build logs (HTTP %d): %w", azErr.StatusCode, err)
+		}
+		return err
+	})
+}
+
+func NewRemoteBuildManager(
+	credentialProvider account.SubscriptionCredentialProvider,
+	armClientOptions *arm.ClientOptions,
+) *RemoteBuildManager {
+	return &RemoteBuildManager{
+		credentialProvider: credentialProvider,
+		armClientOptions:   armClientOptions,
+	}
+}

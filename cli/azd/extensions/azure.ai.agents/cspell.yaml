@@ -1,0 +1,161 @@
+import: ../../.vscode/cspell.yaml
+overrides:
+  - filename: ["internal/helpformat/*.go", "internal/cmd/root.go"]
+    words:
+      - helpformat
+words:
+  # Connection commands
+  - tavily
+  - tvly
+  - conncmd
+  # Contributors
+  - harsheet
+  # Eval / optimize async job ID prefixes and terms
+  - datagen
+  - evaluatorgen
+  - signup
+  # Terms
+  - Reprompt
+  - MMDDH
+  # Voice (prompt-voice) agents
+  - BYOM
+  - Nanami
+  - orgid
+  - pcma
+  - pcmu
+  - webrtc
+  # Azure region names
+  - australiaeast
+  - brazilsouth
+  - canadacentral
+  - canadaeast
+  - francecentral
+  - germanywestcentral
+  - italynorth
+  - japaneast
+  - japanwest
+  - koreacentral
+  - northcentralus
+  - norwayeast
+  - polandcentral
+  - southafricanorth
+  - southcentralus
+  - southeastasia
+  - southindia
+  - spaincentral
+  - switzerlandnorth
+  - switzerlandwest
+  - uaenorth
+  - uksouth
+  - ukwest
+  - westeurope
+  - westcentralus
+  # Project terms
+  - ABAC
+  - abbrs
+  - acrpush
+  - alnum
+  - foundryproject
+  - agentignore
+  - ADLS
+  - agentserver
+  - aiservices
+  - Alphanum
+  - anonymousconnection
+  - aoai
+  - authorizationfailed
+  - azdaiagent
+  - azuresdk
+  - bicepless
+  - CLIENTSECRET
+  - containerref
+  - curr
+  - dataagent
+  - defaultyourvalue
+  - envkey
+  - exterrors
+  - goyaml
+  - helloworld
+  - hostedagent
+  - hostedagents
+  - kval
+  - listbuildsourceuploadurl
+  - logstream
+  - mcpservertoolalwaysrequireapprovalmode
+  - mcpservertoolneverrequireapprovalmode
+  - mcpservertoolspecifyapprovalmode
+  - purgeable
+  - mypy
+  - myregistry
+  - normalises
+  - ondisk
+  - openapitool
+  - posixpath
+  - projectconfig
+  - projectpkg
+  - protocolversionrecord
+  - Qdrant
+  - schedulerun
+  - servicekey
+  - Toolsets
+  - underscoped
+  - unparseable
+  - uvx
+  - Vnext
+  - VOICELIVE
+  - webp
+  # Doctor / next-step terms
+  - nextstep
+  - nextsteps
+  - agentkind
+  - undeployed
+  - unredacted
+  - UNKN
+  - inlines
+  - Remediations
+  - remediations
+  - uppercases
+  - parseable
+  - azd's
+  - deepseek
+  - ttfb
+  - Bhadauria
+  - ensurepip
+  # Live E2E (Tier 2) Go driver
+  - creack
+  - elive
+  - testdir
+  # Test infrastructure
+  - recordproxy
+  # Activity protocol local run (Playground)
+  - agentsplayground
+  - winget
+  - ECONNREFUSED
+  - wsae
+  - WSAECONNREFUSED
+  # Activity protocol / Teams bot terms
+  - armbotservice
+  - botservice
+  - Azurebot
+  - idempotently
+  - sideload
+  - sideloading
+  - microsoftteams
+  - upsert
+  - m365agentstoolkit
+  - atk
+  # Managed agent (Foundry PES / managed harness) terms
+  - azureml
+  - cognitiveservices
+  - fdp
+  - PES
+  # Prompt agent (graph, skills, connections, policies) terms
+  - frontmatter
+  - ghcp
+  - pctx
+  - raipolicies
+  - retarget
+  - stringifying
+  - subfolders
+  - ufeff
+  - warnf

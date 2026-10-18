@@ -1,0 +1,179 @@
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# Licensed under the MIT License.
+
+# cspell settings for miscellaneous files thats are not covered by other projects.
+# cspell root should be specified as the top-level repository directory.
+
+# Use global config
+import: cspell.global.yaml
+
+ignorePaths:
+    # Project changes here should be kept in-sync workflow cspell-misc.yml
+    - cli # uses its own cspell config
+    - ext/vscode # uses its own cspell config
+    - ext/devcontainer
+    - templates # uses its own cspell config
+
+    - eng # not required
+overrides:
+    - filename: ./SECURITY.md
+      words:
+          - MSRC
+          - msrc
+    - filename: ./docs/specs/metrics-audit/**
+      words:
+          - apphost
+          - appdetect
+          - azdext
+          - vsrpc
+          - Buildpacks
+          - devdeviceid
+          - appinit
+          - oneauth
+          - dashboarding
+          - Pseudonymized
+          - pseudonymized
+          - unhashed
+          - countif
+          - Angelos
+          - Entra
+          - CODEOWNERS
+          - weikanglim
+          - appservice
+          - resourcegroup
+          - whatif
+          - remotebuild
+          - firstrun
+          - dependson
+          - exegraph
+          - pseudonymizing
+          - pulumi
+    - filename: ./README.md
+      words:
+          - VSIX
+    - filename: ./docs/specs/perf-foundations/**
+      words:
+          - Alives
+          - appsettings
+          - appservice
+          - armdeploymentstacks
+          - azapi
+          - azsdk
+          - containerapps
+          - golangci
+          - goroutines
+          - httputil
+          - keepalives
+          - nilerr
+          - nolint
+          - remotebuild
+          - resourcegroup
+          - singleflight
+          - stdlib
+          - whatif
+    - filename: ./docs/specs/exegraph/**
+      words:
+          - stdlib
+          - dependson
+          - appsettings
+    - filename: schemas/**/azure.yaml.json
+      words:
+          - prodapi
+          - appservice
+          - containerapp
+          - springapp
+          - staticwebapp
+          - myapp
+          - azdev
+          - myimage
+          - azureai
+          - entra
+          - flexconsumption
+    - filename: .github/instructions/**/*.md
+      words:
+          - azdext
+          - Chdir
+          - exterrors
+          - userinfo
+    - filename: .github/skills/azd-grpc-contracts/**/*.md
+      words:
+          - azdext
+          - grpcserver
+          - oneofs
+          - protos
+          - Protos
+    - filename: docs/architecture/**/*.md
+      words:
+          - azapi
+          - appinsights
+          - Errorf
+          - grpcbroker
+          - Pseudonymized
+          - Thhmmss
+          - unhashed
+          - vsrpc
+    - filename: docs/reference/telemetry-data.md
+      words:
+          - azdext
+    - filename: docs/guides/**/*.md
+      words:
+          - azdext
+          - Entra
+          - errorlint
+          - Errorf
+          - gofmt
+          - golangci
+          - gosec
+          - jaegertracing
+          - mycommand
+          - myfeature
+          - mypackage
+          - pflag
+          - Pseudonymized
+          - staticcheck
+          - stdlib
+          - unhashed
+          - vsrpc
+    - filename: docs/reference/**/*.md
+      words:
+          - apphost
+          - appinit
+          - appservice
+          - buildpack
+          - Buildpacks
+          - centralus
+          - chinacloudapi
+          - containerapp
+          - dcount
+          - dependson
+          - devdeviceid
+          - Entra
+          - entraid
+          - Errorf
+          - exegraph
+          - firstrun
+          - javac
+          - livediagnostics
+          - microsoftonline
+          - oneauth
+          - postprovision
+          - preprovision
+          - postdeploy
+          - pseudonymized
+          - pulumi
+          - redirector
+          - remotebuild
+          - resourcegroup
+          - springapp
+          - startswith
+          - staticwebapp
+          - toreal
+          - tostring
+          - unhashed
+          - usgovcloudapi
+          - vsrpc
+          - whatif
+    - filename: ./agency.toml
+      words:
+          - mcps
+          - toolsets

@@ -6,104 +6,298 @@ package project
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
-	"github.com/azure/azure-dev/cli/azd/pkg/azure"
+	"github.com/azure/azure-dev/cli/azd/internal"
+	"github.com/azure/azure-dev/cli/azd/internal/mapper"
+	"github.com/azure/azure-dev/cli/azd/pkg/async"
+	"github.com/azure/azure-dev/cli/azd/pkg/azapi"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment"
-	"github.com/azure/azure-dev/cli/azd/pkg/environment/azdcontext"
 	"github.com/azure/azure-dev/cli/azd/pkg/tools"
-	"github.com/azure/azure-dev/cli/azd/pkg/tools/azcli"
 	"github.com/azure/azure-dev/cli/azd/pkg/tools/swa"
 )
 
-// TODO: Enhance for multi-environment support
-// https://github.com/Azure/azure-dev/issues/1152
+// DefaultStaticWebAppEnvironmentName is the identifier used by the Azure REST API
+// to refer to the production environment of a Static Web App.
+// This value is distinct from the --env flag accepted by the SWA CLI.
 const DefaultStaticWebAppEnvironmentName = "default"
 
+// swaCliProductionEnvironment is the value the SWA CLI recognizes for production
+// deployments. The SWA CLI treats "production" and "prod" as special values that
+// deploy to the production environment (by not setting DEPLOYMENT_ENVIRONMENT
+// internally). See: https://github.com/Azure/static-web-apps-cli/blob/main/src/cli/commands/deploy/deploy.ts
+const swaCliProductionEnvironment = "production"
+
 type staticWebAppTarget struct {
-	config *ServiceConfig
-	env    *environment.Environment
-	scope  *environment.DeploymentScope
-	cli    azcli.AzCli
-	swa    swa.SwaCli
+	env *environment.Environment
+	cli *azapi.AzureClient
+	swa *swa.Cli
 }
 
-func (at *staticWebAppTarget) RequiredExternalTools() []tools.ExternalTool {
-	return []tools.ExternalTool{at.cli, at.swa}
+// NewStaticWebAppTarget creates a new instance of the Static Web App target
+func NewStaticWebAppTarget(
+	env *environment.Environment,
+	azCli *azapi.AzureClient,
+	swaCli *swa.Cli,
+) ServiceTarget {
+	return &staticWebAppTarget{
+		env: env,
+		cli: azCli,
+		swa: swaCli,
+	}
 }
 
-func (at *staticWebAppTarget) Deploy(ctx context.Context, azdCtx *azdcontext.AzdContext, path string, progress chan<- string) (ServiceDeploymentResult, error) {
-	if strings.TrimSpace(at.config.OutputPath) == "" {
-		at.config.OutputPath = "build"
+// Gets the required external tools for the Static Web App target
+func (at *staticWebAppTarget) RequiredExternalTools(ctx context.Context, serviceConfig *ServiceConfig) []tools.ExternalTool {
+	return []tools.ExternalTool{at.swa}
+}
+
+// Initializes the static web app target
+func (at *staticWebAppTarget) Initialize(ctx context.Context, serviceConfig *ServiceConfig) error {
+	return nil
+}
+
+// Sets the build output that will be consumed for the deploy operation
+func (at *staticWebAppTarget) Package(
+	ctx context.Context,
+	serviceConfig *ServiceConfig,
+	serviceContext *ServiceContext,
+	progress *async.Progress[ServiceProgress],
+) (*ServicePackageResult, error) {
+	// Extract package result from service context
+	var packagePath string
+	var hasSwaConfig bool
+
+	// Check for SWA config
+	if _, found := serviceContext.Package.FindFirst(WithKind(ArtifactKindConfig)); found {
+		hasSwaConfig = true
+	}
+
+	// Get build output path
+	if artifact, found := serviceContext.Package.FindFirst(WithKind(ArtifactKindDirectory)); found {
+		packagePath = artifact.Location
+	}
+
+	if hasSwaConfig {
+		// The swa framework service does not set a packagePath during package b/c the output
+		// is governed by the swa-cli.config.json file.
+		return &ServicePackageResult{
+			Artifacts: ArtifactCollection{
+				{
+					Kind:         ArtifactKindConfig,
+					Location:     "saw-cli.config.json",
+					LocationKind: LocationKindLocal,
+				},
+			},
+		}, nil
+	}
+
+	// packagePath != "" -> This means swa framework service is not used to build/deploy and there
+	// is no a swa-cli.config.json file to govern the output.
+	// In this case, the serviceConfig.OutputPath (azure.yaml -> service -> dist) defines where is the output from
+	// the language framework service.
+	// If serviceConfig.OutputPath is not defined, azd should use the package path defined by the language framework
+	// service.
+
+	if strings.TrimSpace(serviceConfig.OutputPath) != "" {
+		packagePath = serviceConfig.OutputPath
+	}
+
+	return &ServicePackageResult{
+		Artifacts: ArtifactCollection{
+			{
+				Kind:         ArtifactKindDirectory,
+				Location:     packagePath,
+				LocationKind: LocationKindLocal,
+			},
+		},
+	}, nil
+}
+
+func usingSwaConfig(artifacts ArtifactCollection) bool {
+	// Check if swa-config artifact exists in the package result
+	_, found := artifacts.FindFirst(WithKind(ArtifactKindConfig))
+	return found
+}
+
+func (at *staticWebAppTarget) Publish(
+	ctx context.Context,
+	serviceConfig *ServiceConfig,
+	serviceContext *ServiceContext,
+	targetResource *environment.TargetResource,
+	progress *async.Progress[ServiceProgress],
+	publishOptions *PublishOptions,
+) (*ServicePublishResult, error) {
+	return &ServicePublishResult{}, nil
+}
+
+// Deploys the packaged build output using the SWA CLI
+func (at *staticWebAppTarget) Deploy(
+	ctx context.Context,
+	serviceConfig *ServiceConfig,
+	serviceContext *ServiceContext,
+	targetResource *environment.TargetResource,
+	progress *async.Progress[ServiceProgress],
+) (*ServiceDeployResult, error) {
+	if err := at.validateTargetResource(targetResource); err != nil {
+		return nil, fmt.Errorf("validating target resource: %w", err)
 	}
 
 	// Get the static webapp deployment token
-	progress <- "Retrieving deployment token"
-	deploymentToken, err := at.cli.GetStaticWebAppApiKey(ctx, at.env.GetSubscriptionId(), at.scope.ResourceGroupName(), at.scope.ResourceName())
-	if err != nil {
-		return ServiceDeploymentResult{}, fmt.Errorf("failed retrieving static web app deployment token: %w", err)
-	}
-
-	// SWA performs a zip & deploy of the specified output folder and publishes it to the configured environment
-	progress <- "Publishing deployment artifacts"
-	res, err := at.swa.Deploy(ctx,
-		at.config.Project.Path,
-		at.env.GetTenantId(),
-		at.env.GetSubscriptionId(),
-		at.scope.ResourceGroupName(),
-		at.scope.ResourceName(),
-		at.config.RelativePath,
-		at.config.OutputPath,
-		DefaultStaticWebAppEnvironmentName,
-		deploymentToken)
-
-	log.Println(res)
-
-	if err != nil {
-		return ServiceDeploymentResult{}, fmt.Errorf("failed deploying static web app: %w", err)
-	}
-
-	if err := at.verifyDeployment(ctx, progress); err != nil {
-		return ServiceDeploymentResult{}, err
-	}
-
-	progress <- "Fetching endpoints for static web app"
-	endpoints, err := at.Endpoints(ctx)
-	if err != nil {
-		return ServiceDeploymentResult{}, err
-	}
-
-	sdr := NewServiceDeploymentResult(
-		azure.StaticWebAppRID(at.env.GetSubscriptionId(), at.scope.ResourceGroupName(), at.scope.ResourceName()),
-		StaticWebAppTarget,
-		res,
-		endpoints,
+	progress.SetProgress(NewServiceProgress("Retrieving deployment token"))
+	deploymentToken, err := at.cli.GetStaticWebAppApiKey(
+		ctx,
+		targetResource.SubscriptionId(),
+		targetResource.ResourceGroupName(),
+		targetResource.ResourceName(),
 	)
+	if err != nil {
+		return nil, fmt.Errorf("failed retrieving static web app deployment token: %w", err)
+	}
 
-	return sdr, nil
+	// SWA performs a zip & deploy of the specified output folder and deploys it to the configured environment
+	progress.SetProgress(NewServiceProgress("swa cli deploy"))
+	dOptions := swa.DeployOptions{}
+	cwd := serviceConfig.Path()
+	if !usingSwaConfig(serviceContext.Package) {
+		// Extract package path from artifacts
+		var packagePath string
+		if artifact, found := serviceContext.Package.FindFirst(WithKind(ArtifactKindDirectory)); found {
+			packagePath = artifact.Location
+		}
+
+		if (packagePath == "" || cwd == packagePath) &&
+			cwd == serviceConfig.Project.Path {
+			return nil, &internal.ErrorWithSuggestion{
+				Err: fmt.Errorf("service source and output folder cannot be at the root: %s", serviceConfig.RelativePath),
+				Suggestion: strings.Join([]string{
+					"If your service is at the root of your project, next to azure.yaml, move your service to a subfolder.",
+					"Azure Static Web Apps does not support deploying from a folder that is for both the service" +
+						" source and the output folder.",
+					"Update the path of the service in azure.yaml to point to the subfolder and try deploying again.",
+				}, "\n"),
+			}
+		}
+
+		dOptions.AppFolderPath = serviceConfig.RelativePath
+		dOptions.OutputRelativeFolderPath = packagePath
+		cwd = serviceConfig.Project.Path
+	}
+	// Determine the environment to pass to the SWA CLI.
+	// When swa-cli.config.json is present, omit --env and let the SWA CLI resolve
+	// the environment from its own config (respecting the config file as source of truth).
+	// When no config file is present (opinionated mode), pass --env production to fix
+	// the BadRequest that occurred with the old --env default.
+	swaEnv := ""
+	if !usingSwaConfig(serviceContext.Package) {
+		swaEnv = swaCliProductionEnvironment
+	}
+
+	_, err = at.swa.Deploy(ctx,
+		cwd,
+		at.env.GetTenantId(),
+		targetResource.SubscriptionId(),
+		targetResource.ResourceGroupName(),
+		targetResource.ResourceName(),
+		swaEnv,
+		*deploymentToken,
+		dOptions,
+		at.env.Environ())
+
+	if err != nil {
+		return nil, fmt.Errorf("failed deploying static web app: %w", err)
+	}
+
+	progress.SetProgress(NewServiceProgress("Verifying deployment"))
+	if err := at.verifyDeployment(ctx, targetResource); err != nil {
+		return nil, err
+	}
+
+	progress.SetProgress(NewServiceProgress("Fetching endpoints for static web app"))
+	endpoints, err := at.Endpoints(ctx, serviceConfig, targetResource)
+	if err != nil {
+		return nil, err
+	}
+
+	artifacts := ArtifactCollection{}
+
+	// Add endpoints as artifacts
+	for _, endpoint := range endpoints {
+		if err := artifacts.Add(&Artifact{
+			Kind:         ArtifactKindEndpoint,
+			Location:     endpoint,
+			LocationKind: LocationKindRemote,
+		}); err != nil {
+			return nil, fmt.Errorf("failed to add endpoint artifact: %w", err)
+		}
+	}
+
+	// Add resource artifact
+	resourceArtifact := Artifact{}
+	if err := mapper.Convert(targetResource, &resourceArtifact); err == nil {
+		if err := artifacts.Add(&resourceArtifact); err != nil {
+			return nil, fmt.Errorf("failed to add resource artifact: %w", err)
+		}
+	}
+
+	return &ServiceDeployResult{
+		Artifacts: artifacts,
+	}, nil
 }
 
-func (at *staticWebAppTarget) Endpoints(ctx context.Context) ([]string, error) {
+// Gets the endpoints for the static web app
+func (at *staticWebAppTarget) Endpoints(
+	ctx context.Context,
+	serviceConfig *ServiceConfig,
+	targetResource *environment.TargetResource,
+) ([]string, error) {
 	// TODO: Enhance for multi-environment support
 	// https://github.com/Azure/azure-dev/issues/1152
-	envProps, err := at.cli.GetStaticWebAppEnvironmentProperties(ctx, at.env.GetSubscriptionId(), at.scope.ResourceGroupName(), at.scope.ResourceName(), DefaultStaticWebAppEnvironmentName)
-	if err != nil {
+	apiEnvName := DefaultStaticWebAppEnvironmentName
+	if envProps, err := at.cli.GetStaticWebAppEnvironmentProperties(
+		ctx,
+		targetResource.SubscriptionId(),
+		targetResource.ResourceGroupName(),
+		targetResource.ResourceName(),
+		apiEnvName,
+	); err != nil {
 		return nil, fmt.Errorf("fetching service properties: %w", err)
+	} else {
+		return []string{fmt.Sprintf("https://%s/", envProps.Hostname)}, nil
 	}
-
-	return []string{fmt.Sprintf("https://%s/", envProps.Hostname)}, nil
 }
 
-func (at *staticWebAppTarget) verifyDeployment(ctx context.Context, progress chan<- string) error {
-	verifyMsg := "Verifying deployment"
+func (at *staticWebAppTarget) validateTargetResource(
+	targetResource *environment.TargetResource,
+) error {
+	if !strings.EqualFold(targetResource.ResourceType(), string(azapi.AzureResourceTypeStaticWebSite)) {
+		return resourceTypeMismatchError(
+			targetResource.ResourceName(),
+			targetResource.ResourceType(),
+			azapi.AzureResourceTypeStaticWebSite,
+		)
+	}
+
+	return nil
+}
+
+func (at *staticWebAppTarget) verifyDeployment(
+	ctx context.Context,
+	targetResource *environment.TargetResource,
+) error {
 	retries := 0
 	const maxRetries = 10
+	apiEnvName := DefaultStaticWebAppEnvironmentName
 
 	for {
-		progress <- verifyMsg
-		envProps, err := at.cli.GetStaticWebAppEnvironmentProperties(ctx, at.env.GetSubscriptionId(), at.scope.ResourceGroupName(), at.scope.ResourceName(), DefaultStaticWebAppEnvironmentName)
+		envProps, err := at.cli.GetStaticWebAppEnvironmentProperties(
+			ctx,
+			targetResource.SubscriptionId(),
+			targetResource.ResourceGroupName(),
+			targetResource.ResourceName(),
+			apiEnvName,
+		)
 		if err != nil {
 			return fmt.Errorf("failed verifying static web app deployment: %w", err)
 		}
@@ -118,19 +312,12 @@ func (at *staticWebAppTarget) verifyDeployment(ctx context.Context, progress cha
 			return fmt.Errorf("failed verifying static web app deployment. Still in %s state", envProps.Status)
 		}
 
-		verifyMsg += "."
-		time.Sleep(5 * time.Second)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
 	}
 
 	return nil
-}
-
-func NewStaticWebAppTarget(config *ServiceConfig, env *environment.Environment, scope *environment.DeploymentScope, azCli azcli.AzCli, swaCli swa.SwaCli) ServiceTarget {
-	return &staticWebAppTarget{
-		config: config,
-		env:    env,
-		scope:  scope,
-		cli:    azCli,
-		swa:    swaCli,
-	}
 }

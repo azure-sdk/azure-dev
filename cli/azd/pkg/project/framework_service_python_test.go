@@ -1,0 +1,293 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package project
+
+import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/azure/azure-dev/cli/azd/pkg/async"
+	"github.com/azure/azure-dev/cli/azd/pkg/environment"
+	"github.com/azure/azure-dev/cli/azd/pkg/exec"
+	"github.com/azure/azure-dev/cli/azd/pkg/osutil"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools/python"
+	"github.com/azure/azure-dev/cli/azd/test/mocks"
+	"github.com/azure/azure-dev/cli/azd/test/ostest"
+)
+
+func Test_PythonProject_Restore(t *testing.T) {
+	var venvArgs exec.RunArgs
+	var pipArgs exec.RunArgs
+
+	mockContext := mocks.NewMockContext(t.Context())
+	mockContext.CommandRunner.MockToolInPath(pythonExe(), nil)
+	mockContext.CommandRunner.
+		When(func(args exec.RunArgs, command string) bool {
+			return strings.Contains(command, "-m venv")
+		}).
+		RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+			venvArgs = args
+			return exec.NewRunResult(0, "", ""), nil
+		})
+
+	mockContext.CommandRunner.
+		When(func(args exec.RunArgs, command string) bool {
+			return strings.Contains(command, "-m pip install")
+		}).
+		RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+			pipArgs = args
+			return exec.NewRunResult(0, "", ""), nil
+		})
+
+	env := environment.New("test")
+	pythonCli := python.NewCli(mockContext.CommandRunner)
+	serviceConfig := createTestServiceConfig("./src/api", AppServiceTarget, ServiceLanguagePython)
+
+	pythonProject := NewPythonProject(pythonCli, env)
+	result, err := logProgress(t, func(progess *async.Progress[ServiceProgress]) (*ServiceRestoreResult, error) {
+		serviceContext := NewServiceContext()
+		return pythonProject.Restore(*mockContext.Context, serviceConfig, serviceContext, progess)
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	require.Equal(t, pythonExe(), venvArgs.Cmd)
+	require.Equal(t,
+		[]string{"-m", "venv", "api_env"},
+		venvArgs.Args,
+	)
+
+	require.Len(t, pipArgs.Args, 2)
+
+	if runtime.GOOS == "windows" {
+		require.Equal(t, "api_env\\Scripts\\activate", pipArgs.Args[0])
+		require.Equal(t, "py -m pip install -r requirements.txt", pipArgs.Args[1])
+	} else {
+		require.Equal(t, ". api_env/bin/activate", pipArgs.Args[0])
+		require.Equal(t, "python3 -m pip install -r requirements.txt", pipArgs.Args[1])
+	}
+
+	require.Equal(t, "requirements.txt", result.Artifacts[0].Metadata["requirements"])
+}
+
+func Test_PythonProject_Restore_PyprojectToml(t *testing.T) {
+	tempDir := t.TempDir()
+	ostest.Chdir(t, tempDir)
+
+	var pipArgs exec.RunArgs
+
+	mockContext := mocks.NewMockContext(t.Context())
+	mockContext.CommandRunner.MockToolInPath(pythonExe(), nil)
+	mockContext.CommandRunner.
+		When(func(args exec.RunArgs, command string) bool {
+			return strings.Contains(command, "-m venv")
+		}).
+		RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+			return exec.NewRunResult(0, "", ""), nil
+		})
+
+	mockContext.CommandRunner.
+		When(func(args exec.RunArgs, command string) bool {
+			return strings.Contains(command, "-m pip install")
+		}).
+		RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+			pipArgs = args
+			return exec.NewRunResult(0, "", ""), nil
+		})
+
+	env := environment.New("test")
+	pythonCli := python.NewCli(mockContext.CommandRunner)
+	serviceConfig := createTestServiceConfig("./src/api", AppServiceTarget, ServiceLanguagePython)
+
+	// Create pyproject.toml in the service path
+	err := os.MkdirAll(serviceConfig.Path(), osutil.PermissionDirectory)
+	require.NoError(t, err)
+	err = os.WriteFile(
+		filepath.Join(serviceConfig.Path(), "pyproject.toml"),
+		[]byte("[project]\nname = \"myapp\"\n"),
+		osutil.PermissionFile,
+	)
+	require.NoError(t, err)
+
+	pythonProject := NewPythonProject(pythonCli, env)
+	result, err := logProgress(t, func(progress *async.Progress[ServiceProgress]) (*ServiceRestoreResult, error) {
+		serviceContext := NewServiceContext()
+		return pythonProject.Restore(*mockContext.Context, serviceConfig, serviceContext, progress)
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	// Verify pip install . is called (not pip install -r requirements.txt)
+	require.Len(t, pipArgs.Args, 2)
+	if runtime.GOOS == "windows" {
+		require.Equal(t, "py -m pip install .", pipArgs.Args[1])
+	} else {
+		require.Equal(t, "python3 -m pip install .", pipArgs.Args[1])
+	}
+
+	require.Equal(t, "pyproject.toml", result.Artifacts[0].Metadata["requirements"])
+}
+
+func Test_PythonProject_Restore_PyprojectTomlPriority(t *testing.T) {
+	tempDir := t.TempDir()
+	ostest.Chdir(t, tempDir)
+
+	var pipArgs exec.RunArgs
+
+	mockContext := mocks.NewMockContext(t.Context())
+	mockContext.CommandRunner.MockToolInPath(pythonExe(), nil)
+	mockContext.CommandRunner.
+		When(func(args exec.RunArgs, command string) bool {
+			return strings.Contains(command, "-m venv")
+		}).
+		RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+			return exec.NewRunResult(0, "", ""), nil
+		})
+
+	mockContext.CommandRunner.
+		When(func(args exec.RunArgs, command string) bool {
+			return strings.Contains(command, "-m pip install")
+		}).
+		RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+			pipArgs = args
+			return exec.NewRunResult(0, "", ""), nil
+		})
+
+	env := environment.New("test")
+	pythonCli := python.NewCli(mockContext.CommandRunner)
+	serviceConfig := createTestServiceConfig("./src/api", AppServiceTarget, ServiceLanguagePython)
+
+	// Create both files — pyproject.toml should take priority
+	err := os.MkdirAll(serviceConfig.Path(), osutil.PermissionDirectory)
+	require.NoError(t, err)
+	err = os.WriteFile(
+		filepath.Join(serviceConfig.Path(), "requirements.txt"),
+		[]byte("flask==2.3.2\n"),
+		osutil.PermissionFile,
+	)
+	require.NoError(t, err)
+	err = os.WriteFile(
+		filepath.Join(serviceConfig.Path(), "pyproject.toml"),
+		[]byte("[project]\nname = \"myapp\"\n"),
+		osutil.PermissionFile,
+	)
+	require.NoError(t, err)
+
+	pythonProject := NewPythonProject(pythonCli, env)
+	result, err := logProgress(t, func(progress *async.Progress[ServiceProgress]) (*ServiceRestoreResult, error) {
+		serviceContext := NewServiceContext()
+		return pythonProject.Restore(*mockContext.Context, serviceConfig, serviceContext, progress)
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	// Verify pyproject.toml takes priority: pip install . (not -r requirements.txt)
+	require.Len(t, pipArgs.Args, 2)
+	if runtime.GOOS == "windows" {
+		require.Equal(t, "py -m pip install .", pipArgs.Args[1])
+	} else {
+		require.Equal(t, "python3 -m pip install .", pipArgs.Args[1])
+	}
+
+	require.Equal(t, "pyproject.toml", result.Artifacts[0].Metadata["requirements"])
+}
+
+func Test_PythonProject_Build(t *testing.T) {
+	mockContext := mocks.NewMockContext(t.Context())
+
+	env := environment.New("test")
+	pythonCli := python.NewCli(mockContext.CommandRunner)
+	serviceConfig := createTestServiceConfig("./src/api", AppServiceTarget, ServiceLanguagePython)
+
+	pythonProject := NewPythonProject(pythonCli, env)
+	result, err := logProgress(
+		t, func(progress *async.Progress[ServiceProgress]) (*ServiceBuildResult, error) {
+			return pythonProject.Build(*mockContext.Context, serviceConfig, nil, progress)
+		},
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+}
+
+func Test_PythonProject_Package(t *testing.T) {
+	tempDir := t.TempDir()
+	ostest.Chdir(t, tempDir)
+	mockContext := mocks.NewMockContext(t.Context())
+
+	env := environment.New("test")
+	pythonCli := python.NewCli(mockContext.CommandRunner)
+	serviceConfig := createTestServiceConfig("./src/api", AppServiceTarget, ServiceLanguagePython)
+	err := os.MkdirAll(serviceConfig.Path(), osutil.PermissionDirectory)
+	require.NoError(t, err)
+	err = os.WriteFile(filepath.Join(serviceConfig.Path(), "requirements.txt"), nil, osutil.PermissionFile)
+	require.NoError(t, err)
+
+	pythonProject := NewPythonProject(pythonCli, env)
+
+	result, err := logProgress(t, func(progress *async.Progress[ServiceProgress]) (*ServicePackageResult, error) {
+		serviceContext := NewServiceContext()
+		serviceContext.Build = ArtifactCollection{
+			{
+				Kind:         ArtifactKindDirectory,
+				Location:     serviceConfig.Path(),
+				LocationKind: LocationKindLocal,
+				Metadata: map[string]string{
+					"framework": "python",
+				},
+			},
+		}
+		return pythonProject.Package(
+			*mockContext.Context,
+			serviceConfig,
+			serviceContext,
+			progress,
+		)
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotEmpty(t, result.Artifacts[0].Location)
+
+	_, err = os.Stat(result.Artifacts[0].Location)
+	require.NoError(t, err)
+}
+
+func pythonExe() string {
+	if runtime.GOOS == "windows" {
+		return "py" // https://peps.python.org/pep-0397
+	} else {
+		return "python3"
+	}
+}
+
+func Test_pythonProject_Requirements(t *testing.T) {
+	p := NewPythonProject(python.NewCli(exec.NewCommandRunner(nil)), environment.NewWithValues("test", nil))
+	reqs := p.Requirements()
+	assert.False(t, reqs.Package.RequireRestore)
+	assert.False(t, reqs.Package.RequireBuild)
+}
+
+func Test_pythonProject_RequiredExternalTools(t *testing.T) {
+	cli := python.NewCli(exec.NewCommandRunner(nil))
+	p := NewPythonProject(cli, environment.NewWithValues("test", nil))
+	tools := p.RequiredExternalTools(t.Context(), &ServiceConfig{})
+	require.Len(t, tools, 1)
+	assert.Equal(t, cli, tools[0])
+}
+
+func Test_pythonProject_Initialize(t *testing.T) {
+	p := NewPythonProject(python.NewCli(exec.NewCommandRunner(nil)), environment.NewWithValues("test", nil))
+	err := p.Initialize(t.Context(), &ServiceConfig{})
+	require.NoError(t, err)
+}

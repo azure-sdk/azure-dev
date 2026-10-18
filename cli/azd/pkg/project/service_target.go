@@ -5,60 +5,218 @@ package project
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
 
-	"github.com/azure/azure-dev/cli/azd/pkg/environment/azdcontext"
+	"github.com/azure/azure-dev/cli/azd/internal/mapper"
+	"github.com/azure/azure-dev/cli/azd/pkg/async"
+	"github.com/azure/azure-dev/cli/azd/pkg/azapi"
+	"github.com/azure/azure-dev/cli/azd/pkg/environment"
 	"github.com/azure/azure-dev/cli/azd/pkg/tools"
 )
 
 type ServiceTargetKind string
 
 const (
-	AppServiceTarget    ServiceTargetKind = "appservice"
-	ContainerAppTarget  ServiceTargetKind = "containerapp"
-	AzureFunctionTarget ServiceTargetKind = "function"
-	StaticWebAppTarget  ServiceTargetKind = "staticwebapp"
+	NonSpecifiedTarget       ServiceTargetKind = ""
+	AppServiceTarget         ServiceTargetKind = "appservice"
+	ContainerAppTarget       ServiceTargetKind = "containerapp"
+	AzureFunctionTarget      ServiceTargetKind = "function"
+	StaticWebAppTarget       ServiceTargetKind = "staticwebapp"
+	SpringAppTarget          ServiceTargetKind = "springapp"
+	AksTarget                ServiceTargetKind = "aks"
+	DotNetContainerAppTarget ServiceTargetKind = "containerapp-dotnet"
+	AiEndpointTarget         ServiceTargetKind = "ai.endpoint"
 )
 
-type ServiceDeploymentResult struct {
-	// Related Azure resource ID
-	TargetResourceId string            `json:"targetResourceId"`
-	Kind             ServiceTargetKind `json:"kind"`
-	Details          interface{}       `json:"details"`
-	Endpoints        []string          `json:"endpoints"`
+// DotNetContainerAppTarget is intentionally omitted because it is only used internally when
+// containerizing .NET projects and is not a valid service host value in azure.yaml.
+// SpringAppTarget is intentionally omitted because support has been removed.
+var builtInServiceTargetKinds = []ServiceTargetKind{
+	AppServiceTarget,
+	ContainerAppTarget,
+	AzureFunctionTarget,
+	StaticWebAppTarget,
+	AksTarget,
+	AiEndpointTarget,
+}
+
+func builtInServiceTargetNames() []string {
+	names := make([]string, 0, len(builtInServiceTargetKinds))
+	for _, kind := range builtInServiceTargetKinds {
+		names = append(names, string(kind))
+	}
+
+	return names
+}
+
+// BuiltInServiceTargetKinds returns the slice of built-in service target kinds
+func BuiltInServiceTargetKinds() []ServiceTargetKind {
+	return builtInServiceTargetKinds
+}
+
+// RequiresContainer returns true if the service target runs a container image.
+func (stk ServiceTargetKind) RequiresContainer() bool {
+	switch stk {
+	case ContainerAppTarget,
+		AksTarget:
+		return true
+	}
+
+	return false
+}
+
+func parseServiceHost(kind ServiceTargetKind) (ServiceTargetKind, error) {
+	// Allow any non-empty service target kind through.
+	// Built-in kinds are handled by the hardcoded service target constructors in container.go
+	// External kinds are handled by extensions that register via gRPC
+	// If a kind is not supported, resolution will fail later with a clear error message
+	if string(kind) != "" {
+		return kind, nil
+	}
+
+	return ServiceTargetKind(""), fmt.Errorf("host cannot be empty")
 }
 
 type ServiceTarget interface {
+	// Initializes the service target for the specified service configuration.
+	// This allows service targets to opt-in to service lifecycle events
+	Initialize(ctx context.Context, serviceConfig *ServiceConfig) error
+
 	// RequiredExternalTools are the tools needed to run the deploy operation for this
 	// target.
-	RequiredExternalTools() []tools.ExternalTool
-	// Deploy deploys the given deployment artifact to the target resource
-	Deploy(ctx context.Context, azdCtx *azdcontext.AzdContext, path string, progress chan<- string) (ServiceDeploymentResult, error)
+	RequiredExternalTools(ctx context.Context, serviceConfig *ServiceConfig) []tools.ExternalTool
+
+	// Package prepares artifacts for deployment
+	Package(
+		ctx context.Context,
+		serviceConfig *ServiceConfig,
+		serviceContext *ServiceContext,
+		progress *async.Progress[ServiceProgress],
+	) (*ServicePackageResult, error)
+
+	// Publish pushes the prepared artifacts without performing deployment.
+	Publish(
+		ctx context.Context,
+		serviceConfig *ServiceConfig,
+		serviceContext *ServiceContext,
+		targetResource *environment.TargetResource,
+		progress *async.Progress[ServiceProgress],
+		publishOptions *PublishOptions,
+	) (*ServicePublishResult, error)
+
+	// Deploys the given deployment artifact to the target resource
+	Deploy(
+		ctx context.Context,
+		serviceConfig *ServiceConfig,
+		serviceContext *ServiceContext,
+		targetResource *environment.TargetResource,
+		progress *async.Progress[ServiceProgress],
+	) (*ServiceDeployResult, error)
+
 	// Endpoints gets the endpoints a service exposes.
-	Endpoints(ctx context.Context) ([]string, error)
+	Endpoints(
+		ctx context.Context,
+		serviceConfig *ServiceConfig,
+		targetResource *environment.TargetResource,
+	) ([]string, error)
 }
 
-func NewServiceDeploymentResult(relatedResourceId string, kind ServiceTargetKind, rawResult string, endpoints []string) ServiceDeploymentResult {
-	returnValue := ServiceDeploymentResult{
-		TargetResourceId: relatedResourceId,
-		Kind:             kind,
-		Endpoints:        endpoints,
-	}
+// ErrDeployPreviewNotSupported is returned when a service target cannot preview a deployment.
+var ErrDeployPreviewNotSupported = errors.New("deployment preview is not supported")
 
-	// If the result can be parsed as JSON, store it as such.
-	// Otherwise, just preserve in raw (string) format.
-	var detailsObj interface{}
-	err := json.Unmarshal([]byte(rawResult), &detailsObj)
-	if err != nil {
-		returnValue.Details = rawResult
-	} else {
-		returnValue.Details = detailsObj
-	}
-
-	return returnValue
+// ServiceTargetPreviewer is optionally implemented by service targets that can preview a deployment
+// without packaging, publishing, deploying, or running lifecycle hooks.
+type ServiceTargetPreviewer interface {
+	Preview(ctx context.Context, serviceConfig *ServiceConfig) (*ServiceDeployPreviewResult, error)
 }
 
-var _ ServiceTarget = &appServiceTarget{}
-var _ ServiceTarget = &containerAppTarget{}
-var _ ServiceTarget = &functionAppTarget{}
-var _ ServiceTarget = &staticWebAppTarget{}
+// ServiceTargetResourcePreviewer is optionally implemented by built-in service targets that need
+// the resolved Azure resource to describe a deployment preview. Extension service targets continue
+// to use ServiceTargetPreviewer.
+type ServiceTargetResourcePreviewer interface {
+	PreviewWithTarget(
+		ctx context.Context,
+		serviceConfig *ServiceConfig,
+		targetResource *environment.TargetResource,
+	) (*ServiceDeployPreviewResult, error)
+}
+
+func resourceTypeMismatchError(
+	resourceName string,
+	resourceType string,
+	expectedResourceType azapi.AzureResourceType,
+) error {
+	return fmt.Errorf(
+		"resource '%s' with type '%s' does not match expected resource type '%s'",
+		resourceName,
+		resourceType,
+		string(expectedResourceType),
+	)
+}
+
+// IgnoreFile returns the ignore file associated with the service target.
+// Returns an empty string if no ignore file is used.
+func (st ServiceTargetKind) IgnoreFile() string {
+	switch st {
+	case AppServiceTarget:
+		return ".webappignore"
+	case AzureFunctionTarget:
+		return ".funcignore"
+	default:
+		return ""
+	}
+}
+
+// SupportsDelayedProvisioning returns true if the service target supports provisioning
+// resources during deployment when they don't exist yet.
+//
+// Deprecated: Use TargetResourceResolver interface for custom resource resolution instead.
+// Container Apps supports delayed provisioning but implements TargetResourceResolver to
+// provide better error messages when resources are missing in non-bicep deployment scenarios.
+// Retained only for AKS backward compatibility.
+func (st ServiceTargetKind) SupportsDelayedProvisioning() bool {
+	return st == AksTarget
+}
+
+func checkResourceType(resource *environment.TargetResource, expectedResourceType azapi.AzureResourceType) error {
+	if !strings.EqualFold(resource.ResourceType(), string(expectedResourceType)) {
+		return resourceTypeMismatchError(
+			resource.ResourceName(),
+			resource.ResourceType(),
+			expectedResourceType,
+		)
+	}
+
+	return nil
+}
+
+// newDeployArtifacts builds the artifact collection reported by a successful deployment: one
+// remote endpoint artifact per endpoint, followed by the target resource itself. A target resource
+// that cannot be mapped to an artifact is omitted rather than failing the deployment.
+func newDeployArtifacts(
+	endpoints []string,
+	targetResource *environment.TargetResource,
+) (ArtifactCollection, error) {
+	artifacts := ArtifactCollection{}
+
+	for _, endpoint := range endpoints {
+		if err := artifacts.Add(&Artifact{
+			Kind:         ArtifactKindEndpoint,
+			Location:     endpoint,
+			LocationKind: LocationKindRemote,
+		}); err != nil {
+			return nil, fmt.Errorf("failed to add endpoint artifact: %w", err)
+		}
+	}
+
+	var resourceArtifact *Artifact
+	if err := mapper.Convert(targetResource, &resourceArtifact); err == nil {
+		if err := artifacts.Add(resourceArtifact); err != nil {
+			return nil, fmt.Errorf("failed to add resource artifact: %w", err)
+		}
+	}
+
+	return artifacts, nil
+}

@@ -1,0 +1,1131 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package cmd
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"slices"
+	"strings"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/MakeNowJust/heredoc/v2"
+	"github.com/azure/azure-dev/cli/azd/cmd/actions"
+	"github.com/azure/azure-dev/cli/azd/cmd/middleware"
+	"github.com/azure/azure-dev/cli/azd/internal"
+	"github.com/azure/azure-dev/cli/azd/internal/agent"
+	"github.com/azure/azure-dev/cli/azd/internal/agent/consent"
+	agentcopilot "github.com/azure/azure-dev/cli/azd/internal/agent/copilot"
+	"github.com/azure/azure-dev/cli/azd/internal/agent/security"
+	"github.com/azure/azure-dev/cli/azd/internal/cmd"
+	"github.com/azure/azure-dev/cli/azd/internal/grpcserver"
+	"github.com/azure/azure-dev/cli/azd/internal/repository"
+	"github.com/azure/azure-dev/cli/azd/internal/terminal"
+	"github.com/azure/azure-dev/cli/azd/pkg/account"
+	"github.com/azure/azure-dev/cli/azd/pkg/ai"
+	"github.com/azure/azure-dev/cli/azd/pkg/alpha"
+	"github.com/azure/azure-dev/cli/azd/pkg/armmsi"
+	"github.com/azure/azure-dev/cli/azd/pkg/auth"
+	"github.com/azure/azure-dev/cli/azd/pkg/azapi"
+	"github.com/azure/azure-dev/cli/azd/pkg/azd"
+	"github.com/azure/azure-dev/cli/azd/pkg/azdext"
+	"github.com/azure/azure-dev/cli/azd/pkg/azsdk"
+	"github.com/azure/azure-dev/cli/azd/pkg/azsdk/storage"
+	"github.com/azure/azure-dev/cli/azd/pkg/cloud"
+	"github.com/azure/azure-dev/cli/azd/pkg/config"
+	"github.com/azure/azure-dev/cli/azd/pkg/containerapps"
+	"github.com/azure/azure-dev/cli/azd/pkg/containerregistry"
+	"github.com/azure/azure-dev/cli/azd/pkg/devcenter"
+	"github.com/azure/azure-dev/cli/azd/pkg/entraid"
+	"github.com/azure/azure-dev/cli/azd/pkg/environment"
+	"github.com/azure/azure-dev/cli/azd/pkg/environment/azdcontext"
+	"github.com/azure/azure-dev/cli/azd/pkg/errorhandler"
+	"github.com/azure/azure-dev/cli/azd/pkg/exec"
+	"github.com/azure/azure-dev/cli/azd/pkg/extensions"
+	"github.com/azure/azure-dev/cli/azd/pkg/helm"
+	"github.com/azure/azure-dev/cli/azd/pkg/infra"
+	"github.com/azure/azure-dev/cli/azd/pkg/infra/provisioning"
+	"github.com/azure/azure-dev/cli/azd/pkg/input"
+	"github.com/azure/azure-dev/cli/azd/pkg/ioc"
+	"github.com/azure/azure-dev/cli/azd/pkg/keyvault"
+	"github.com/azure/azure-dev/cli/azd/pkg/kubelogin"
+	"github.com/azure/azure-dev/cli/azd/pkg/kustomize"
+	"github.com/azure/azure-dev/cli/azd/pkg/lazy"
+	"github.com/azure/azure-dev/cli/azd/pkg/output"
+	"github.com/azure/azure-dev/cli/azd/pkg/pipeline"
+	"github.com/azure/azure-dev/cli/azd/pkg/platform"
+	"github.com/azure/azure-dev/cli/azd/pkg/project"
+	"github.com/azure/azure-dev/cli/azd/pkg/prompt"
+	"github.com/azure/azure-dev/cli/azd/pkg/state"
+	"github.com/azure/azure-dev/cli/azd/pkg/templates"
+	"github.com/azure/azure-dev/cli/azd/pkg/tool"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools/az"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools/bash"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools/docker"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools/dotnet"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools/git"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools/github"
+	golangtools "github.com/azure/azure-dev/cli/azd/pkg/tools/golang"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools/javac"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools/kubectl"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools/language"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools/maven"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools/node"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools/powershell"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools/python"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools/swa"
+	"github.com/azure/azure-dev/cli/azd/pkg/workflow"
+	"github.com/mattn/go-colorable"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+)
+
+// Registers a transient action initializer for the specified action name
+// This returns a function that when called resolves the action
+// This is to ensure pre-conditions are met for composite actions like 'up'
+// This finds the action for a named instance and casts it to the correct type for injection
+func registerAction[T actions.Action](container *ioc.NestedContainer, actionName string) {
+	container.MustRegisterTransient(func(serviceLocator ioc.ServiceLocator) (T, error) {
+		return resolveAction[T](serviceLocator, actionName)
+	})
+}
+
+// Resolves the action instance for the specified action name
+// This finds the action for a named instance and casts it to the correct type for injection
+func resolveAction[T actions.Action](serviceLocator ioc.ServiceLocator, actionName string) (T, error) {
+	var zero T
+	var action actions.Action
+	err := serviceLocator.ResolveNamed(actionName, &action)
+	if err != nil {
+		return zero, err
+	}
+
+	instance, ok := action.(T)
+	if !ok {
+		return zero, fmt.Errorf("failed converting action to '%T'", zero)
+	}
+
+	return instance, nil
+}
+
+// newCommandConsole lets you create a new command console targeted at a given instance of cobra.Command.
+// Useful if you need to ensure you use the same streams and console formatting as a command, from the
+// outside.
+func newCommandConsole(
+	rootOptions *internal.GlobalCommandOptions,
+	formatter output.Formatter,
+	cmd *cobra.Command,
+) input.Console {
+	writer := cmd.OutOrStdout()
+	// When using JSON formatting, we want to ensure we always write messages from the console to stderr.
+	if formatter != nil && formatter.Kind() == output.JsonFormat {
+		writer = cmd.ErrOrStderr()
+	}
+
+	if os.Getenv("NO_COLOR") != "" {
+		writer = colorable.NewNonColorable(writer)
+	}
+
+	isTerminal := cmd.OutOrStdout() == os.Stdout &&
+		cmd.InOrStdin() == os.Stdin && terminal.IsTerminal(os.Stdout.Fd(), os.Stdin.Fd())
+
+	// Check for external prompt configuration from environment variables
+	var externalPromptCfg *input.ExternalPromptConfiguration
+	if endpoint := os.Getenv("AZD_UI_PROMPT_ENDPOINT"); endpoint != "" {
+		if key := os.Getenv("AZD_UI_PROMPT_KEY"); key != "" {
+			externalPromptCfg = &input.ExternalPromptConfiguration{
+				Endpoint:       endpoint,
+				Key:            key,
+				Transporter:    http.DefaultClient,
+				NoPromptDialog: os.Getenv("AZD_UI_NO_PROMPT_DIALOG") != "",
+			}
+		}
+	}
+
+	return input.NewConsole(rootOptions.NoPrompt, isTerminal, input.Writers{Output: writer}, input.ConsoleHandles{
+		Stdin:  cmd.InOrStdin(),
+		Stdout: cmd.OutOrStdout(),
+		Stderr: cmd.ErrOrStderr(),
+	}, formatter, externalPromptCfg)
+}
+
+// Registers common Azd dependencies
+func registerCommonDependencies(container *ioc.NestedContainer) {
+	// Core bootstrapping registrations
+	ioc.RegisterInstance(container, container)
+	container.MustRegisterSingleton(NewCobraBuilder)
+
+	// Standard Registrations
+	container.MustRegisterTransient(output.GetCommandFormatter)
+
+	container.MustRegisterScoped(newCommandConsole)
+
+	container.MustRegisterSingleton(
+		func(console input.Console, rootOptions *internal.GlobalCommandOptions) exec.CommandRunner {
+			return exec.NewCommandRunner(
+				&exec.RunnerOptions{
+					Stdin:        console.Handles().Stdin,
+					Stdout:       console.Handles().Stdout,
+					Stderr:       console.Handles().Stderr,
+					DebugLogging: rootOptions.EnableDebugLogging,
+				})
+		},
+	)
+
+	client := createHttpClient()
+	ioc.RegisterInstance[policy.Transporter](container, client)
+	ioc.RegisterInstance[auth.HttpClient](container, client)
+
+	// Auth
+	container.MustRegisterSingleton(auth.NewMultiTenantCredentialProvider)
+	container.MustRegisterSingleton(func(mgr *auth.Manager) CredentialProviderFn {
+		return mgr.CredentialForCurrentUser
+	})
+
+	container.MustRegisterSingleton(func(console input.Console) io.Writer {
+		writer := console.Handles().Stdout
+
+		if os.Getenv("NO_COLOR") != "" {
+			writer = colorable.NewNonColorable(writer)
+		}
+
+		return writer
+	})
+
+	container.MustRegisterScoped(func(
+		ctx context.Context,
+		cmd *cobra.Command,
+		globalOptions *internal.GlobalCommandOptions,
+	) internal.EnvFlag {
+		// The env flag `-e, --environment` is available on most azd commands but not all.
+		// This is typically used to override the default environment and is used for bootstrapping other components
+		// such as the azd environment.
+		// If the flag is not available, don't panic, just return an empty string which will then allow for our default
+		// semantics to follow.
+		envValue, err := cmd.Flags().GetString(internal.EnvironmentNameFlagName)
+		if err != nil {
+			log.Printf("'%s' command did not include --environment so using default environment instead.", cmd.CommandPath())
+			envValue = ""
+		}
+
+		// For extension commands (DisableFlagParsing=true), cobra never parses -e so
+		// cmd.Flags().GetString always returns "". Fall back to the value that was
+		// pre-parsed in ParseGlobalFlags before the command tree was built.
+		if envValue == "" && globalOptions.EnvironmentName != "" {
+			envValue = globalOptions.EnvironmentName
+		}
+
+		if envValue == "" {
+			// If no explicit environment flag was set, but one was provided
+			// in the context, use that instead.
+			// This is used in workflow execution (in `up`) to influence the environment used.
+			if envFlag, ok := ctx.Value(envFlagCtxKey).(internal.EnvFlag); ok {
+				return envFlag
+			}
+		}
+
+		return internal.EnvFlag{EnvironmentName: envValue}
+	})
+
+	container.MustRegisterSingleton(func(cmd *cobra.Command) CmdAnnotations {
+		return cmd.Annotations
+	})
+
+	container.MustRegisterSingleton(func(cmd *cobra.Command) CmdCalledAs {
+		return CmdCalledAs(cmd.CalledAs())
+	})
+
+	// Azd Context
+	//
+	// Using Transient for the scope here is important - the underlying container will cache
+	// a failed result (nil), preventing Lazy from retrying and basically _never_ being
+	// updatable. We have explicit flows where the project isn't defined until after some
+	// code has run, which means each time we inject the AzdContext it MUST run
+	// GetValue() _each_ time.
+	container.MustRegisterTransient(func(lazyAzdContext *lazy.Lazy[*azdcontext.AzdContext]) (*azdcontext.AzdContext, error) {
+		return lazyAzdContext.GetValue()
+	})
+
+	// Lazy loads the Azd context after the azure.yaml file becomes available
+	container.MustRegisterScoped(func() *lazy.Lazy[*azdcontext.AzdContext] {
+		return lazy.NewLazy(azdcontext.NewAzdContext)
+	})
+
+	// Register an initialized environment based on the specified environment flag, or the default environment.
+	// Note that referencing an *environment.Environment in a command automatically triggers a UI prompt if the
+	// environment is uninitialized or a default environment doesn't yet exist.
+	container.MustRegisterScoped(
+		func(ctx context.Context,
+			azdContext *azdcontext.AzdContext,
+			envManager environment.Manager,
+			lazyEnv *lazy.Lazy[*environment.Environment],
+			envFlags internal.EnvFlag,
+		) (*environment.Environment, error) {
+			if azdContext == nil {
+				return nil, azdcontext.ErrNoProject
+			}
+
+			environmentName := envFlags.EnvironmentName
+			var err error
+
+			env, err := envManager.LoadOrInitInteractive(ctx, environmentName)
+			if err != nil {
+				return nil, fmt.Errorf("loading environment: %w", err)
+			}
+
+			// Reset lazy env value after loading or creating environment
+			// This allows any previous lazy instances (such as hooks) to now point to the same instance
+			lazyEnv.SetValue(env)
+
+			return env, nil
+		},
+	)
+	container.MustRegisterScoped(func(lazyEnvManager *lazy.Lazy[environment.Manager]) environment.EnvironmentResolver {
+		return func(ctx context.Context) (*environment.Environment, error) {
+			azdCtx, err := azdcontext.NewAzdContext()
+			if err != nil {
+				return nil, err
+			}
+			defaultEnv, err := azdCtx.GetDefaultEnvironmentName()
+			if err != nil {
+				return nil, err
+			}
+
+			// We need to lazy load the environment manager since it depends on azd context
+			envManager, err := lazyEnvManager.GetValue()
+			if err != nil {
+				return nil, err
+			}
+
+			return envManager.Get(ctx, defaultEnv)
+		}
+	})
+
+	container.MustRegisterSingleton(environment.NewLocalFileDataStore)
+	container.MustRegisterSingleton(environment.NewManager)
+
+	container.MustRegisterSingleton(func(serviceLocator ioc.ServiceLocator) *lazy.Lazy[environment.LocalDataStore] {
+		return lazy.NewLazy(func() (environment.LocalDataStore, error) {
+			var localDataStore environment.LocalDataStore
+			err := serviceLocator.Resolve(&localDataStore)
+			if err != nil {
+				return nil, err
+			}
+
+			return localDataStore, nil
+		})
+	})
+
+	// Environment manager depends on azd context
+	container.MustRegisterSingleton(
+		func(serviceLocator ioc.ServiceLocator,
+			azdContext *lazy.Lazy[*azdcontext.AzdContext]) *lazy.Lazy[environment.Manager] {
+			return lazy.NewLazy(func() (environment.Manager, error) {
+				if _, err := azdContext.GetValue(); err != nil {
+					return nil, err
+				}
+
+				var envManager environment.Manager
+				err := serviceLocator.Resolve(&envManager)
+				if err != nil {
+					return nil, err
+				}
+
+				return envManager, nil
+			})
+		},
+	)
+
+	container.MustRegisterSingleton(func(
+		lazyProjectConfig *lazy.Lazy[*project.ProjectConfig],
+		userConfigManager config.UserConfigManager,
+	) (*state.RemoteConfig, error) {
+		var remoteStateConfig *state.RemoteConfig
+
+		userConfig, err := userConfigManager.Load()
+		if err != nil {
+			return nil, fmt.Errorf("loading user config: %w", err)
+		}
+
+		// The project config may not be available yet
+		// Ex) Within init phase of fingerprinting
+		projectConfig, _ := lazyProjectConfig.GetValue()
+
+		// Lookup remote state config in the following precedence:
+		// 1. Project azure.yaml
+		// 2. User configuration
+		if projectConfig != nil && projectConfig.State != nil && projectConfig.State.Remote != nil {
+			remoteStateConfig = projectConfig.State.Remote
+		} else {
+			if _, err := userConfig.GetSection("state.remote", &remoteStateConfig); err != nil {
+				return nil, fmt.Errorf("getting remote state config: %w", err)
+			}
+		}
+
+		return remoteStateConfig, nil
+	})
+
+	// Lazy loads an existing environment, erroring out if not available
+	// One can repeatedly call GetValue to wait until the environment is available.
+	container.MustRegisterScoped(
+		func(
+			ctx context.Context,
+			lazyEnvManager *lazy.Lazy[environment.Manager],
+			lazyAzdContext *lazy.Lazy[*azdcontext.AzdContext],
+			envFlags internal.EnvFlag,
+		) *lazy.Lazy[*environment.Environment] {
+			return lazy.NewLazy(func() (*environment.Environment, error) {
+				azdCtx, err := lazyAzdContext.GetValue()
+				if err != nil {
+					return nil, err
+				}
+
+				environmentName := envFlags.EnvironmentName
+				if environmentName == "" {
+					environmentName, err = azdCtx.GetDefaultEnvironmentName()
+					if err != nil {
+						return nil, err
+					}
+				}
+
+				envManager, err := lazyEnvManager.GetValue()
+				if err != nil {
+					return nil, err
+				}
+
+				env, err := envManager.Get(ctx, environmentName)
+				if err != nil {
+					return nil, err
+				}
+
+				return env, err
+			})
+		},
+	)
+
+	// Project Config
+	container.MustRegisterSingleton(
+		func(lazyConfig *lazy.Lazy[*project.ProjectConfig]) (*project.ProjectConfig, error) {
+			return lazyConfig.GetValue()
+		},
+	)
+
+	// Lazy loads the project config from the Azd Context when it becomes available
+	container.MustRegisterSingleton(
+		func(
+			ctx context.Context,
+			lazyAzdContext *lazy.Lazy[*azdcontext.AzdContext],
+			alphaManager *alpha.FeatureManager,
+		) *lazy.Lazy[*project.ProjectConfig] {
+			return lazy.NewLazy(func() (*project.ProjectConfig, error) {
+				azdCtx, err := lazyAzdContext.GetValue()
+				if err != nil {
+					return nil, err
+				}
+
+				projectConfig, err := project.Load(ctx, azdCtx.ProjectPath())
+				if err != nil {
+					return nil, err
+				}
+
+				featureCustomLanguage := alpha.MustFeatureKey("language.custom")
+				for sName, sConfig := range projectConfig.ServiceConfigs() {
+					if sConfig.Language == project.ServiceLanguageCustom &&
+						!alphaManager.IsEnabled(featureCustomLanguage) {
+						return nil, fmt.Errorf(
+							"%s service is using language 'custom' (alpha) but it is not enabled.\n"+
+								"Please enable it using the command: \"%s\"",
+							sName,
+							alpha.GetEnableCommand(featureCustomLanguage))
+					}
+				}
+
+				return projectConfig, nil
+			})
+		},
+	)
+
+	container.MustRegisterSingleton(func(
+		ctx context.Context,
+		userConfigManager config.UserConfigManager,
+		lazyProjectConfig *lazy.Lazy[*project.ProjectConfig],
+		lazyAzdContext *lazy.Lazy[*azdcontext.AzdContext],
+		lazyLocalEnvStore *lazy.Lazy[environment.LocalDataStore],
+	) (*cloud.Cloud, error) {
+
+		// Precedence for cloud configuration:
+		// 1. Local environment config (.azure/<environment>/config.json)
+		// 2. Project config (azure.yaml)
+		// 3. User config (~/.azure/config.json)
+		// Default if no cloud configured: Azure Public Cloud
+
+		validClouds := fmt.Sprintf(
+			"Valid cloud names are '%s', '%s', '%s'.",
+			cloud.AzurePublicName,
+			cloud.AzureChinaCloudName,
+			cloud.AzureUSGovernmentName,
+		)
+
+		// Local Environment Configuration (.azure/<environment>/config.json)
+		localEnvStore, _ := lazyLocalEnvStore.GetValue()
+		if azdCtx, err := lazyAzdContext.GetValue(); err == nil {
+			if azdCtx != nil && localEnvStore != nil {
+				if defaultEnvName, err := azdCtx.GetDefaultEnvironmentName(); err == nil {
+					if env, err := localEnvStore.Get(ctx, defaultEnvName); err == nil {
+						if cloudConfigurationNode, exists := env.Config.Get(cloud.ConfigPath); exists {
+							if value, err := cloud.ParseCloudConfig(cloudConfigurationNode); err == nil {
+								cloudConfig, err := cloud.NewCloud(value)
+								if err == nil {
+									return cloudConfig, nil
+								}
+
+								return nil, &internal.ErrorWithSuggestion{
+									Err: err,
+									Suggestion: fmt.Sprintf(
+										"Set the cloud configuration by editing the 'cloud' node in the config.json "+
+											"file for the %s environment\n%s",
+										defaultEnvName,
+										validClouds,
+									),
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Project Configuration (azure.yaml)
+		projConfig, err := lazyProjectConfig.GetValue()
+		if err == nil && projConfig != nil && projConfig.Cloud != nil {
+			if value, err := cloud.ParseCloudConfig(projConfig.Cloud); err == nil {
+				if cloudConfig, err := cloud.ParseCloudConfig(value); err == nil {
+					if cloud, err := cloud.NewCloud(cloudConfig); err == nil {
+						return cloud, nil
+					} else {
+						return nil, &internal.ErrorWithSuggestion{
+							Err: err,
+							//nolint:lll
+							Suggestion: fmt.Sprintf("Set the cloud configuration by editing the 'cloud' node in the project YAML file\n%s", validClouds),
+						}
+					}
+				}
+			}
+		}
+
+		// User Configuration (~/.azure/config.json)
+		if azdConfig, err := userConfigManager.Load(); err == nil {
+			if cloudConfigNode, exists := azdConfig.Get(cloud.ConfigPath); exists {
+				if value, err := cloud.ParseCloudConfig(cloudConfigNode); err == nil {
+					if cloud, err := cloud.NewCloud(value); err == nil {
+						return cloud, nil
+					} else {
+						return nil, &internal.ErrorWithSuggestion{
+							Err: err,
+							Suggestion: fmt.Sprintf(
+								"Set the cloud configuration using 'azd config set cloud.name <name>'.\n%s", validClouds),
+						}
+					}
+				}
+			}
+		}
+
+		return cloud.NewCloud(&cloud.Config{Name: cloud.AzurePublicName})
+	})
+
+	container.MustRegisterSingleton(func(transport policy.Transporter, cloud *cloud.Cloud) *azcore.ClientOptions {
+		return &azcore.ClientOptions{
+			Cloud: cloud.Configuration,
+			PerCallPolicies: []policy.Policy{
+				azsdk.NewMsCorrelationPolicy(),
+				azsdk.NewUserAgentPolicy(internal.UserAgent()),
+			},
+			Transport: transport,
+		}
+	})
+
+	container.MustRegisterSingleton(func(transport policy.Transporter, cloud *cloud.Cloud) *arm.ClientOptions {
+		return &arm.ClientOptions{
+			ClientOptions: azcore.ClientOptions{
+				Cloud: cloud.Configuration,
+				Logging: policy.LogOptions{
+					AllowedHeaders: []string{azsdk.MsCorrelationIdHeader},
+				},
+				PerCallPolicies: []policy.Policy{
+					azsdk.NewMsCorrelationPolicy(),
+					azsdk.NewUserAgentPolicy(internal.UserAgent()),
+				},
+				Transport: transport,
+			},
+		}
+	})
+
+	container.MustRegisterSingleton(templates.NewTemplateManager)
+	container.MustRegisterSingleton(templates.NewSourceManager)
+	container.MustRegisterScoped(project.NewResourceManager)
+	container.MustRegisterScoped(func(serviceLocator ioc.ServiceLocator) *lazy.Lazy[project.ResourceManager] {
+		return lazy.NewLazy(func() (project.ResourceManager, error) {
+			var resourceManager project.ResourceManager
+			err := serviceLocator.Resolve(&resourceManager)
+
+			return resourceManager, err
+		})
+	})
+	container.MustRegisterScoped(project.NewProjectManager)
+	// Currently caches manifest across command executions
+	container.MustRegisterSingleton(project.NewDotNetImporter)
+	container.MustRegisterScoped(project.NewImportManager)
+	container.MustRegisterScoped(project.NewServiceManager)
+
+	// Unified up action: the exegraph-backed `azd up` entry point that
+	// collapses provision + package + publish + deploy (and project command
+	// hooks) into a single DAG.
+	container.MustRegisterScoped(cmd.NewUpGraphAction)
+
+	// Even though the service manager is scoped based on its use of environment we can still
+	// register its internal cache as a singleton to ensure operation caching is consistent across all instances
+	container.MustRegisterSingleton(func() project.ServiceOperationCache {
+		return project.ServiceOperationCache{}
+	})
+
+	container.MustRegisterScoped(func(serviceLocator ioc.ServiceLocator) *lazy.Lazy[project.ServiceManager] {
+		return lazy.NewLazy(func() (project.ServiceManager, error) {
+			var serviceManager project.ServiceManager
+			err := serviceLocator.Resolve(&serviceManager)
+
+			return serviceManager, err
+		})
+	})
+
+	// Copilot agent components
+	container.MustRegisterSingleton(agentcopilot.NewSessionConfigBuilder)
+	container.MustRegisterSingleton(agentcopilot.NewCopilotCLI)
+	container.MustRegisterSingleton(func(cli *agentcopilot.CopilotCLI) *agentcopilot.CopilotClientManager {
+		return agentcopilot.NewCopilotClientManager(nil, cli)
+	})
+	container.MustRegisterScoped(agent.NewCopilotAgentFactory)
+	container.MustRegisterScoped(consent.NewConsentManager)
+
+	// Agent security manager
+	container.MustRegisterSingleton(func() (*security.Manager, error) {
+		// Use current working directory as security root
+		cwd, err := os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get current working directory: %w", err)
+		}
+		return security.NewManager(cwd)
+	})
+
+	container.MustRegisterSingleton(func(
+		console input.Console,
+		gitCli *git.Cli,
+		dotnetCli *dotnet.Cli,
+		features *alpha.FeatureManager,
+		lazyEnvManager *lazy.Lazy[environment.Manager],
+		transport policy.Transporter,
+	) *repository.Initializer {
+		return repository.NewInitializerWithRepositoryStatusChecker(
+			console,
+			gitCli,
+			dotnetCli,
+			features,
+			lazyEnvManager,
+			repository.NewGitHubRepositoryStatusChecker(transport),
+		)
+	})
+	container.MustRegisterSingleton(alpha.NewFeaturesManager)
+	container.MustRegisterSingleton(config.NewUserConfigManager)
+	container.MustRegisterSingleton(config.NewManager)
+	container.MustRegisterSingleton(config.NewFileConfigManager)
+	container.MustRegisterScoped(func() (auth.ExternalAuthConfiguration, error) {
+		return buildExternalAuthConfiguration(
+			os.Getenv("AZD_AUTH_ENDPOINT"),
+			os.Getenv("AZD_AUTH_KEY"),
+			os.Getenv("AZD_AUTH_CERT"),
+		)
+	})
+	container.MustRegisterSingleton(func() auth.UserAgent {
+		return auth.UserAgent(internal.UserAgent())
+	})
+	container.MustRegisterScoped(auth.NewManager)
+	container.MustRegisterSingleton(azapi.NewUserProfileService)
+	container.MustRegisterScoped(func(authManager *auth.Manager) middleware.CurrentUserAuthManager {
+		return authManager
+	})
+	container.MustRegisterSingleton(account.NewSubscriptionsService)
+	container.MustRegisterSingleton(account.NewManager)
+	container.MustRegisterSingleton(account.NewSubscriptionsManager)
+	container.MustRegisterSingleton(account.NewSubscriptionCredentialProvider)
+	container.MustRegisterSingleton(azapi.NewManagedClustersService)
+	container.MustRegisterSingleton(entraid.NewEntraIdService)
+	container.MustRegisterSingleton(armmsi.NewArmMsiService)
+	container.MustRegisterSingleton(azapi.NewContainerRegistryService)
+	container.MustRegisterSingleton(azapi.NewResourceTypeLocationService)
+	container.MustRegisterSingleton(containerapps.NewContainerAppService)
+	container.MustRegisterSingleton(containerregistry.NewRemoteBuildManager)
+	container.MustRegisterSingleton(keyvault.NewKeyVaultService)
+	container.MustRegisterSingleton(storage.NewFileShareService)
+	container.MustRegisterSingleton(ai.NewAiModelService)
+	container.MustRegisterSingleton(func(serviceLocator ioc.ServiceLocator) *errorhandler.ErrorHandlerPipeline {
+		resolver := func(name string) (errorhandler.ErrorHandler, error) {
+			var handler errorhandler.ErrorHandler
+			if err := serviceLocator.ResolveNamed(name, &handler); err != nil {
+				return nil, err
+			}
+			return handler, nil
+		}
+		return errorhandler.NewErrorHandlerPipeline(resolver)
+	})
+	container.MustRegisterNamedSingleton("resourceNotAvailableHandler",
+		func(
+			locationService *azapi.ResourceTypeLocationService,
+			lazyEnv *lazy.Lazy[*environment.Environment],
+		) errorhandler.ErrorHandler {
+			return errorhandler.NewResourceNotAvailableHandler(
+				locationService,
+				&lazyEnvironmentResolver{lazyEnv: lazyEnv},
+			)
+		},
+	)
+
+	container.MustRegisterScoped(project.NewContainerHelper)
+	container.MustRegisterScoped(func(serviceLocator ioc.ServiceLocator) *lazy.Lazy[*project.ContainerHelper] {
+		return lazy.NewLazy(func() (*project.ContainerHelper, error) {
+			var containerHelper *project.ContainerHelper
+			err := serviceLocator.Resolve(&containerHelper)
+
+			return containerHelper, err
+		})
+	})
+
+	container.MustRegisterSingleton(func(subManager *account.SubscriptionsManager) account.SubscriptionResolver {
+		return subManager
+	})
+
+	// Tools
+	container.MustRegisterSingleton(azapi.NewAzureClient)
+
+	// Tools
+	container.MustRegisterSingleton(azapi.NewResourceService)
+	container.MustRegisterSingleton(azapi.NewPermissionsService)
+	container.MustRegisterSingleton(docker.NewCli)
+	container.MustRegisterSingleton(dotnet.NewCli)
+	container.MustRegisterSingleton(git.NewCli)
+	container.MustRegisterSingleton(github.NewGitHubCli)
+	container.MustRegisterSingleton(golangtools.NewCli)
+	container.MustRegisterSingleton(javac.NewCli)
+	container.MustRegisterSingleton(kubectl.NewCli)
+	container.MustRegisterSingleton(maven.NewCli)
+	container.MustRegisterSingleton(kubelogin.NewCli)
+	container.MustRegisterSingleton(helm.NewCli)
+	container.MustRegisterSingleton(kustomize.NewCli)
+	container.MustRegisterSingleton(node.NewCli)
+	container.MustRegisterSingleton(python.NewCli)
+	container.MustRegisterSingleton(swa.NewCli)
+	container.MustRegisterScoped(ai.NewPythonBridge)
+	container.MustRegisterScoped(project.NewAiHelper)
+	container.MustRegisterSingleton(az.NewCli)
+
+	// Provisioning
+	container.MustRegisterSingleton(func(
+		serviceLocator ioc.ServiceLocator,
+		featureManager *alpha.FeatureManager,
+	) (azapi.DeploymentService, error) {
+		deploymentsType := azapi.DeploymentTypeStandard
+
+		if featureManager.IsEnabled(azapi.FeatureDeploymentStacks) {
+			deploymentsType = azapi.DeploymentTypeStacks
+		}
+
+		var deployments azapi.DeploymentService
+		if err := serviceLocator.ResolveNamed(string(deploymentsType), &deployments); err != nil {
+			return nil, err
+		}
+
+		return deployments, nil
+	})
+
+	container.MustRegisterSingleton(azapi.NewResourceService)
+
+	// Register Deployment Services
+	deploymentServiceTypes := map[azapi.DeploymentType]any{
+		azapi.DeploymentTypeStandard: func(deploymentService *azapi.StandardDeployments) azapi.DeploymentService {
+			return deploymentService
+		},
+		azapi.DeploymentTypeStacks: func(deploymentService *azapi.StackDeployments) azapi.DeploymentService {
+			return deploymentService
+		},
+	}
+
+	for deploymentType, constructor := range deploymentServiceTypes {
+		container.MustRegisterNamedSingleton(string(deploymentType), constructor)
+	}
+
+	container.MustRegisterSingleton(azapi.NewStandardDeployments)
+	container.MustRegisterSingleton(azapi.NewStackDeployments)
+	container.MustRegisterScoped(infra.NewDeploymentManager)
+	container.MustRegisterSingleton(infra.NewAzureResourceManager)
+	container.MustRegisterScoped(provisioning.NewManager)
+	container.MustRegisterScoped(provisioning.NewPrincipalIdProvider)
+	container.MustRegisterScoped(prompt.NewDefaultPrompter)
+
+	// Other
+	container.MustRegisterSingleton(createClock)
+
+	// Service Targets
+	serviceTargetMap := map[project.ServiceTargetKind]any{
+		project.NonSpecifiedTarget:       project.NewAppServiceTarget,
+		project.AppServiceTarget:         project.NewAppServiceTarget,
+		project.AzureFunctionTarget:      project.NewFunctionAppTarget,
+		project.ContainerAppTarget:       project.NewContainerAppTarget,
+		project.StaticWebAppTarget:       project.NewStaticWebAppTarget,
+		project.AksTarget:                project.NewAksTarget,
+		project.SpringAppTarget:          project.NewSpringAppTarget,
+		project.DotNetContainerAppTarget: project.NewDotNetContainerAppTarget,
+		project.AiEndpointTarget:         project.NewAiEndpointTarget,
+	}
+
+	for target, constructor := range serviceTargetMap {
+		container.MustRegisterNamedScoped(string(target), constructor)
+	}
+
+	// Languages
+	frameworkServiceMap := map[project.ServiceLanguageKind]any{
+		project.ServiceLanguageNone:       project.NewNoOpProject,
+		project.ServiceLanguageDotNet:     project.NewDotNetProject,
+		project.ServiceLanguageCsharp:     project.NewDotNetProject,
+		project.ServiceLanguageFsharp:     project.NewDotNetProject,
+		project.ServiceLanguagePython:     project.NewPythonProject,
+		project.ServiceLanguageJavaScript: project.NewNodeProject,
+		project.ServiceLanguageTypeScript: project.NewNodeProject,
+		project.ServiceLanguageJava:       project.NewMavenProject,
+		project.ServiceLanguageGo:         project.NewGoProject,
+		project.ServiceLanguageDocker:     project.NewDockerProject,
+		project.ServiceLanguageSwa:        project.NewSwaProject,
+		project.ServiceLanguageCustom:     project.NewCustomProject,
+	}
+
+	for language, constructor := range frameworkServiceMap {
+		container.MustRegisterNamedScoped(string(language), constructor)
+	}
+
+	container.MustRegisterNamedScoped(string(project.ServiceLanguageDocker), project.NewDockerProjectAsFrameworkService)
+
+	// Hook executors registered by language name (transient — fresh per hook invocation).
+	// The HooksRunner resolves these via serviceLocator.ResolveNamed().
+	hookExecutorMap := map[language.HookKind]any{
+		language.HookKindBash:       bash.NewExecutor,
+		language.HookKindPowerShell: powershell.NewExecutor,
+		language.HookKindPython:     language.NewPythonExecutor,
+		language.HookKindJavaScript: language.NewJavaScriptExecutor,
+		language.HookKindTypeScript: language.NewTypeScriptExecutor,
+		language.HookKindDotNet:     language.NewDotNetExecutor,
+	}
+
+	for kind, constructor := range hookExecutorMap {
+		container.MustRegisterNamedTransient(string(kind), constructor)
+	}
+
+	// Pipelines
+	container.MustRegisterScoped(pipeline.NewPipelineManager)
+	container.MustRegisterSingleton(func(flags *pipelineConfigFlags) *pipeline.PipelineManagerArgs {
+		return &flags.PipelineManagerArgs
+	})
+
+	pipelineProviderMap := map[string]any{
+		"github-ci":  pipeline.NewGitHubCiProvider,
+		"github-scm": pipeline.NewGitHubScmProvider,
+		"azdo-ci":    pipeline.NewAzdoCiProvider,
+		"azdo-scm":   pipeline.NewAzdoScmProvider,
+	}
+
+	for provider, constructor := range pipelineProviderMap {
+		container.MustRegisterNamedScoped(string(provider), constructor)
+	}
+
+	// Platform configuration
+	container.MustRegisterSingleton(func(lazyConfig *lazy.Lazy[*platform.Config]) (*platform.Config, error) {
+		return lazyConfig.GetValue()
+	})
+
+	container.MustRegisterSingleton(func(
+		lazyProjectConfig *lazy.Lazy[*project.ProjectConfig],
+		userConfigManager config.UserConfigManager,
+	) *lazy.Lazy[*platform.Config] {
+		return lazy.NewLazy(func() (*platform.Config, error) {
+			// First check `azure.yaml` for platform configuration section
+			projectConfig, err := lazyProjectConfig.GetValue()
+			if err == nil && projectConfig != nil && projectConfig.Platform != nil {
+				return projectConfig.Platform, nil
+			}
+
+			// Fallback to global user configuration
+			config, err := userConfigManager.Load()
+			if err != nil {
+				return nil, fmt.Errorf("loading user config: %w", err)
+			}
+
+			var platformConfig *platform.Config
+			_, err = config.GetSection("platform", &platformConfig)
+			if err != nil {
+				return nil, fmt.Errorf("getting platform config: %w", err)
+			}
+
+			// If we still don't have a platform configuration, check the OS environment
+			// We check the OS environment instead of AZD environment because the global platform configuration
+			// cannot be known at this time in the azd bootstrapping process.
+			if platformConfig == nil {
+				if envPlatformType, has := os.LookupEnv(environment.PlatformTypeEnvVarName); has {
+					platformConfig = &platform.Config{
+						Type: platform.PlatformKind(envPlatformType),
+					}
+				}
+			}
+
+			if platformConfig == nil || platformConfig.Type == "" {
+				return nil, platform.ErrPlatformConfigNotFound
+			}
+
+			// Validate platform type
+			supportedPlatformKinds := []string{
+				string(devcenter.PlatformKindDevCenter),
+				string(azd.PlatformKindDefault),
+			}
+			if !slices.Contains(supportedPlatformKinds, string(platformConfig.Type)) {
+				return nil, fmt.Errorf(
+					heredoc.Doc(`platform type '%s' is not supported. Valid values are '%s'.
+				Run %s to set or %s to reset. (%w)`),
+					platformConfig.Type,
+					strings.Join(supportedPlatformKinds, ","),
+					output.WithBackticks("azd config set platform.type <type>"),
+					output.WithBackticks("azd config unset platform.type"),
+					platform.ErrPlatformNotSupported,
+				)
+			}
+
+			return platformConfig, nil
+		})
+	})
+
+	// Platform Providers
+	platformProviderMap := map[platform.PlatformKind]any{
+		azd.PlatformKindDefault:         azd.NewDefaultPlatform,
+		devcenter.PlatformKindDevCenter: devcenter.NewPlatform,
+	}
+
+	for provider, constructor := range platformProviderMap {
+		platformName := fmt.Sprintf("%s-platform", provider)
+		container.MustRegisterNamedSingleton(platformName, constructor)
+	}
+
+	container.MustRegisterSingleton(func() workflow.AzdCommandRunner {
+		return &workflowCmdAdapter{
+			newCommand: func() *cobra.Command {
+				return newRootCmdWithoutRegistration(container)
+			},
+			globalArgs: extractGlobalArgs(),
+		}
+	})
+	container.MustRegisterSingleton(workflow.NewRunner)
+
+	container.MustRegisterScoped(func(authManager *auth.Manager) prompt.AuthManager {
+		return authManager
+	})
+	container.MustRegisterSingleton(func(subscriptionManager *account.SubscriptionsManager) prompt.SubscriptionManager {
+		return subscriptionManager
+	})
+	container.MustRegisterSingleton(func(resourceService *azapi.ResourceService) prompt.ResourceService {
+		return resourceService
+	})
+
+	container.MustRegisterScoped(prompt.NewPromptService)
+
+	// Extensions
+	container.MustRegisterSingleton(extensions.NewManager)
+	container.MustRegisterSingleton(extensions.NewSourceManager)
+	container.MustRegisterSingleton(extensions.NewRunner)
+	container.MustRegisterScoped(middleware.NewExtensionActivator)
+	container.MustRegisterSingleton(func(serviceLocator ioc.ServiceLocator) *lazy.Lazy[*extensions.Runner] {
+		return lazy.NewLazy(func() (*extensions.Runner, error) {
+			var runner *extensions.Runner
+			err := serviceLocator.Resolve(&runner)
+			return runner, err
+		})
+	})
+
+	// Tool management
+	container.MustRegisterSingleton(func(commandRunner exec.CommandRunner) *tool.PlatformDetector {
+		return tool.NewPlatformDetector(commandRunner)
+	})
+	container.MustRegisterSingleton(func(commandRunner exec.CommandRunner) tool.Detector {
+		return tool.NewDetector(commandRunner)
+	})
+	container.MustRegisterSingleton(func(
+		commandRunner exec.CommandRunner,
+		platformDetector *tool.PlatformDetector,
+		detector tool.Detector,
+	) tool.Installer {
+		return tool.NewInstaller(commandRunner, platformDetector, detector)
+	})
+	container.MustRegisterSingleton(func(
+		configManager config.UserConfigManager,
+		detector tool.Detector,
+		commandRunner exec.CommandRunner,
+	) *tool.UpdateChecker {
+		providers := tool.SelectVersionProviders(
+			tool.BuiltInTools(),
+			commandRunner,
+			tryNewRegistryCacheManager(),
+			http.DefaultClient,
+		)
+		return tool.NewUpdateChecker(
+			configManager, detector,
+			config.GetUserConfigDir, providers,
+		)
+	})
+	container.MustRegisterSingleton(func(
+		detector tool.Detector,
+		installer tool.Installer,
+		updateChecker *tool.UpdateChecker,
+	) *tool.Manager {
+		return tool.NewManager(detector, installer, updateChecker)
+	})
+
+	// gRPC Server
+	container.MustRegisterScoped(grpcserver.NewServer)
+	container.MustRegisterScoped(grpcserver.NewProjectService)
+	container.MustRegisterScoped(grpcserver.NewEnvironmentService)
+	container.MustRegisterScoped(grpcserver.NewPromptService)
+	container.MustRegisterScoped(grpcserver.NewDeploymentService)
+	container.MustRegisterScoped(grpcserver.NewEventService)
+	container.MustRegisterScoped(grpcserver.NewContainerService)
+	container.MustRegisterSingleton(grpcserver.NewAccountService)
+	container.MustRegisterSingleton(grpcserver.NewUserConfigService)
+	container.MustRegisterSingleton(grpcserver.NewComposeService)
+	container.MustRegisterSingleton(grpcserver.NewWorkflowService)
+	container.MustRegisterSingleton(grpcserver.NewExtensionService)
+	container.MustRegisterSingleton(grpcserver.NewServiceTargetService)
+	container.MustRegisterSingleton(grpcserver.NewFrameworkService)
+	container.MustRegisterSingleton(grpcserver.NewProvisioningService)
+	container.MustRegisterSingleton(grpcserver.NewValidationService)
+	// Bind the concrete ValidationService to both the gRPC interface and
+	// the dispatcher interface so DI resolves both from the same instance.
+	container.MustRegisterSingleton(
+		func(svc *grpcserver.ValidationService) azdext.ValidationServiceServer {
+			return svc
+		},
+	)
+	container.MustRegisterSingleton(
+		func(svc *grpcserver.ValidationService) provisioning.ValidationCheckDispatcher {
+			return svc
+		},
+	)
+	container.MustRegisterSingleton(grpcserver.NewAiModelService)
+	container.MustRegisterScoped(grpcserver.NewCopilotService)
+	container.MustRegisterSingleton(grpcserver.NewTelemetryService)
+
+	// Required for nested actions called from composite actions like 'up'
+	registerAction[*cmd.ProvisionAction](container, "azd-provision-action")
+	registerAction[*downAction](container, "azd-down-action")
+	registerAction[*configShowAction](container, "azd-config-show-action")
+}
+
+// workflowCmdAdapter adapts a cobra command to the workflow.AzdCommandRunner interface.
+// On each ExecuteContext call, a fresh cobra command tree is built via the newCommand factory
+// to avoid stale context or command state from previous executions.
+// See: https://github.com/Azure/azure-dev/issues/6530
+type workflowCmdAdapter struct {
+	newCommand func() *cobra.Command
+	globalArgs []string
+}
+
+// ExecuteContext implements workflow.AzdCommandRunner.
+// It rebuilds the cobra command tree on each call to ensure a clean slate,
+// preventing "context canceled" errors from stale command state during retries.
+// Global flags from the original process invocation are appended to the step args
+// so that persistent flags (e.g., --trace-log-file) are properly parsed and visible
+// to telemetry middleware on the fresh command tree.
+func (w *workflowCmdAdapter) ExecuteContext(ctx context.Context, args []string) error {
+	// Cancel the child context when the step completes so that any event handlers
+	// registered during this step (e.g. by service target Initialize methods) are
+	// marked as expired and cleaned up on the next RaiseEvent call.
+	childCtx, cancel := context.WithCancel(middleware.WithChildAction(ctx))
+	defer cancel()
+
+	rootCmd := w.newCommand()
+	// Always set args explicitly to prevent Cobra from falling back to os.Args[1:].
+	// Cobra uses os.Args when cmd.args is nil (but not when it's an empty slice).
+	mergedArgs := append(slices.Clone(args), w.globalArgs...)
+	if mergedArgs == nil {
+		mergedArgs = []string{}
+	}
+	rootCmd.SetArgs(mergedArgs)
+	return rootCmd.ExecuteContext(childCtx)
+}
+
+// extractGlobalArgs extracts global flag arguments from the process command line.
+// It parses os.Args against the global flag set and returns only the flags that were
+// explicitly set by the user, formatted as command-line arguments.
+//
+// The "environment" flag is intentionally excluded: workflow steps may define their own
+// -e/--environment (e.g. `azd: env set KEY VALUE -e env1`), and appending the parent's
+// --environment would override the step-level value. Environment propagation to workflow
+// steps is handled by the globalOptions DI fallback in the EnvFlag resolver instead.
+func extractGlobalArgs() []string {
+	globalFlagSet := CreateGlobalFlagSet()
+	globalFlagSet.SetOutput(io.Discard)
+	globalFlagSet.ParseErrorsAllowlist = pflag.ParseErrorsAllowlist{UnknownFlags: true}
+	_ = globalFlagSet.Parse(os.Args[1:])
+
+	var result []string
+	globalFlagSet.VisitAll(func(f *pflag.Flag) {
+		if f.Changed && f.Name != internal.EnvironmentNameFlagName {
+			// Use --flag=value syntax to avoid ambiguity. The two-arg form (--flag value)
+			// doesn't work for boolean flags, where the value is treated as a positional arg.
+			result = append(result, fmt.Sprintf("--%s=%s", f.Name, f.Value.String()))
+		}
+	})
+	return result
+}
+
+// ArmClientInitializer is a function definition for all Azure SDK ARM Client
+type ArmClientInitializer[T comparable] func(
+	subscriptionId string,
+	credentials azcore.TokenCredential,
+	armClientOptions *arm.ClientOptions,
+) (T, error)
+
+// lazyEnvironmentResolver adapts *lazy.Lazy[*environment.Environment]
+// to the errorhandler.EnvironmentResolver interface.
+type lazyEnvironmentResolver struct {
+	lazyEnv *lazy.Lazy[*environment.Environment]
+}
+
+func (r *lazyEnvironmentResolver) Getenv(key string) string {
+	env, err := r.lazyEnv.GetValue()
+	if err != nil {
+		return ""
+	}
+	return env.Getenv(key)
+}
+
+// tryNewRegistryCacheManager attempts to create an extension registry
+// cache manager, returning nil on failure. This avoids blocking the
+// UpdateChecker when the extension registry is unavailable.
+func tryNewRegistryCacheManager() *extensions.RegistryCacheManager {
+	mgr, err := extensions.NewRegistryCacheManager()
+	if err != nil {
+		log.Printf(
+			"tool: skipping extension registry provider: %v", err,
+		)
+		return nil
+	}
+	return mgr
+}

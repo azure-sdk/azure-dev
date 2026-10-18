@@ -5,70 +5,39 @@ package azureutil
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"regexp"
 
-	"github.com/azure/azure-dev/cli/azd/pkg/tools/azcli"
+	"github.com/azure/azure-dev/cli/azd/pkg/auth"
+	"github.com/azure/azure-dev/cli/azd/pkg/azapi"
 )
 
-// GetCurrentPrincipalId returns the object id of the current
-// principal authenticated with the CLI
-// (via ad sp signed-in-user), falling back to extracting the
-// `oid` claim from an access token a principal can not be
-// obtained in this way.
-func GetCurrentPrincipalId(ctx context.Context) (string, error) {
-	azCli := azcli.GetAzCli(ctx)
-	principalId, err := azCli.GetSignedInUserId(ctx)
+// GetCurrentPrincipalId returns a non-empty object ID of the current principal authenticated with the CLI.
+// It prefers the oid claim from an ARM access token, falling back to Graph /me when acquiring the
+// token fails or when the token does not include a usable oid.
+func GetCurrentPrincipalId(ctx context.Context, userProfile *azapi.UserProfileService, tenantId string) (string, error) {
+	token, err := userProfile.GetAccessToken(ctx, tenantId)
 	if err == nil {
-		return principalId, nil
+		oid, oidErr := auth.GetOidFromAccessToken(token.AccessToken)
+		if oidErr == nil {
+			return oid, nil
+		}
+
+		err = fmt.Errorf("getting oid from token: %w", oidErr)
+	} else {
+		err = fmt.Errorf("getting access token: %w", err)
 	}
 
-	token, err := azCli.GetAccessToken(ctx)
-	if err != nil {
-		return "", fmt.Errorf("getting access token: %w", err)
+	principalId, graphErr := userProfile.GetSignedInUserId(ctx, tenantId)
+	if graphErr == nil {
+		if principalId != "" {
+			return principalId, nil
+		}
+		graphErr = errors.New("signed-in user response did not contain an object id")
 	}
 
-	oid, err := getOidClaimFromAccessToken(token.AccessToken)
-	if err != nil {
-		return "", fmt.Errorf("getting oid from token: %w", err)
-	}
-
-	return oid, nil
-}
-
-// jwtClaimsRegex is a regular expression for JWT. A JWT is a string with three base64 encoded
-// components (using the "url safe" base64 alphabet) separated by dots.  For example:
-// eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c cspell: disable-line
-var jwtClaimsRegex = regexp.MustCompile(`^[a-zA-Z0-9-_]*\.([a-zA-Z0-9-_]*)\.[a-zA-Z0-9-_]*$`)
-
-// getOidClaimFromAccessToken extracts a string claim with the name "oid" from an access token.
-// Access Tokens are JWTs and the middle component is a base64 encoded string of a JSON object
-// with claims.
-func getOidClaimFromAccessToken(token string) (string, error) {
-	matches := jwtClaimsRegex.FindStringSubmatch(token)
-	if len(matches) != 2 {
-		return "", errors.New("malformed access token")
-	}
-
-	bytes, err := base64.RawURLEncoding.DecodeString(matches[1])
-	if err != nil {
-		return "", err
-	}
-
-	var claims struct {
-		Oid *string
-	}
-
-	if err := json.Unmarshal(bytes, &claims); err != nil {
-		return "", err
-	}
-
-	if claims.Oid == nil {
-		return "", errors.New("no oid claim")
-	}
-
-	return *claims.Oid, nil
+	return "", fmt.Errorf(
+		"resolving current principal ID from token oid and Graph fallback: %w",
+		errors.Join(err, fmt.Errorf("getting signed-in user id: %w", graphErr)),
+	)
 }

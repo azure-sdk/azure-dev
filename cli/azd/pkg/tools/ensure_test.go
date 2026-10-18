@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
 package tools
 
 import (
@@ -7,8 +10,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func Test_EnsureInstalledOnlyOnce(t *testing.T) {
-	ctx := context.Background()
+func Test_EnsureInstalledOnlyOnceWhenCached(t *testing.T) {
+	ctx := WithInstalledCheckCache(t.Context())
 	tool := TestTool{}
 
 	_ = EnsureInstalled(ctx, &tool)
@@ -21,9 +24,9 @@ type TestTool struct {
 	installChecks int
 }
 
-func (t *TestTool) CheckInstalled(ctx context.Context) (bool, error) {
+func (t *TestTool) CheckInstalled(ctx context.Context) error {
 	t.installChecks++
-	return true, nil
+	return nil
 }
 
 func (t *TestTool) InstallUrl() string {

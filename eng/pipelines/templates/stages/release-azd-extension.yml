@@ -1,0 +1,108 @@
+parameters:
+  - name: AzdExtensionId
+    type: string
+  - name: AzdExtensionDirectory
+    type: string
+  - name: SanitizedExtensionId
+    type: string
+  - name: SkipTests
+    type: boolean
+    default: false
+  - name: PublishToRegistry
+    type: string
+    default: stable
+    values:
+      - stable
+      - dev
+      - nightly
+
+stages: 
+  - template: /eng/pipelines/templates/stages/build-and-test-azd-extension.yml
+    parameters:
+      AzdExtensionId: ${{ parameters.AzdExtensionId }}
+      AzdExtensionDirectory: ${{ parameters.AzdExtensionDirectory }}
+      SkipTests: ${{ parameters.SkipTests }}
+      PublishToRegistry: ${{ parameters.PublishToRegistry }}
+      BuildMatrix:
+        Windows:
+          Pool: $(WINDOWSPOOL)
+          OSVmImage: $(WINDOWSVMIMAGE)
+          OS: windows
+          ImageKey: image
+          UploadArtifact: true
+          Variables:
+            BuildTarget: ${{ parameters.SanitizedExtensionId }}-windows-amd64.exe
+            BuildOutputName: ${{ parameters.SanitizedExtensionId }}-windows-amd64.exe
+            AZURE_DEV_CI_OS: win
+            Codeql.Enabled: true
+            Codeql.SkipTaskAutoInjection: false
+            Codeql.BuildIdentifier: cli_windows
+        Linux:
+          Pool: $(LINUXPOOL)
+          OSVmImage: $(LINUXVMIMAGE)
+          OS: linux
+          ImageKey: image
+          UploadArtifact: true
+          Variables:
+            BuildTarget: ${{ parameters.SanitizedExtensionId }}-linux-amd64
+            BuildOutputName: ${{ parameters.SanitizedExtensionId }}-linux-amd64
+            SetExecutableBit: true
+            SetShieldInfo: true
+            BuildLinuxPackages: true
+            AZURE_DEV_CI_OS: lin
+            Codeql.Enabled: true
+            Codeql.SkipTaskAutoInjection: false
+            Codeql.BuildIdentifier: cli_linux
+        Mac:
+          Pool: Azure Pipelines
+          OSVmImage: $(MACVMIMAGE)
+          OS: macOS
+          ImageKey: vmImage
+          UploadArtifact: true
+          Variables:
+            BuildTarget: ${{ parameters.SanitizedExtensionId }}-darwin-amd64
+            BuildOutputName: ${{ parameters.SanitizedExtensionId }}-darwin-amd64
+            MacLocalSign: false
+            SetExecutableBit: true
+            AZURE_DEV_CI_OS: mac
+            # CodeQL on macOS not supported by the Azure DevOps task as-of current.
+            # Codeql.BuildIdentifier: cli_darwin
+
+        ${{ if or(eq(variables['Build.Reason'], 'Schedule'), eq(parameters.PublishToRegistry, 'nightly')) }}:
+          # Only run this build for nightly publishes (scheduled runs, or a manual
+          # run that selected the 'nightly' registry channel).
+          MacAppleSilicon:
+            Pool: Azure Pipelines
+            OSVmImage: $(MACVMIMAGEM1)
+            OS: macOS
+            ImageKey: vmImage
+            UploadArtifact: false
+            Variables:
+              BuildTarget: ${{ parameters.SanitizedExtensionId }}-darwin-amd64
+              BuildOutputName: ${{ parameters.SanitizedExtensionId }}-darwin-amd64
+              MacLocalSign: false
+              SetExecutableBit: true
+              AZURE_DEV_CI_OS: mac-arm64
+
+  - ${{ if eq(variables['System.TeamProject'], 'internal') }}:
+    - template: /eng/pipelines/templates/stages/publish-extension-pr.yml
+      parameters:
+        AzdExtensionId: ${{ parameters.AzdExtensionId }}
+        AzdExtensionDirectory: ${{ parameters.AzdExtensionDirectory }}
+        SanitizedExtensionId: ${{ parameters.SanitizedExtensionId }}
+
+  # Sign and release on manual builds (stable/dev/nightly release) and scheduled
+  # builds (nightly) from internal. Nightly builds reuse the same sign + package +
+  # publish path; publish-extension.yml branches its behavior on both the schedule
+  # trigger (Build.Reason) and the selected PublishToRegistry channel.
+  - ${{ if and(eq(variables['System.TeamProject'], 'internal'), in(variables['Build.Reason'], 'Manual', 'Schedule')) }}:
+    - template: /eng/pipelines/templates/stages/sign-extension.yml
+      parameters:
+        SanitizedExtensionId: ${{ parameters.SanitizedExtensionId }}
+
+    - template: /eng/pipelines/templates/stages/publish-extension.yml
+      parameters:
+        AzdExtensionId: ${{ parameters.AzdExtensionId }}
+        AzdExtensionDirectory: ${{ parameters.AzdExtensionDirectory }}
+        SanitizedExtensionId: ${{ parameters.SanitizedExtensionId }}
+        PublishToRegistry: ${{ parameters.PublishToRegistry }}

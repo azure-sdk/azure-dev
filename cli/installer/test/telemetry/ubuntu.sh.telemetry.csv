@@ -1,0 +1,4 @@
+os,ubuntu
+osVersion,22.04
+isWsl,false
+terminal,bash
