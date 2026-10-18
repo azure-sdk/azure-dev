@@ -102,7 +102,10 @@ func TestAZCLIWithUserAgent(t *testing.T) {
 		EnableDebug:     true,
 	})
 
-	account := mustGetDefaultAccount(t, azCli)
+	account, ok := getDefaultAccount(t, azCli)
+	if !ok {
+		t.Skip("skipping TestAZCLIWithUserAgent: Azure CLI is not logged in")
+	}
 	userAgent := runAndCaptureUserAgent(t, account.Id)
 
 	require.Contains(t, userAgent, "AZTesting=yes")
@@ -119,6 +122,19 @@ func mustGetDefaultAccount(t *testing.T, azCli AzCli) AzCliSubscriptionInfo {
 	}
 	assert.Fail(t, "No default account set")
 	return AzCliSubscriptionInfo{}
+}
+
+func getDefaultAccount(t *testing.T, azCli AzCli) (AzCliSubscriptionInfo, bool) {
+	accounts, err := azCli.ListAccounts(context.Background())
+	if err != nil {
+		return AzCliSubscriptionInfo{}, false
+	}
+	for _, account := range accounts {
+		if account.IsDefault {
+			return account, true
+		}
+	}
+	return AzCliSubscriptionInfo{}, false
 }
 
 func runAndCaptureUserAgent(t *testing.T, subscriptionID string) string {
