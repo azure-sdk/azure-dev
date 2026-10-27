@@ -5,36 +5,57 @@ package output
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 const (
 	outputFlagName               = "output"
+	queryFlagName                = "query"
 	supportedFormatterAnnotation = "github.com/azure/azure-dev/cli/azd/pkg/output/supportedOutputFormatters"
 )
 
-func AddOutputParam(cmd *cobra.Command, supportedFormats []Format, defaultFormat Format) *cobra.Command {
+func AddOutputFlag(f *pflag.FlagSet, s *string, supportedFormats []Format, defaultFormat Format) {
 	formatNames := make([]string, len(supportedFormats))
 	for i, f := range supportedFormats {
 		formatNames[i] = string(f)
 	}
 
 	description := fmt.Sprintf("The output format (the supported formats are %s).", strings.Join(formatNames, ", "))
-	cmd.Flags().StringP(outputFlagName, "o", string(defaultFormat), description)
+	f.StringVarP(s, outputFlagName, "o", string(defaultFormat), description)
+	//preview:flag hide --output
+	_ = f.MarkHidden(outputFlagName)
 
 	// Only error that can occur is "flag not found", which is not possible given we just added the flag on the previous line
-	_ = cmd.Flags().SetAnnotation(outputFlagName, supportedFormatterAnnotation, formatNames)
+	_ = f.SetAnnotation(outputFlagName, supportedFormatterAnnotation, formatNames)
+}
 
+func AddOutputParam(cmd *cobra.Command, supportedFormats []Format, defaultFormat Format) *cobra.Command {
+	discard := new(string)
+	AddOutputFlag(cmd.Flags(), discard, supportedFormats, defaultFormat)
 	return cmd
+}
+
+// AddQueryParam adds a hidden --query flag to the command for JMESPath filtering.
+// This should only be called for commands that support JSON output format.
+func AddQueryParam(cmd *cobra.Command) {
+	cmd.Flags().String(
+		queryFlagName,
+		"",
+		"The JMESPath query string used to filter JSON output.",
+	)
+	//preview:flag hide --query
+	_ = cmd.Flags().MarkHidden(queryFlagName)
 }
 
 func GetCommandFormatter(cmd *cobra.Command) (Formatter, error) {
 	// If the command does not specify any output params just return nil Formatter pointer
 	outputVal, err := cmd.Flags().GetString(outputFlagName)
 	if err != nil {
-		return nil, nil
+		return &NoneFormatter{}, nil
 	}
 
 	desiredFormatter := strings.ToLower(strings.TrimSpace(outputVal))
@@ -44,15 +65,18 @@ func GetCommandFormatter(cmd *cobra.Command) (Formatter, error) {
 		return NewFormatter(desiredFormatter)
 	}
 
-	supported := false
-	for _, formatter := range supportedFormatters {
-		if formatter == desiredFormatter {
-			supported = true
-			break
-		}
-	}
+	supported := slices.Contains(supportedFormatters, desiredFormatter)
 	if !supported {
-		return nil, fmt.Errorf("unsupported format '%s'", desiredFormatter)
+		return nil, fmt.Errorf("unsupported format '%s' for --output", desiredFormatter)
+	}
+
+	// Check for --query flag and validate it requires JSON output
+	queryVal, queryErr := cmd.Flags().GetString(queryFlagName)
+	if queryErr == nil && queryVal != "" {
+		if desiredFormatter != string(JsonFormat) {
+			return nil, fmt.Errorf("--query requires --output json or -o json")
+		}
+		return &JsonFormatter{Query: queryVal}, nil
 	}
 
 	return NewFormatter(desiredFormatter)

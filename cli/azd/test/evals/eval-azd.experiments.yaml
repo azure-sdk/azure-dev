@@ -1,0 +1,35 @@
+# Experiment: measure the impact of the azd skill across two models by running
+# the same evals with skills loaded and without.
+#
+#   npm run eval:experiment
+#
+name: azd-skills-baseline
+
+evals:
+  - eval-azd-qna.yaml
+  - eval-azd-deploy.yaml
+
+# Axes:
+# - skills: azd skill off vs on
+# - model: claude-sonnet-5 vs gpt-5.6-terra
+#
+# An empty skills list replaces the eval's skills entirely (no skills); the
+# other value injects the azd skill.
+matrix:
+  skills:
+    path: /environment/skills
+    values:
+      - without-skills: []
+      - with-skills: ["./skills/azd"]
+  # Keep subject models distinct from judge_model in every eval above so a model
+  # never grades its own responses.
+  model:
+    path: /defaults/model
+    values:
+      - claude-sonnet-5: claude-sonnet-5
+      - gpt-5.6-terra: gpt-5.6-terra
+
+# Control variant that deltas are measured against.
+baseline:
+  skills: without-skills
+  model: claude-sonnet-5

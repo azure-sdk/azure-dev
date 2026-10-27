@@ -1,0 +1,36 @@
+name: Release dev container feature image
+
+env:
+  IMAGE_NAME: ${{ github.repository }}
+  REGISTRY: ghcr.io
+
+on:
+  workflow_dispatch:
+
+jobs:
+  call-workflow-test:
+    uses: ./.github/workflows/devcontainer-feature-test.yml
+
+  deploy:
+    needs: 
+     - call-workflow-test
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      pull-requests: write
+    environment:
+      name: deploy-devcontainer-feature
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: "Publish Features"
+        uses: devcontainers/action@1082abd5d2bf3a11abccba70eef98df068277772  # v1.4.3
+        with:
+          publish-features: "true"
+          base-path-to-features: "./ext/devcontainer/src"
+          generate-docs: "false"
+          
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

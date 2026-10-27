@@ -1,0 +1,158 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package extensions
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/url"
+	"slices"
+	"strings"
+)
+
+type Source interface {
+	// Name returns the name of the source.
+	Name() string
+	// ListExtensions returns a list of AZD compatible templates.
+	ListExtensions(ctx context.Context) ([]*ExtensionMetadata, error)
+	// GetExtension returns a template by path.
+	GetExtension(ctx context.Context, extensionId string) (*ExtensionMetadata, error)
+}
+
+// RegistryProvider is an optional interface that a Source may implement
+// to expose the full Registry object, including registry-level fields
+// like SchemaVersion.
+type RegistryProvider interface {
+	// GetRegistry returns the underlying registry for the source.
+	GetRegistry() *Registry
+}
+
+type categorizedSource struct {
+	Source
+	category SourceCategory
+}
+
+func newCategorizedSource(source Source, category SourceCategory) Source {
+	categorized := &categorizedSource{
+		Source:   source,
+		category: category,
+	}
+	if provider, ok := source.(RegistryProvider); ok {
+		return &categorizedRegistrySource{
+			categorizedSource: categorized,
+			provider:          provider,
+		}
+	}
+	return categorized
+}
+
+func (s *categorizedSource) ListExtensions(ctx context.Context) ([]*ExtensionMetadata, error) {
+	extensions, err := s.Source.ListExtensions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, extension := range extensions {
+		extension.SourceCategory = s.category
+	}
+	return extensions, nil
+}
+
+func (s *categorizedSource) GetExtension(ctx context.Context, extensionId string) (*ExtensionMetadata, error) {
+	extension, err := s.Source.GetExtension(ctx, extensionId)
+	if err != nil {
+		return nil, err
+	}
+	extension.SourceCategory = s.category
+	return extension, nil
+}
+
+type categorizedRegistrySource struct {
+	*categorizedSource
+	provider RegistryProvider
+}
+
+func (s *categorizedRegistrySource) GetRegistry() *Registry {
+	return s.provider.GetRegistry()
+}
+
+type registrySource struct {
+	name     string
+	registry *Registry
+}
+
+// newRegistrySource creates a new registry source.
+func newRegistrySource(name string, registry *Registry) (Source, error) {
+	return &registrySource{
+		name:     name,
+		registry: registry,
+	}, nil
+}
+
+func (ts *registrySource) Name() string {
+	return ts.name
+}
+
+// GetRegistry returns the underlying registry for the source.
+func (s *registrySource) GetRegistry() *Registry {
+	return s.registry
+}
+
+// ListTemplates returns a list of templates from the extension source.
+func (s *registrySource) ListExtensions(ctx context.Context) ([]*ExtensionMetadata, error) {
+	for _, extension := range s.registry.Extensions {
+		extension.Source = s.name
+	}
+
+	return s.registry.Extensions, nil
+}
+
+// GetExtension returns an extension by id.
+func (s *registrySource) GetExtension(ctx context.Context, id string) (*ExtensionMetadata, error) {
+	allTemplates, err := s.ListExtensions(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed listing templates: %w", err)
+	}
+
+	matchingIndex := slices.IndexFunc(allTemplates, func(extension *ExtensionMetadata) bool {
+		return strings.EqualFold(extension.Id, id)
+	})
+
+	if matchingIndex == -1 {
+		return nil, fmt.Errorf("'%s' %w", id, ErrRegistryExtensionNotFound)
+	}
+
+	return allTemplates[matchingIndex], nil
+}
+
+// IsOfficialMainRegistrySource reports whether config identifies the
+// immutable official registry source.
+func IsOfficialMainRegistrySource(config *SourceConfig) bool {
+	if config == nil ||
+		NormalizeSourceKey(config.Name) != MainRegistryName ||
+		config.Type != SourceKindUrl {
+		return false
+	}
+
+	expected, err := normalizeOfficialSourceLocation(extensionRegistryUrl)
+	if err != nil {
+		return false
+	}
+
+	actual, err := normalizeOfficialSourceLocation(config.Location)
+	return err == nil && actual == expected
+}
+
+func normalizeOfficialSourceLocation(location string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(location))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", errors.New("invalid source location")
+	}
+
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.Path = strings.TrimSuffix(parsed.Path, "/")
+
+	return parsed.String(), nil
+}

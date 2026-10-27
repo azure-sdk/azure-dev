@@ -1,0 +1,622 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package azdext
+
+import (
+	"errors"
+	"fmt"
+	"testing"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	v1beta "github.com/azure/azure-dev/cli/azd/pkg/azdext/contracts/v1beta"
+	"github.com/azure/azure-dev/cli/azd/pkg/errorhandler"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/protoadapt"
+)
+
+func TestExtensionError_RoundTrip(t *testing.T) {
+	tests := []struct {
+		name     string
+		inputErr error
+		wantNil  bool
+		verify   func(t *testing.T, protoErr *ExtensionError, goErr error)
+	}{
+		{
+			name:     "NilError",
+			inputErr: nil,
+			wantNil:  true,
+		},
+		{
+			name:     "SimpleError",
+			inputErr: errors.New("simple error"),
+			verify: func(t *testing.T, protoErr *ExtensionError, goErr error) {
+				assert.Equal(t, "simple error", protoErr.GetMessage())
+				assert.Equal(t, ErrorOrigin_ERROR_ORIGIN_UNSPECIFIED, protoErr.GetOrigin())
+				assert.Nil(t, protoErr.GetSource())
+
+				assert.Equal(t, "simple error", goErr.Error())
+
+				// Untyped errors round-trip as LocalError so the message is preserved
+				// through the display and telemetry pipelines.
+				var localErr *LocalError
+				require.ErrorAs(t, goErr, &localErr)
+				assert.Equal(t, "simple error", localErr.Message)
+				assert.Equal(t, LocalErrorCategoryLocal, localErr.Category)
+			},
+		},
+		{
+			name: "ExtServiceError",
+			inputErr: &ServiceError{
+				Message:     "Rate limit exceeded",
+				ErrorCode:   "RateLimitExceeded",
+				StatusCode:  429,
+				ServiceName: "openai.azure.com",
+				Suggestion:  "Retry with exponential backoff",
+				Links: []errorhandler.ErrorLink{{
+					URL:   "https://aka.ms/azd-errors#rate-limit",
+					Title: "Rate limit troubleshooting",
+				}},
+			},
+			verify: func(t *testing.T, protoErr *ExtensionError, goErr error) {
+				assert.Equal(t, "Rate limit exceeded", protoErr.GetMessage())
+				assert.Equal(t, "Retry with exponential backoff", protoErr.GetSuggestion())
+				assert.Equal(t, ErrorOrigin_ERROR_ORIGIN_SERVICE, protoErr.GetOrigin())
+				require.Len(t, protoErr.GetLinks(), 1)
+				assert.Equal(t, "https://aka.ms/azd-errors#rate-limit", protoErr.GetLinks()[0].GetUrl())
+				assert.Equal(t, "Rate limit troubleshooting", protoErr.GetLinks()[0].GetTitle())
+
+				svcDetail := protoErr.GetServiceError()
+				require.NotNil(t, svcDetail)
+				assert.Equal(t, "RateLimitExceeded", svcDetail.GetErrorCode())
+				assert.Equal(t, int32(429), svcDetail.GetStatusCode())
+				assert.Equal(t, "openai.azure.com", svcDetail.GetServiceName())
+
+				var svcErr *ServiceError
+				require.ErrorAs(t, goErr, &svcErr)
+				assert.Equal(t, "Rate limit exceeded", svcErr.Message)
+				assert.Equal(t, "RateLimitExceeded", svcErr.ErrorCode)
+				assert.Equal(t, 429, svcErr.StatusCode)
+				assert.Equal(t, "openai.azure.com", svcErr.ServiceName)
+				assert.Equal(t, "Retry with exponential backoff", svcErr.Suggestion)
+				require.Len(t, svcErr.Links, 1)
+				assert.Equal(t, "https://aka.ms/azd-errors#rate-limit", svcErr.Links[0].URL)
+				assert.Equal(t, "Rate limit troubleshooting", svcErr.Links[0].Title)
+			},
+		},
+		{
+			name: "ExtLocalError",
+			inputErr: &LocalError{
+				Message:    "invalid config",
+				Code:       "invalid_config",
+				Category:   LocalErrorCategoryValidation,
+				CauseTypes: []string{"*agents.TransportError", "*agents.ConfigError"},
+				Suggestion: "Add the missing required field",
+				Links: []errorhandler.ErrorLink{{
+					URL:   "https://aka.ms/azd-errors#invalid-config",
+					Title: "Invalid config reference",
+				}},
+			},
+			verify: func(t *testing.T, protoErr *ExtensionError, goErr error) {
+				assert.Equal(t, ErrorOrigin_ERROR_ORIGIN_LOCAL, protoErr.GetOrigin())
+				assert.Equal(t, "Add the missing required field", protoErr.GetSuggestion())
+				require.Len(t, protoErr.GetLinks(), 1)
+				assert.Equal(t, "https://aka.ms/azd-errors#invalid-config", protoErr.GetLinks()[0].GetUrl())
+
+				localDetail := protoErr.GetLocalError()
+				require.NotNil(t, localDetail)
+				assert.Equal(t, "invalid_config", localDetail.GetCode())
+				assert.Equal(t, "validation", localDetail.GetCategory())
+
+				var localErr *LocalError
+				require.ErrorAs(t, goErr, &localErr)
+				assert.Equal(t, "invalid_config", localErr.Code)
+				assert.Equal(t, LocalErrorCategoryValidation, localErr.Category)
+				assert.Nil(t, localErr.CauseTypes)
+				assert.Equal(t, "Add the missing required field", localErr.Suggestion)
+				require.Len(t, localErr.Links, 1)
+				assert.Equal(t, "Invalid config reference", localErr.Links[0].Title)
+			},
+		},
+		{
+			name: "AzCoreResponseError",
+			inputErr: &azcore.ResponseError{
+				ErrorCode:  "ResourceNotFound",
+				StatusCode: 404,
+			},
+			verify: func(t *testing.T, protoErr *ExtensionError, goErr error) {
+				assert.Equal(t, ErrorOrigin_ERROR_ORIGIN_SERVICE, protoErr.GetOrigin())
+
+				svcDetail := protoErr.GetServiceError()
+				require.NotNil(t, svcDetail)
+				assert.Equal(t, "ResourceNotFound", svcDetail.GetErrorCode())
+				assert.Equal(t, int32(404), svcDetail.GetStatusCode())
+
+				var svcErr *ServiceError
+				require.ErrorAs(t, goErr, &svcErr)
+				assert.Equal(t, "ResourceNotFound", svcErr.ErrorCode)
+				assert.Equal(t, 404, svcErr.StatusCode)
+			},
+		},
+		{
+			name: "GrpcUnauthenticatedError",
+			inputErr: mustAuthStatusError(
+				codes.Unauthenticated,
+				AuthErrorReasonNotLoggedIn,
+				"not logged in, run `azd auth login` to login",
+			),
+			verify: func(t *testing.T, protoErr *ExtensionError, goErr error) {
+				assert.Equal(t, ErrorOrigin_ERROR_ORIGIN_LOCAL, protoErr.GetOrigin())
+				assert.Contains(t, protoErr.GetMessage(), "not logged in")
+
+				localDetail := protoErr.GetLocalError()
+				require.NotNil(t, localDetail)
+				assert.Equal(t, "not_logged_in", localDetail.GetCode())
+				assert.Equal(t, "auth", localDetail.GetCategory())
+
+				var localErr *LocalError
+				require.ErrorAs(t, goErr, &localErr)
+				assert.Equal(t, LocalErrorCategoryAuth, localErr.Category)
+				assert.Equal(t, "not_logged_in", localErr.Code)
+			},
+		},
+		{
+			name: "WrappedGrpcUnauthenticatedError",
+			inputErr: fmt.Errorf(
+				"failed to prompt: %w",
+				mustAuthStatusError(
+					codes.Unauthenticated,
+					"AADSTS530084",
+					"AADSTS530084: blocked by token protection",
+				),
+			),
+			verify: func(t *testing.T, protoErr *ExtensionError, goErr error) {
+				assert.Equal(t, ErrorOrigin_ERROR_ORIGIN_LOCAL, protoErr.GetOrigin())
+				assert.Equal(t, "AADSTS530084: blocked by token protection", protoErr.GetMessage())
+
+				localDetail := protoErr.GetLocalError()
+				require.NotNil(t, localDetail)
+				// AAD-originated reasons collapse to the generic "auth_failed" code; the raw
+				// "AADSTS530084" reason remains available to extensions via the gRPC ErrorInfo.
+				assert.Equal(t, "auth_failed", localDetail.GetCode())
+				assert.Equal(t, "auth", localDetail.GetCategory())
+			},
+		},
+		{
+			name: "GrpcUnauthenticatedLoginRequiredError",
+			inputErr: mustAuthStatusError(
+				codes.Unauthenticated,
+				AuthErrorReasonLoginRequired,
+				"AADSTS70043: token expired\nlogin expired, run `azd auth login`",
+			),
+			verify: func(t *testing.T, protoErr *ExtensionError, goErr error) {
+				assert.Equal(t, ErrorOrigin_ERROR_ORIGIN_LOCAL, protoErr.GetOrigin())
+				assert.Contains(t, protoErr.GetMessage(), "login expired")
+
+				localDetail := protoErr.GetLocalError()
+				require.NotNil(t, localDetail)
+				assert.Equal(t, "login_required", localDetail.GetCode())
+				assert.Equal(t, "auth", localDetail.GetCategory())
+
+				var localErr *LocalError
+				require.ErrorAs(t, goErr, &localErr)
+				assert.Equal(t, LocalErrorCategoryAuth, localErr.Category)
+				assert.Equal(t, "login_required", localErr.Code)
+			},
+		},
+		{
+			name: "GrpcUnauthenticatedWithActionableDetail",
+			inputErr: mustStatusErrorWithDetails(
+				codes.Unauthenticated,
+				"A Conditional Access token protection policy blocked this token request.",
+				&errdetails.ErrorInfo{
+					Reason: "AADSTS530084",
+					Domain: AuthErrorDomain,
+				},
+				&ActionableErrorDetail{
+					Suggestion: "Contact your IT administrator or request a policy exception.",
+					Links: []*ErrorLink{{
+						Url:   "https://aka.ms/TokenProtectionFAQ#troubleshooting",
+						Title: "Token protection FAQ",
+					}},
+				},
+			),
+			verify: func(t *testing.T, protoErr *ExtensionError, goErr error) {
+				assert.Equal(t, ErrorOrigin_ERROR_ORIGIN_LOCAL, protoErr.GetOrigin())
+				assert.Equal(t,
+					"A Conditional Access token protection policy blocked this token request.",
+					protoErr.GetMessage())
+				assert.Equal(t, "Contact your IT administrator or request a policy exception.", protoErr.GetSuggestion())
+				require.Len(t, protoErr.GetLinks(), 1)
+				assert.Equal(t, "https://aka.ms/TokenProtectionFAQ#troubleshooting", protoErr.GetLinks()[0].GetUrl())
+
+				localDetail := protoErr.GetLocalError()
+				require.NotNil(t, localDetail)
+				assert.Equal(t, "auth_failed", localDetail.GetCode())
+				assert.Equal(t, "auth", localDetail.GetCategory())
+
+				var localErr *LocalError
+				require.ErrorAs(t, goErr, &localErr)
+				assert.Equal(t, LocalErrorCategoryAuth, localErr.Category)
+				assert.Equal(t, "auth_failed", localErr.Code)
+				assert.Equal(t, "Contact your IT administrator or request a policy exception.", localErr.Suggestion)
+				require.Len(t, localErr.Links, 1)
+			},
+		},
+		{
+			name: "GrpcActionableNonAuthError",
+			inputErr: mustStatusErrorWithDetails(
+				codes.InvalidArgument,
+				"The extension configuration is invalid.",
+				&ActionableErrorDetail{
+					Suggestion: "Fix the extension config and retry.",
+					Links: []*ErrorLink{{
+						Url:   "https://aka.ms/azd-errors#invalid-config",
+						Title: "Invalid config reference",
+					}},
+				},
+			),
+			verify: func(t *testing.T, protoErr *ExtensionError, goErr error) {
+				assert.Equal(t, ErrorOrigin_ERROR_ORIGIN_LOCAL, protoErr.GetOrigin())
+				assert.Equal(t, "The extension configuration is invalid.", protoErr.GetMessage())
+				assert.Equal(t, "Fix the extension config and retry.", protoErr.GetSuggestion())
+				require.Len(t, protoErr.GetLinks(), 1)
+
+				localDetail := protoErr.GetLocalError()
+				require.NotNil(t, localDetail)
+				assert.Equal(t, string(LocalErrorCategoryLocal), localDetail.GetCategory())
+
+				var localErr *LocalError
+				require.ErrorAs(t, goErr, &localErr)
+				assert.Equal(t, LocalErrorCategoryLocal, localErr.Category)
+				assert.Equal(t, "Fix the extension config and retry.", localErr.Suggestion)
+			},
+		},
+		{
+			name:     "GrpcUnauthenticatedWithoutAuthDetailsFallsBackToAuthFailed",
+			inputErr: status.Error(codes.Unauthenticated, "generic auth problem"),
+			verify: func(t *testing.T, protoErr *ExtensionError, goErr error) {
+				assert.Equal(t, ErrorOrigin_ERROR_ORIGIN_LOCAL, protoErr.GetOrigin())
+				assert.Equal(t, "generic auth problem", protoErr.GetMessage())
+
+				localDetail := protoErr.GetLocalError()
+				require.NotNil(t, localDetail)
+				assert.Equal(t, "auth_failed", localDetail.GetCode())
+				assert.Equal(t, "auth", localDetail.GetCategory())
+
+				var localErr *LocalError
+				require.ErrorAs(t, goErr, &localErr)
+				assert.Equal(t, LocalErrorCategoryAuth, localErr.Category)
+				assert.Equal(t, "auth_failed", localErr.Code)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			protoErr := WrapError(tt.inputErr)
+
+			if tt.wantNil {
+				assert.Nil(t, protoErr)
+				assert.Nil(t, UnwrapError(nil))
+				return
+			}
+
+			require.NotNil(t, protoErr)
+			goErr := UnwrapError(protoErr)
+			require.NotNil(t, goErr)
+
+			tt.verify(t, protoErr, goErr)
+		})
+	}
+}
+
+func TestExtensionError_ToolErrorRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	exitCode := 23
+	source := &ToolError{
+		Message:    "docker build failed",
+		ToolName:   "docker",
+		Kind:       ToolErrorKindFailed,
+		ExitCode:   &exitCode,
+		Suggestion: "Check the Docker build output",
+	}
+
+	protoErr := WrapError(fmt.Errorf("container build: %w", source))
+	require.NotNil(t, protoErr)
+	assert.Equal(t, ErrorOrigin_ERROR_ORIGIN_TOOL, protoErr.GetOrigin())
+	assert.Equal(t, "docker build failed", protoErr.GetMessage())
+
+	unwrapped := UnwrapError(protoErr)
+	var toolErr *ToolError
+	require.ErrorAs(t, unwrapped, &toolErr)
+	assert.Equal(t, "docker build failed", toolErr.Message)
+	assert.Equal(t, ToolErrorKindFailed, toolErr.Kind)
+	assert.Equal(t, "Check the Docker build output", toolErr.Suggestion)
+}
+
+func TestErrorDetailsFromStatus(t *testing.T) {
+	t.Parallel()
+
+	extensionErr := WrapError(&ToolError{
+		Message:  "docker build failed",
+		ToolName: "docker",
+		Kind:     ToolErrorKindFailed,
+	})
+	st, err := status.New(codes.Unknown, "container build failed").WithDetails(extensionErr)
+	require.NoError(t, err)
+
+	assert.Equal(t, extensionErr.GetMessage(), ExtensionErrorFromStatus(st).GetMessage())
+	assert.Nil(t, ServiceErrorDetailFromStatus(st))
+
+	serviceDetail := &ServiceErrorDetail{
+		ErrorCode:   "InternalServerError",
+		StatusCode:  500,
+		ServiceName: "management.azure.com",
+	}
+	st, err = status.New(codes.Unknown, "service failed").WithDetails(serviceDetail)
+	require.NoError(t, err)
+
+	assert.Equal(t, serviceDetail.GetErrorCode(), ServiceErrorDetailFromStatus(st).GetErrorCode())
+	assert.Nil(t, ExtensionErrorFromStatus(st))
+	assert.Nil(t, ExtensionErrorFromStatus(nil))
+	assert.Nil(t, ServiceErrorDetailFromStatus(nil))
+
+	betaExtensionErr := &v1beta.ExtensionError{
+		Message:    "beta extension failed",
+		Origin:     v1beta.ErrorOrigin_ERROR_ORIGIN_LOCAL,
+		Suggestion: "fix the beta input",
+		Source: &v1beta.ExtensionError_LocalError{
+			LocalError: &v1beta.LocalErrorDetail{
+				Code:       "invalid_beta_input",
+				Category:   "validation",
+				CauseTypes: []string{"*errors.errorString"},
+			},
+		},
+	}
+	st, err = status.New(codes.Unknown, "beta extension failed").WithDetails(betaExtensionErr)
+	require.NoError(t, err)
+
+	relayed := ExtensionErrorFromStatus(st)
+	require.NotNil(t, relayed)
+	assert.Equal(t, betaExtensionErr.GetMessage(), relayed.GetMessage())
+	assert.Equal(t, betaExtensionErr.GetSuggestion(), relayed.GetSuggestion())
+	assert.Equal(t, betaExtensionErr.GetLocalError().GetCode(), relayed.GetLocalError().GetCode())
+
+	betaServiceDetail := &v1beta.ServiceErrorDetail{
+		ErrorCode:   "BetaServiceFailure",
+		StatusCode:  503,
+		ServiceName: "preview.example.com",
+	}
+	st, err = status.New(codes.Unavailable, "beta service failed").WithDetails(betaServiceDetail)
+	require.NoError(t, err)
+
+	serviceDetail = ServiceErrorDetailFromStatus(st)
+	require.NotNil(t, serviceDetail)
+	assert.Equal(t, betaServiceDetail.GetErrorCode(), serviceDetail.GetErrorCode())
+	assert.Equal(t, betaServiceDetail.GetStatusCode(), serviceDetail.GetStatusCode())
+	assert.Equal(t, betaServiceDetail.GetServiceName(), serviceDetail.GetServiceName())
+}
+
+func TestWrapError_RelaysStructuredStatusDetails(t *testing.T) {
+	t.Parallel()
+
+	serviceErr := &ServiceError{
+		Message:     "service request failed",
+		ErrorCode:   "AuthorizationFailed",
+		StatusCode:  403,
+		ServiceName: "management.azure.com",
+		Suggestion:  "request the required role",
+		Links: []errorhandler.ErrorLink{{
+			URL:   "https://aka.ms/azd-errors#authorization",
+			Title: "Authorization help",
+		}},
+	}
+	serviceDetail := WrapError(serviceErr)
+	serviceStatus := mustStatusErrorWithDetails(
+		codes.Unknown,
+		"host service request failed",
+		serviceDetail,
+	)
+
+	serviceWrapped := WrapError(serviceStatus)
+	require.Equal(t, "host service request failed", serviceWrapped.GetMessage())
+	require.Equal(t, ErrorOrigin_ERROR_ORIGIN_SERVICE, serviceWrapped.GetOrigin())
+	require.Equal(t, serviceErr.Suggestion, serviceWrapped.GetSuggestion())
+	require.Len(t, serviceWrapped.GetLinks(), 1)
+	require.Equal(t, serviceDetail.GetLinks()[0].GetUrl(),
+		serviceWrapped.GetLinks()[0].GetUrl())
+	require.Equal(t, serviceDetail.GetLinks()[0].GetTitle(),
+		serviceWrapped.GetLinks()[0].GetTitle())
+	require.Equal(t, serviceErr.ErrorCode, serviceWrapped.GetServiceError().GetErrorCode())
+	require.Equal(t, serviceDetail.GetServiceError().GetStatusCode(),
+		serviceWrapped.GetServiceError().GetStatusCode())
+
+	toolDetail := WrapError(&ToolError{
+		Message:  "docker build failed",
+		ToolName: "docker",
+		Kind:     ToolErrorKindFailed,
+	})
+	toolStatus := mustStatusErrorWithDetails(
+		codes.Unknown,
+		"host docker build failed",
+		toolDetail,
+	)
+
+	toolWrapped := WrapError(toolStatus)
+	require.Equal(t, "host docker build failed", toolWrapped.GetMessage())
+	require.Equal(t, ErrorOrigin_ERROR_ORIGIN_TOOL, toolWrapped.GetOrigin())
+}
+
+func TestWrapError_ConvertsServiceDetailFromStatus(t *testing.T) {
+	t.Parallel()
+
+	serviceDetail := &ServiceErrorDetail{
+		ErrorCode:   "TooManyRequests",
+		StatusCode:  429,
+		ServiceName: "management.azure.com",
+	}
+	err := mustStatusErrorWithDetails(
+		codes.Unknown,
+		"host service request failed",
+		serviceDetail,
+	)
+
+	wrapped := WrapError(err)
+	require.Equal(t, "host service request failed", wrapped.GetMessage())
+	require.Equal(t, ErrorOrigin_ERROR_ORIGIN_SERVICE, wrapped.GetOrigin())
+	require.Equal(t, serviceDetail.GetErrorCode(), wrapped.GetServiceError().GetErrorCode())
+	require.Equal(t, serviceDetail.GetStatusCode(), wrapped.GetServiceError().GetStatusCode())
+	require.Equal(t, serviceDetail.GetServiceName(),
+		wrapped.GetServiceError().GetServiceName())
+}
+
+func TestUnwrapError_EmptyMessagePreservesStructuredError(t *testing.T) {
+	protoErr := &ExtensionError{
+		Origin: ErrorOrigin_ERROR_ORIGIN_LOCAL,
+		Source: &ExtensionError_LocalError{
+			LocalError: &LocalErrorDetail{
+				Code:     "empty_message",
+				Category: "validation",
+			},
+		},
+		Suggestion: "Fill in the required setting",
+		Links: []*ErrorLink{{
+			Url:   "https://aka.ms/azd-errors#empty-message",
+			Title: "Validation troubleshooting",
+		}},
+	}
+
+	err := UnwrapError(protoErr)
+	require.Error(t, err)
+
+	localErr, ok := errors.AsType[*LocalError](err)
+	require.True(t, ok)
+	assert.Empty(t, localErr.Message)
+	assert.Equal(t, "empty_message", localErr.Code)
+	assert.Equal(t, LocalErrorCategoryValidation, localErr.Category)
+	assert.Nil(t, localErr.CauseTypes)
+	assert.Equal(t, "Fill in the required setting", localErr.Suggestion)
+	require.Len(t, localErr.Links, 1)
+	assert.Equal(t, "Validation troubleshooting", localErr.Links[0].Title)
+}
+
+func mustAuthStatusError(code codes.Code, reason, message string) error {
+	return mustStatusErrorWithDetails(code, message, &errdetails.ErrorInfo{
+		Reason: reason,
+		Domain: AuthErrorDomain,
+	})
+}
+
+func mustStatusErrorWithDetails(code codes.Code, message string, details ...protoadapt.MessageV1) error {
+	st := status.New(code, message)
+	withDetails, err := st.WithDetails(details...)
+	if err != nil {
+		panic(err)
+	}
+
+	return withDetails.Err()
+}
+
+func TestGRPCStatusFromError(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil error returns false", func(t *testing.T) {
+		st, ok := GRPCStatusFromError(nil)
+		assert.False(t, ok)
+		assert.Nil(t, st)
+	})
+
+	t.Run("non-gRPC error returns false", func(t *testing.T) {
+		st, ok := GRPCStatusFromError(errors.New("plain error"))
+		assert.False(t, ok)
+		assert.Nil(t, st)
+	})
+
+	t.Run("status error returns status", func(t *testing.T) {
+		original := status.New(codes.NotFound, "missing").Err()
+		st, ok := GRPCStatusFromError(original)
+		require.True(t, ok)
+		require.NotNil(t, st)
+		assert.Equal(t, codes.NotFound, st.Code())
+		assert.Equal(t, "missing", st.Message())
+	})
+
+	t.Run("status error wrapped with fmt.Errorf is unwrapped", func(t *testing.T) {
+		original := status.New(codes.NotFound, "missing").Err()
+		wrapped := fmt.Errorf("context: %w", original)
+		st, ok := GRPCStatusFromError(wrapped)
+		require.True(t, ok)
+		assert.Equal(t, codes.NotFound, st.Code())
+	})
+}
+
+func TestActionableErrorDetailFromStatus(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil status returns nil", func(t *testing.T) {
+		assert.Nil(t, ActionableErrorDetailFromStatus(nil))
+	})
+
+	t.Run("status without ActionableErrorDetail returns nil", func(t *testing.T) {
+		st := status.New(codes.Unknown, "no details")
+		assert.Nil(t, ActionableErrorDetailFromStatus(st))
+	})
+
+	t.Run("status with ActionableErrorDetail returns it", func(t *testing.T) {
+		err := mustStatusErrorWithDetails(codes.Unknown, "boom", &ActionableErrorDetail{
+			Suggestion: "try harder",
+		})
+		st, _ := status.FromError(err)
+		actionable := ActionableErrorDetailFromStatus(st)
+		require.NotNil(t, actionable)
+		assert.Equal(t, "try harder", actionable.GetSuggestion())
+	})
+
+	t.Run("status with beta ActionableErrorDetail returns stable facade detail", func(t *testing.T) {
+		err := mustStatusErrorWithDetails(codes.Unknown, "boom", &v1beta.ActionableErrorDetail{
+			Suggestion: "use the preview recovery path",
+			Links: []*v1beta.ErrorLink{{
+				Url:   "https://aka.ms/azd-preview-errors",
+				Title: "Preview error help",
+			}},
+		})
+		st, _ := status.FromError(err)
+		actionable := ActionableErrorDetailFromStatus(st)
+		require.NotNil(t, actionable)
+		assert.Equal(t, "use the preview recovery path", actionable.GetSuggestion())
+		require.Len(t, actionable.GetLinks(), 1)
+		assert.Equal(t, "https://aka.ms/azd-preview-errors", actionable.GetLinks()[0].GetUrl())
+	})
+}
+
+func TestActionableErrorDetailFromError(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil error returns nil", func(t *testing.T) {
+		assert.Nil(t, ActionableErrorDetailFromError(nil))
+	})
+
+	t.Run("non-gRPC error returns nil", func(t *testing.T) {
+		assert.Nil(t, ActionableErrorDetailFromError(errors.New("plain")))
+	})
+
+	t.Run("status error without detail returns nil", func(t *testing.T) {
+		assert.Nil(t, ActionableErrorDetailFromError(status.New(codes.Unknown, "no details").Err()))
+	})
+
+	t.Run("status error with detail returns it (even when wrapped)", func(t *testing.T) {
+		statusErr := mustStatusErrorWithDetails(codes.Unknown, "boom", &ActionableErrorDetail{
+			Suggestion: "try harder",
+		})
+		wrapped := fmt.Errorf("context: %w", statusErr)
+		actionable := ActionableErrorDetailFromError(wrapped)
+		require.NotNil(t, actionable)
+		assert.Equal(t, "try harder", actionable.GetSuggestion())
+	})
+}

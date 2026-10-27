@@ -13,7 +13,8 @@ type ActionOptions struct {
 }
 
 // Gets a value determining whether the console is interactive
-// Console is only considered interactive when the interactive flag has been set and an output format has not been defined.
+// Console is only considered interactive when the interactive
+// flag has been set and an output format has not been defined.
 func (options *ActionOptions) IsInteractive() bool {
 	return options.interactive && options.Formatter().Kind() == output.NoneFormat
 }
@@ -33,6 +34,21 @@ type DestroyOptions struct {
 	force bool
 	// Whether or not to purge any key vaults associated with the deployment
 	purge bool
+}
+
+type StateOptions struct {
+	// A value used to lookup the state of a specific deployment
+	hint string
+}
+
+func NewStateOptions(hint string) *StateOptions {
+	return &StateOptions{
+		hint: hint,
+	}
+}
+
+func (o *StateOptions) Hint() string {
+	return o.hint
 }
 
 func (o *DestroyOptions) Purge() bool {

@@ -1,114 +1,393 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
 package infra
 
 import (
-	"context"
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/azure/azure-dev/cli/azd/pkg/exec"
-	"github.com/azure/azure-dev/cli/azd/pkg/tools/azcli"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
+	"github.com/azure/azure-dev/cli/azd/pkg/azapi"
+	"github.com/azure/azure-dev/cli/azd/pkg/azure"
 	"github.com/azure/azure-dev/cli/azd/test/mocks"
+	"github.com/azure/azure-dev/cli/azd/test/mocks/mockazapi"
 	"github.com/stretchr/testify/require"
 )
 
 func TestScopeGetDeployment(t *testing.T) {
-	outputs := make(map[string]azcli.AzCliDeploymentOutput)
-	outputs["APP_URL"] = azcli.AzCliDeploymentOutput{
+	outputs := make(map[string]azapi.AzCliDeploymentOutput)
+	outputs["APP_URL"] = azapi.AzCliDeploymentOutput{
 		Type:  "string",
 		Value: "https://www.myapp.com",
 	}
 
-	deployment := azcli.AzCliDeploymentResult{
-		Properties: azcli.AzCliDeploymentResultProperties{
-			Outputs: outputs,
+	// mocked response for get deployment from subscription
+	deploymentWithOptions := &armresources.DeploymentsClientGetAtSubscriptionScopeResponse{
+		DeploymentExtended: armresources.DeploymentExtended{
+			ID: new(
+				"/subscriptions/SUBSCRIPTION_ID/providers/Microsoft.Resources/deployments/DEPLOYMENT_NAME",
+			),
+			Location: new("eastus2"),
+			Type:     new("Microsoft.Resources/deployments"),
+			Tags:     map[string]*string{},
+			Name:     new("DEPLOYMENT_NAME"),
+			Properties: &armresources.DeploymentPropertiesExtended{
+				ProvisioningState: to.Ptr(armresources.ProvisioningStateCreated),
+				Outputs:           outputs,
+				Timestamp:         new(time.Now().UTC()),
+			},
 		},
 	}
-	deploymentBytes, _ := json.Marshal(deployment)
+	deploymentResourceGroupWithOptions := &armresources.DeploymentsClientGetResponse{
+		DeploymentExtended: armresources.DeploymentExtended{
+			ID: new(
+				"/subscriptions/SUBSCRIPTION_ID/providers/Microsoft.Resources/deployments/DEPLOYMENT_NAME",
+			),
+			Location: new("eastus2"),
+			Type:     new("Microsoft.Resources/deployments"),
+			Tags:     map[string]*string{},
+			Name:     new("DEPLOYMENT_NAME"),
+			Properties: &armresources.DeploymentPropertiesExtended{
+				ProvisioningState: to.Ptr(armresources.ProvisioningStateCreated),
+				Outputs:           outputs,
+				Timestamp:         new(time.Now().UTC()),
+			},
+		},
+	}
 
 	t.Run("SubscriptionScopeSuccess", func(t *testing.T) {
-		mockContext := mocks.NewMockContext(context.Background())
-		mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
-			return strings.Contains(command, "az deployment sub show")
-		}).Respond(exec.NewRunResult(0, string(deploymentBytes), ""))
+		mockContext := mocks.NewMockContext(t.Context())
+		deploymentService := mockazapi.NewDeploymentsServiceFromMockContext(mockContext)
 
-		scope := NewSubscriptionScope(*mockContext.Context, "eastus2", "SUBSCRIPTION_ID", "DEPLOYMENT_NAME")
+		subscriptionId := "SUBSCRIPTION_ID"
+		deploymentName := "DEPLOYMENT_NAME"
 
-		deployment, err := scope.GetDeployment(*mockContext.Context)
+		mockContext.HttpClient.When(func(request *http.Request) bool {
+			return request.Method == http.MethodGet && strings.Contains(
+				request.URL.Path,
+				fmt.Sprintf(
+					"/subscriptions/%s/providers/Microsoft.Resources/deployments/%s",
+					subscriptionId,
+					deploymentName),
+			)
+		}).RespondFn(func(request *http.Request) (*http.Response, error) {
+			subscriptionsListBytes, _ := json.Marshal(deploymentWithOptions)
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(bytes.NewBuffer(subscriptionsListBytes)),
+			}, nil
+		})
+
+		scope := newSubscriptionScope(deploymentService, subscriptionId, "eastus2")
+		target := NewSubscriptionDeployment(
+			scope,
+			deploymentName,
+		)
+
+		deployment, err := target.Get(*mockContext.Context)
 		require.NoError(t, err)
-		require.Equal(t, outputs["APP_URL"].Value, deployment.Properties.Outputs["APP_URL"].Value)
+		responseOutputs := deployment.Outputs.(map[string]any)["APP_URL"].(map[string]any)
+		require.Equal(t, outputs["APP_URL"].Value, responseOutputs["value"].(string))
+		require.Equal(t, outputs["APP_URL"].Type, responseOutputs["type"].(string))
 	})
 
 	t.Run("ResourceGroupScopeSuccess", func(t *testing.T) {
-		mockContext := mocks.NewMockContext(context.Background())
-		mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
-			return strings.Contains(command, "az deployment group show")
-		}).Respond(exec.NewRunResult(0, string(deploymentBytes), ""))
+		mockContext := mocks.NewMockContext(t.Context())
+		deploymentService := mockazapi.NewDeploymentsServiceFromMockContext(mockContext)
 
-		scope := NewResourceGroupScope(*mockContext.Context, "SUBSCRIPTION_ID", "RESOURCE_GROUP", "DEPLOYMENT_NAME")
+		subscriptionId := "SUBSCRIPTION_ID"
+		deploymentName := "DEPLOYMENT_NAME"
+		resourceGroupName := "RESOURCE_GROUP"
 
-		deployment, err := scope.GetDeployment(*mockContext.Context)
+		mockContext.HttpClient.When(func(request *http.Request) bool {
+			return request.Method == http.MethodGet && strings.Contains(
+				request.URL.Path,
+				fmt.Sprintf(
+					"/subscriptions/%s/resourcegroups/%s/providers/Microsoft.Resources/deployments/%s",
+					subscriptionId,
+					resourceGroupName,
+					deploymentName),
+			)
+		}).RespondFn(func(request *http.Request) (*http.Response, error) {
+			subscriptionsListBytes, _ := json.Marshal(deploymentResourceGroupWithOptions)
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(bytes.NewBuffer(subscriptionsListBytes)),
+			}, nil
+		})
+
+		scope := newResourceGroupScope(deploymentService, subscriptionId, resourceGroupName)
+		target := NewResourceGroupDeployment(
+			scope,
+			deploymentName,
+		)
+
+		deployment, err := target.Get(*mockContext.Context)
 		require.NoError(t, err)
-		require.Equal(t, outputs["APP_URL"].Value, deployment.Properties.Outputs["APP_URL"].Value)
+		responseOutputs := deployment.Outputs.(map[string]any)["APP_URL"].(map[string]any)
+		require.Equal(t, outputs["APP_URL"].Value, responseOutputs["value"].(string))
+		require.Equal(t, outputs["APP_URL"].Type, responseOutputs["type"].(string))
 	})
+}
+
+var deploymentExtended = armresources.DeploymentExtended{
+	ID:       new("/subscriptions/SUBSCRIPTION_ID/providers/Microsoft.Resources/deployments/DEPLOYMENT_NAME"),
+	Location: new("eastus2"),
+	Type:     new("Microsoft.Resources/deployments"),
+	Tags:     map[string]*string{},
+	Name:     new("DEPLOYMENT_NAME"),
+	Properties: &armresources.DeploymentPropertiesExtended{
+		ProvisioningState: to.Ptr(armresources.ProvisioningStateSucceeded),
+		Timestamp:         new(time.Now().UTC()),
+	},
 }
 
 func TestScopeDeploy(t *testing.T) {
-	deployment := azcli.AzCliDeploymentResult{}
-	deploymentBytes, _ := json.Marshal(deployment)
-
 	t.Run("SubscriptionScopeSuccess", func(t *testing.T) {
-		mockContext := mocks.NewMockContext(context.Background())
-		mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
-			return strings.Contains(command, "az deployment sub create")
-		}).Respond(exec.NewRunResult(0, string(deploymentBytes), ""))
+		mockContext := mocks.NewMockContext(t.Context())
+		deploymentService := mockazapi.NewDeploymentsServiceFromMockContext(mockContext)
 
-		scope := NewSubscriptionScope(*mockContext.Context, "eastus2", "SUBSCRIPTION_ID", "DEPLOYMENT_NAME")
+		mockContext.HttpClient.When(func(request *http.Request) bool {
+			return request.Method == http.MethodPut && strings.Contains(
+				request.URL.Path,
+				"/subscriptions/SUBSCRIPTION_ID/providers/Microsoft.Resources/deployments/DEPLOYMENT_NAME",
+			)
+		}).RespondFn(func(request *http.Request) (*http.Response, error) {
+			return mocks.CreateHttpResponseWithBody(
+				request,
+				http.StatusCreated,
+				armresources.DeploymentsClientCreateOrUpdateAtSubscriptionScopeResponse{
+					DeploymentExtended: deploymentExtended,
+				},
+			)
+		})
 
-		err := scope.Deploy(*mockContext.Context, "/path/to/template.bicep", "path/to/params.json")
+		scope := newSubscriptionScope(deploymentService, "SUBSCRIPTION_ID", "eastus2")
+		target := NewSubscriptionDeployment(
+			scope,
+			"DEPLOYMENT_NAME",
+		)
+
+		armTemplate := azure.RawArmTemplate(testArmTemplate)
+		_, err := target.Deploy(*mockContext.Context, armTemplate, testArmParameters, nil, nil)
 		require.NoError(t, err)
 	})
 
 	t.Run("ResourceGroupScopeSuccess", func(t *testing.T) {
-		mockContext := mocks.NewMockContext(context.Background())
-		mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
-			return strings.Contains(command, "az deployment group create")
-		}).Respond(exec.NewRunResult(0, string(deploymentBytes), ""))
+		mockContext := mocks.NewMockContext(t.Context())
+		deploymentService := mockazapi.NewDeploymentsServiceFromMockContext(mockContext)
 
-		scope := NewResourceGroupScope(*mockContext.Context, "SUBSCRIPTION_ID", "RESOURCE_GROUP", "DEPLOYMENT_NAME")
+		mockContext.HttpClient.When(func(request *http.Request) bool {
+			return request.Method == http.MethodPut && strings.Contains(
+				request.URL.Path,
+				//nolint:lll
+				"/subscriptions/SUBSCRIPTION_ID/resourcegroups/RESOURCE_GROUP/providers/Microsoft.Resources/deployments/DEPLOYMENT_NAME",
+			)
+		}).RespondFn(func(request *http.Request) (*http.Response, error) {
+			return mocks.CreateHttpResponseWithBody(
+				request,
+				http.StatusCreated,
+				armresources.DeploymentsClientCreateOrUpdateResponse{
+					DeploymentExtended: deploymentExtended,
+				},
+			)
+		})
 
-		err := scope.Deploy(*mockContext.Context, "/path/to/template.bicep", "path/to/params.json")
+		scope := newResourceGroupScope(deploymentService, "SUBSCRIPTION_ID", "RESOURCE_GROUP")
+		target := NewResourceGroupDeployment(
+			scope,
+			"DEPLOYMENT_NAME",
+		)
+
+		armTemplate := azure.RawArmTemplate(testArmTemplate)
+		_, err := target.Deploy(*mockContext.Context, armTemplate, testArmParameters, nil, nil)
 		require.NoError(t, err)
 	})
+}
+
+var deploymentOperationsListResult = armresources.DeploymentOperationsListResult{
+	Value: []*armresources.DeploymentOperation{
+		{
+			ID:          new("operation-1"),
+			OperationID: new("operation-1"),
+			Properties: &armresources.DeploymentOperationProperties{
+				TargetResource: &armresources.TargetResource{
+					//nolint:lll
+					ID: new(
+						"/subscriptions/SUBSCRIPTION_ID/resourceGroups/RESOURCE_GROUP/providers/Microsoft.Storage/storageAccounts/storage-account-name",
+					),
+					ResourceName: new("storage-account-name"),
+					ResourceType: new("Microsoft.Storage/storageAccounts"),
+				},
+			},
+		},
+	},
 }
 
 func TestScopeGetResourceOperations(t *testing.T) {
-	operations := []azcli.AzCliResourceOperation{}
-	deploymentBytes, _ := json.Marshal(operations)
-
 	t.Run("SubscriptionScopeSuccess", func(t *testing.T) {
-		mockContext := mocks.NewMockContext(context.Background())
-		mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
-			return strings.Contains(command, "az deployment operation sub list")
-		}).Respond(exec.NewRunResult(0, string(deploymentBytes), ""))
+		mockContext := mocks.NewMockContext(t.Context())
+		deploymentService := mockazapi.NewDeploymentsServiceFromMockContext(mockContext)
 
-		scope := NewSubscriptionScope(*mockContext.Context, "eastus2", "SUBSCRIPTION_ID", "DEPLOYMENT_NAME")
+		mockContext.HttpClient.When(func(request *http.Request) bool {
+			return request.Method == http.MethodGet && strings.Contains(
+				request.URL.Path,
+				"/subscriptions/SUBSCRIPTION_ID/providers/Microsoft.Resources/deployments/DEPLOYMENT_NAME/operations",
+			)
+		}).RespondFn(func(request *http.Request) (*http.Response, error) {
+			return mocks.CreateHttpResponseWithBody(
+				request,
+				http.StatusOK,
+				armresources.DeploymentOperationsClientListAtScopeResponse{
+					DeploymentOperationsListResult: deploymentOperationsListResult,
+				},
+			)
+		})
 
-		operations, err := scope.GetResourceOperations(*mockContext.Context)
+		scope := newSubscriptionScope(deploymentService, "SUBSCRIPTION_ID", "eastus2")
+		target := NewSubscriptionDeployment(
+			scope,
+			"DEPLOYMENT_NAME",
+		)
+
+		operations, err := target.Operations(*mockContext.Context)
 		require.NoError(t, err)
-		require.Len(t, operations, 0)
+		require.Len(t, operations, 1)
 	})
 
 	t.Run("ResourceGroupScopeSuccess", func(t *testing.T) {
-		mockContext := mocks.NewMockContext(context.Background())
-		mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
-			return strings.Contains(command, "az deployment operation group list")
-		}).Respond(exec.NewRunResult(0, string(deploymentBytes), ""))
+		mockContext := mocks.NewMockContext(t.Context())
+		deploymentService := mockazapi.NewDeploymentsServiceFromMockContext(mockContext)
 
-		scope := NewResourceGroupScope(*mockContext.Context, "SUBSCRIPTION_ID", "RESOURCE_GROUP", "DEPLOYMENT_NAME")
+		mockContext.HttpClient.When(func(request *http.Request) bool {
+			return request.Method == http.MethodGet && strings.Contains(
+				request.URL.Path,
+				"/subscriptions/SUBSCRIPTION_ID/resourcegroups/RESOURCE_GROUP/deployments/DEPLOYMENT_NAME/operations",
+			)
+		}).RespondFn(func(request *http.Request) (*http.Response, error) {
+			return mocks.CreateHttpResponseWithBody(
+				request,
+				http.StatusOK,
+				armresources.DeploymentOperationsClientListAtSubscriptionScopeResponse{
+					DeploymentOperationsListResult: deploymentOperationsListResult,
+				},
+			)
+		})
 
-		operations, err := scope.GetResourceOperations(*mockContext.Context)
+		scope := newResourceGroupScope(deploymentService, "SUBSCRIPTION_ID", "RESOURCE_GROUP")
+		target := NewResourceGroupDeployment(
+			scope,
+			"DEPLOYMENT_NAME",
+		)
+
+		operations, err := target.Operations(*mockContext.Context)
 		require.NoError(t, err)
-		require.Len(t, operations, 0)
+		require.Len(t, operations, 1)
 	})
 }
+
+func TestScopeCancel(t *testing.T) {
+	t.Run("SubscriptionScopeSuccess", func(t *testing.T) {
+		mockContext := mocks.NewMockContext(t.Context())
+		deploymentService := mockazapi.NewDeploymentsServiceFromMockContext(mockContext)
+
+		called := false
+		mockContext.HttpClient.When(func(request *http.Request) bool {
+			return request.Method == http.MethodPost && strings.Contains(
+				request.URL.Path,
+				"/subscriptions/SUBSCRIPTION_ID/providers/Microsoft.Resources/deployments/DEPLOYMENT_NAME/cancel",
+			)
+		}).RespondFn(func(request *http.Request) (*http.Response, error) {
+			called = true
+			return mocks.CreateEmptyHttpResponse(request, http.StatusNoContent)
+		})
+
+		scope := newSubscriptionScope(deploymentService, "SUBSCRIPTION_ID", "eastus2")
+		target := NewSubscriptionDeployment(scope, "DEPLOYMENT_NAME")
+		require.NoError(t, target.Cancel(*mockContext.Context))
+		require.True(t, called, "expected ARM cancel endpoint to be called")
+	})
+
+	t.Run("ResourceGroupScopeSuccess", func(t *testing.T) {
+		mockContext := mocks.NewMockContext(t.Context())
+		deploymentService := mockazapi.NewDeploymentsServiceFromMockContext(mockContext)
+
+		called := false
+		mockContext.HttpClient.When(func(request *http.Request) bool {
+			return request.Method == http.MethodPost && strings.Contains(
+				request.URL.Path,
+				//nolint:lll
+				"/subscriptions/SUBSCRIPTION_ID/resourcegroups/RESOURCE_GROUP/providers/Microsoft.Resources/deployments/DEPLOYMENT_NAME/cancel",
+			)
+		}).RespondFn(func(request *http.Request) (*http.Response, error) {
+			called = true
+			return mocks.CreateEmptyHttpResponse(request, http.StatusNoContent)
+		})
+
+		scope := newResourceGroupScope(deploymentService, "SUBSCRIPTION_ID", "RESOURCE_GROUP")
+		target := NewResourceGroupDeployment(scope, "DEPLOYMENT_NAME")
+		require.NoError(t, target.Cancel(*mockContext.Context))
+		require.True(t, called, "expected ARM cancel endpoint to be called")
+	})
+
+	t.Run("PropagatesError", func(t *testing.T) {
+		mockContext := mocks.NewMockContext(t.Context())
+		deploymentService := mockazapi.NewDeploymentsServiceFromMockContext(mockContext)
+
+		mockContext.HttpClient.When(func(request *http.Request) bool {
+			return request.Method == http.MethodPost && strings.Contains(request.URL.Path, "/cancel")
+		}).RespondFn(func(request *http.Request) (*http.Response, error) {
+			return mocks.CreateEmptyHttpResponse(request, http.StatusConflict)
+		})
+
+		scope := newSubscriptionScope(deploymentService, "SUBSCRIPTION_ID", "eastus2")
+		target := NewSubscriptionDeployment(scope, "DEPLOYMENT_NAME")
+		require.Error(t, target.Cancel(*mockContext.Context))
+	})
+}
+
+var testArmParameters = azure.ArmParameters{
+	"location": {
+		Value: "West US",
+	},
+}
+
+var testArmTemplate string = `{
+"$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
+"contentVersion": "1.0.0.0",
+"parameters": {
+	"location": {
+	"type": "string",
+	"allowedValues": [
+		"East US"
+	],
+	"metadata": {
+		"description": "Location to deploy to"
+	}
+	}
+},
+"resources": [
+	{
+	"type": "Microsoft.Compute/availabilitySets",
+	"name": "availabilitySet1",
+	"apiVersion": "2019-07-01",
+	"location": "[parameters('location')]",
+	"properties": {}
+	}
+],
+"outputs": {
+	"parameter": {
+	"type": "object",
+	"value": "[reference('Microsoft.Compute/availabilitySets/availabilitySet1')]"
+	}
+}}`

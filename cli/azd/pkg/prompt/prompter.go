@@ -1,0 +1,372 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package prompt
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"slices"
+
+	"github.com/MakeNowJust/heredoc/v2"
+	"github.com/azure/azure-dev/cli/azd/pkg/account"
+	"github.com/azure/azure-dev/cli/azd/pkg/azapi"
+	"github.com/azure/azure-dev/cli/azd/pkg/azure"
+	"github.com/azure/azure-dev/cli/azd/pkg/azureutil"
+	"github.com/azure/azure-dev/cli/azd/pkg/cloud"
+	"github.com/azure/azure-dev/cli/azd/pkg/config"
+	"github.com/azure/azure-dev/cli/azd/pkg/environment"
+	"github.com/azure/azure-dev/cli/azd/pkg/input"
+	"github.com/azure/azure-dev/cli/azd/pkg/stringutil"
+)
+
+type LocationFilterPredicate func(loc account.Location) bool
+
+type Prompter interface {
+	PromptSubscription(ctx context.Context, msg string) (subscriptionId string, err error)
+	PromptLocation(
+		ctx context.Context,
+		subId string,
+		msg string,
+		filter LocationFilterPredicate,
+		defaultLocation *string) (string, error)
+
+	// PromptResourceGroup prompts for an existing or optionally a new resource group.
+	// A location saved as AZURE_LOCATION is also prompted as part of creating a new resource group.
+	PromptResourceGroup(ctx context.Context, options PromptResourceOptions) (string, error)
+
+	// PromptResourceGroupFrom is like PromptResourceGroup, but it takes an existing subscription ID and location.
+	PromptResourceGroupFrom(
+		ctx context.Context, subscriptionId string, location string, options PromptResourceGroupFromOptions) (string, error)
+
+	// IsNoPromptMode returns true when --no-prompt is active and interactive prompts are disabled.
+	IsNoPromptMode() bool
+}
+
+type DefaultPrompter struct {
+	console           input.Console
+	env               *environment.Environment
+	accountManager    account.Manager
+	userConfigManager config.UserConfigManager
+	resourceService   *azapi.ResourceService
+	portalUrlBase     string
+}
+
+func NewDefaultPrompter(
+	env *environment.Environment,
+	console input.Console,
+	accountManager account.Manager,
+	userConfigManager config.UserConfigManager,
+	resourceService *azapi.ResourceService,
+	cloud *cloud.Cloud,
+) Prompter {
+	return &DefaultPrompter{
+		console:           console,
+		env:               env,
+		accountManager:    accountManager,
+		userConfigManager: userConfigManager,
+		resourceService:   resourceService,
+		portalUrlBase:     cloud.PortalUrlBase,
+	}
+}
+
+func (p *DefaultPrompter) PromptSubscription(ctx context.Context, msg string) (subscriptionId string, err error) {
+	subscriptionInfos, err := p.accountManager.GetSubscriptions(ctx)
+	if err != nil {
+		return "", fmt.Errorf("listing subscriptions: %w", err)
+	}
+
+	if len(subscriptionInfos) == 0 {
+		// NOTE: Error text must contain "no subscriptions found" to match the
+		// pattern in error_suggestions.yaml. Update both if rewording.
+		return "", errors.New(heredoc.Docf(
+			`no subscriptions found.
+			Ensure you have a subscription by visiting %s and search for Subscriptions in the search bar.
+			Once you have a subscription, run 'azd auth login' again to reload subscriptions.`,
+			p.portalUrlBase,
+		))
+	}
+
+	// Filter by AZURE_TENANT_ID if set (works in both prompt and no-prompt modes)
+	subscriptionInfos = filterByTenantEnvVar(subscriptionInfos)
+
+	// Tenant selection: if multiple tenants, prompt user to pick one
+	var selectedTenantId string
+	if !p.console.IsNoPromptMode() {
+		subscriptionInfos, selectedTenantId, err = promptAndFilterByTenant(
+			ctx, p.console, subscriptionInfos, p.accountManager.GetTenantDisplayNames)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	// Apply subscription filter if one exists for the selected tenant
+	var filterApplied bool
+	unfilteredSubs := subscriptionInfos
+	if selectedTenantId != "" && p.userConfigManager != nil {
+		userCfg, cfgErr := p.userConfigManager.Load()
+		if cfgErr == nil {
+			filterIds, hasFilter := LoadSubscriptionFilter(
+				userCfg, selectedTenantId,
+			)
+			if hasFilter {
+				subscriptionInfos, filterApplied = ApplySubscriptionFilter(
+					subscriptionInfos, filterIds,
+				)
+			}
+		}
+	}
+
+	slices.SortFunc(subscriptionInfos, func(a, b account.Subscription) int {
+		return stringutil.CompareLower(a.Name, b.Name)
+	})
+
+	// The default value is based on AZURE_SUBSCRIPTION_ID, falling back to whatever default subscription in
+	// set in azd's config.
+	defaultSubscriptionId := os.Getenv(environment.SubscriptionIdEnvVarName)
+	if defaultSubscriptionId == "" {
+		defaultSubscriptionId = p.accountManager.GetDefaultSubscriptionID(ctx)
+	}
+
+	// Show note when subscription filter is active
+	if filterApplied {
+		p.console.Message(ctx, FilteredSubscriptionNote)
+	}
+
+	subscriptionOptions, subscriptions, defaultSubscription :=
+		formatSubscriptionOptions(subscriptionInfos, defaultSubscriptionId)
+
+	// Add "Show all subscriptions" option when filter is active
+	if filterApplied {
+		nextIdx := len(subscriptionOptions) + 1
+		subscriptionOptions = append(
+			subscriptionOptions,
+			fmt.Sprintf("%2d. %s", nextIdx, ShowAllSubscriptionsOption),
+		)
+		subscriptions = append(
+			subscriptions, ShowAllSubscriptionsOption,
+		)
+	}
+
+	for subscriptionId == "" {
+		subscriptionSelectionIndex, err := p.console.Select(ctx, input.ConsoleOptions{
+			Message:      msg,
+			Options:      subscriptionOptions,
+			DefaultValue: defaultSubscription,
+		})
+
+		if err != nil {
+			return "", fmt.Errorf("reading subscription id: %w", err)
+		}
+
+		subscriptionId = subscriptions[subscriptionSelectionIndex]
+	}
+
+	// If "Show all subscriptions" was selected, re-prompt with full list
+	if subscriptionId == ShowAllSubscriptionsOption {
+		subscriptionId = ""
+		allSubs := unfilteredSubs
+
+		slices.SortFunc(allSubs, func(a, b account.Subscription) int {
+			return stringutil.CompareLower(a.Name, b.Name)
+		})
+
+		allOpts, allIds, allDefault := formatSubscriptionOptions(
+			allSubs, defaultSubscriptionId,
+		)
+
+		for subscriptionId == "" {
+			idx, selErr := p.console.Select(
+				ctx, input.ConsoleOptions{
+					Message:      msg,
+					Options:      allOpts,
+					DefaultValue: allDefault,
+				})
+			if selErr != nil {
+				return "", fmt.Errorf(
+					"reading subscription id: %w", selErr,
+				)
+			}
+			subscriptionId = allIds[idx]
+		}
+	}
+
+	if !p.accountManager.HasDefaultSubscription() {
+		if _, err := p.accountManager.SetDefaultSubscription(ctx, subscriptionId); err != nil {
+			log.Printf("failed setting default subscription. %v\n", err)
+		}
+	}
+
+	return subscriptionId, nil
+}
+
+// formatSubscriptionOptions formats subscription infos into display options.
+func formatSubscriptionOptions(
+	subscriptionInfos []account.Subscription,
+	defaultSubscriptionId string,
+) (options []string, ids []string, defaultOption any) {
+	options = make([]string, len(subscriptionInfos))
+	ids = make([]string, len(subscriptionInfos))
+
+	hideId := IsDemoModeEnabled()
+
+	for index, info := range subscriptionInfos {
+		if hideId {
+			options[index] = fmt.Sprintf("%2d. %s", index+1, info.Name)
+		} else {
+			options[index] = fmt.Sprintf(
+				"%2d. %s (%s)", index+1, info.Name, info.Id)
+		}
+
+		ids[index] = info.Id
+
+		if info.Id == defaultSubscriptionId {
+			defaultOption = options[index]
+		}
+	}
+
+	return options, ids, defaultOption
+}
+
+func (p *DefaultPrompter) PromptLocation(
+	ctx context.Context,
+	subId string,
+	msg string,
+	filter LocationFilterPredicate,
+	defaultLocation *string,
+) (string, error) {
+	loc, err := azureutil.PromptLocationWithFilter(ctx, subId, msg, "", p.console, p.accountManager, filter, defaultLocation)
+	if err != nil {
+		return "", err
+	}
+
+	if !p.accountManager.HasDefaultLocation() {
+		if _, err := p.accountManager.SetDefaultLocation(ctx, subId, loc); err != nil {
+			log.Printf("failed setting default location. %v\n", err)
+		}
+	}
+
+	return loc, nil
+}
+
+type PromptResourceOptions struct {
+	// DisableCreateNew disables the option to create a new resource group.
+	DisableCreateNew bool
+
+	// DefaultName is the default name to use when creating a new resource group.
+	// If not specified, the default name will be generated based on the environment name.
+	DefaultName string
+}
+
+func (p *DefaultPrompter) PromptResourceGroup(ctx context.Context, options PromptResourceOptions) (string, error) {
+	name := options.DefaultName
+	if name == "" {
+		name = fmt.Sprintf("rg-%s", p.env.Name())
+	}
+
+	return p.PromptResourceGroupFrom(
+		ctx,
+		p.env.GetSubscriptionId(),
+		p.env.GetLocation(),
+		PromptResourceGroupFromOptions{
+			Tags: map[string]string{
+				azure.TagKeyAzdEnvName: p.env.Name(),
+			},
+			DefaultName:      name,
+			DisableCreateNew: options.DisableCreateNew,
+		})
+}
+
+type PromptResourceGroupFromOptions struct {
+	Tags                  map[string]string
+	DefaultName           string
+	NewResourceGroupHelp  string
+	PickResourceGroupHelp string
+	DisableCreateNew      bool
+}
+
+func (p *DefaultPrompter) PromptResourceGroupFrom(
+	ctx context.Context, subscriptionId string, location string, options PromptResourceGroupFromOptions) (string, error) {
+	// Get current resource groups
+	groups, err := p.resourceService.ListResourceGroup(ctx, subscriptionId, nil)
+	if err != nil {
+		return "", fmt.Errorf("listing resource groups: %w", err)
+	}
+
+	slices.SortFunc(groups, func(a, b *azapi.Resource) int {
+		return stringutil.CompareLower(a.Name, b.Name)
+	})
+
+	canCreateNeResourceGroup := !options.DisableCreateNew
+
+	choices := make([]string, len(groups))
+	canCreateOverride := 0
+	if canCreateNeResourceGroup {
+		choices = make([]string, len(groups)+1)
+		choices[0] = "1. Create a new resource group"
+		canCreateOverride = 1
+	}
+	for idx, group := range groups {
+		choices[idx+canCreateOverride] = fmt.Sprintf("%d. %s", idx+canCreateOverride+1, group.Name)
+	}
+
+	pickPrompt := input.ConsoleOptions{
+		Message: "Pick a resource group to use:",
+		Options: choices,
+		Help:    options.PickResourceGroupHelp,
+	}
+
+	if canCreateNeResourceGroup && options.DefaultName != "" {
+		// Default selection to create new resource group with the default name provided
+		pickPrompt.DefaultValue = choices[0]
+	}
+
+	choice, err := p.console.Select(ctx, pickPrompt)
+	if err != nil {
+		return "", fmt.Errorf("selecting resource group: %w", err)
+	}
+
+	if !canCreateNeResourceGroup {
+		return groups[choice].Name, nil
+	}
+
+	if choice > 0 {
+		return groups[choice-1].Name, nil
+	}
+
+	if location == "" {
+		loc, err := p.PromptLocation(ctx, subscriptionId, "Select a location to create the resource group in:", nil, nil)
+		if err != nil {
+			return "", fmt.Errorf("prompting for location: %w", err)
+		}
+		location = loc
+	}
+
+	name, err := p.console.Prompt(ctx, input.ConsoleOptions{
+		Message:      "Enter a name for the new resource group:",
+		DefaultValue: options.DefaultName,
+		Help:         options.NewResourceGroupHelp,
+	})
+	if err != nil {
+		return "", fmt.Errorf("prompting for resource group name: %w", err)
+	}
+
+	tagsParam := make(map[string]*string, len(options.Tags))
+	for k, v := range options.Tags {
+		tagsParam[k] = new(v)
+	}
+
+	_, err = p.resourceService.CreateOrUpdateResourceGroup(ctx, subscriptionId, name, location, tagsParam)
+	if err != nil {
+		return "", fmt.Errorf("creating resource group: %w", err)
+	}
+
+	return name, nil
+}
+
+func (p *DefaultPrompter) IsNoPromptMode() bool {
+	return p.console.IsNoPromptMode()
+}

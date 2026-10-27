@@ -9,25 +9,70 @@ ignorePaths:
     - ./go.mod
     - ./go.sum
     - ./NOTICE.txt
-    - ./templates/common/NOTICE.txt
 words:
     - opentelemetry
     - bson
     - azdo
+    - choco
+    - winget
+    - bicepparam
+    - cmdhook
+    - containerapp
+    - containerapps
+    - Exegraph
+    - exegraph
+    - GOMAXPROCS
+    - unrecovered
 ignoreWords:
-    - magefile
+    - AADSTS
     - afwp
+    - apim
+    - appcontainers
     - appcs
     - appi
     - arck
+    - armauthorization
+    - armappcontainers
+    - armappservice
+    - armcontainerservice
+    - armkeyvault
+    - armresources
+    - armruntime
+    - armsubscriptions
+    - azconnection
+    - azurewebsites
+    - azcore
+    - Azdo
+    - azdrelease
+    - aztfmod
+    - azurecaf
+    - azurecr
+    - azuredevops
+    - azurerm
+    - azuresdkartifacts
+    - armcontainerregistry
+    - azidentity
+    - azsecrets
+    - beginswith
     - Bfor
     - bicepcli
     - cdne
     - cdnp
+    - chooks
+    - cloudshell
     - commandrunner
+    - configlist
+    - conjunction
+    - containerregistry
+    - containerservice
+    - dacl
+    - dapr
     - databricks
     - dedb
+    - devcenter
+    - devcontainer
     - dnsz
+    - euid
     - evgd
     - evgs
     - evgt
@@ -35,29 +80,66 @@ ignoreWords:
     - execfn
     - execmock
     - fdfp
+    - fics
     - Frontdoor
+    - golobby
+    - graphsdk
     - hndl
     - httpclient
+    - httptrigger
+    - infracreate
+    - infradelete
     - inputhelper
     - ippre
     - JOBOBJECT
     - kubernetes
     - kusto
+    - kubeconfig
+    - kubeconfigs
+    - kustomize
+    - magefile
+    - mainfic
+    - menuid
+    - middlewares
     - migr
+    - mockconfig
     - mockconsole
     - mockexec
     - mockhttp
     - MYDIR
+    - npipe
     - nsgsr
     - ntfns
+    - odata
     - osdisk
     - osexec
+    - oidc
     - pcert
     - pdnsz
     - Peerings
+    - pipefail
+    - PLACEHOLDERIACTOOLS
+    - postcommand
+    - postinit
+    - postbuild
+    - postpublish
+    - preinline
+    - prebuild
+    - precommand
+    - predeploy
+    - preinteractive
+    - prealias
     - provs
     - psql
     - pview
+    - resourcegroups
+    - resourcegroupterraform
+    - resourcegroupterraformremote
+    - Retryable
+    - sddl
+    - serviceendpoint
+    - serviceprincipalid
+    - serviceprincipalkey
     - sigr
     - snet
     - sqldb
@@ -67,34 +149,49 @@ ignoreWords:
     - srch
     - ssimp
     - stapp
+    - startswith
+    - stringutil
     - stvm
     - syndp
     - synsp
     - synw
+    - taskagent
     - TEAMPROJECTID
+    - tenantid
     - terraformcli
-    - tfvars
+    - tfsgit
     - tfstate
+    - tfvars
     - traf
+    - unmanage
     - useragent
+    - versioncontrol
     - vmss
     - vnet
     - vpng
     - vwan
     - wafrg
+    - westus
     - Wans
+    - winio
     - apim
     - Retryable
     - httptrigger
     - resourcegroups
     - resourcegroupterraform
     - resourcegroupterraformremote
+    - resourcemanager
     - devcontainer
     - azurecaf
     - azurerm
     - aztfmod
     - menuid
     - PLACEHOLDERIACTOOLS
+    - LOGANALYTICS
+    - venv
+    - webapprouting
+    - zipdeploy
+    - appinsights
 useGitignore: true
 dictionaryDefinitions:
     - name: gitHubUserAliases
@@ -107,8 +204,20 @@ dictionaryDefinitions:
       description: Custom Notice Dictionary
       addWords: true
       scope: workspace
+    - name: schemas
+      path: ./cspell-schemas.txt
+      description: Custom Schema Dictionary
+      addWords: true
+      scope: workspace
+    - name: devopsExtension
+      path: ./cspell-devops-ext.txt
+      description: Custom DevOps Extension Dictionary
+      addWords: true
+      scope: workspace
 dictionaries:
     - powershell
     - go
     - gitHubUserAliases
     - noticeMd
+    - schemas
+    - devopsExtension

@@ -1,0 +1,360 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package project
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/azure/azure-dev/cli/azd/pkg/async"
+	"github.com/azure/azure-dev/cli/azd/pkg/environment"
+	"github.com/azure/azure-dev/cli/azd/pkg/exec"
+	"github.com/azure/azure-dev/cli/azd/pkg/infra/provisioning"
+	"github.com/azure/azure-dev/cli/azd/pkg/osutil"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools/dotnet"
+	"github.com/azure/azure-dev/cli/azd/test/mocks"
+	"github.com/azure/azure-dev/cli/azd/test/ostest"
+)
+
+func TestBicepOutputsWithDoubleUnderscoresAreConverted(t *testing.T) {
+	mockContext := mocks.NewMockContext(t.Context())
+
+	var secrets map[string]string
+
+	mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
+		return strings.Contains(command, "dotnet user-secrets set")
+	}).RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+		t.Logf("dotnet user-secrets set was called with: %+v", args)
+
+		jsonBytes, err := io.ReadAll(args.StdIn)
+		require.NoError(t, err)
+		err = json.Unmarshal(jsonBytes, &secrets)
+		require.NoError(t, err)
+
+		return exec.NewRunResult(0, "", ""), nil
+	})
+
+	serviceConfig := &ServiceConfig{
+		Project: &ProjectConfig{
+			Path: "/sample/path/for/test",
+		},
+		RelativePath: "",
+	}
+
+	dotNetCli := dotnet.NewCli(mockContext.CommandRunner)
+	dp := NewDotNetProject(dotNetCli, environment.New("test")).(*dotnetProject)
+
+	err := dp.setUserSecretsFromOutputs(*mockContext.Context, serviceConfig, ServiceLifecycleEventArgs{
+		ServiceContext: NewServiceContext(),
+		Args: map[string]any{
+			"bicepOutput": map[string]provisioning.OutputParameter{
+				"EXAMPLE_OUTPUT":          {Type: "string", Value: "foo"},
+				"EXAMPLE__NESTED__OUTPUT": {Type: "string", Value: "bar"},
+			},
+		},
+	})
+
+	require.NoError(t, err)
+	require.Len(t, secrets, 2)
+
+	require.Equal(t, "bar", secrets["EXAMPLE:NESTED:OUTPUT"])
+	require.Equal(t, "foo", secrets["EXAMPLE_OUTPUT"])
+}
+
+func Test_DotNetProject_Init(t *testing.T) {
+	ranUserSecrets := false
+	var runArgs exec.RunArgs
+
+	ostest.Chdir(t, t.TempDir())
+	err := os.MkdirAll("./src/api", osutil.PermissionDirectory)
+	require.NoError(t, err)
+	file, err := os.Create("./src/api/test.csproj")
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+
+	mockContext := mocks.NewMockContext(t.Context())
+	mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
+		return strings.Contains(command, "dotnet user-secrets init")
+	}).RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+		return exec.NewRunResult(0, "", ""), nil
+	})
+	mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
+		return strings.Contains(command, "dotnet user-secrets set")
+	}).RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+		ranUserSecrets = true
+		runArgs = args
+
+		return exec.NewRunResult(0, "", ""), nil
+	})
+
+	env := environment.New("test")
+	dotNetCli := dotnet.NewCli(mockContext.CommandRunner)
+	serviceConfig := createTestServiceConfig("./src/api/test.csproj", AppServiceTarget, ServiceLanguageDotNet)
+
+	dotnetProject := NewDotNetProject(dotNetCli, env)
+
+	err = dotnetProject.Initialize(*mockContext.Context, serviceConfig)
+	require.NoError(t, err)
+
+	eventArgs := ServiceLifecycleEventArgs{
+		Project:        serviceConfig.Project,
+		Service:        serviceConfig,
+		ServiceContext: NewServiceContext(),
+		Args: map[string]any{
+			"bicepOutput": map[string]provisioning.OutputParameter{
+				"EXAMPLE_OUTPUT": {Type: "string", Value: "value"},
+			},
+		},
+	}
+
+	err = serviceConfig.RaiseEvent(*mockContext.Context, ServiceEventEnvUpdated, eventArgs)
+	require.NoError(t, err)
+	require.True(t, ranUserSecrets)
+
+	jsonBytes, err := io.ReadAll(runArgs.StdIn)
+	require.NoError(t, err)
+	require.Contains(t, string(jsonBytes), "EXAMPLE_OUTPUT")
+}
+
+func Test_DotNetProject_Restore(t *testing.T) {
+	var runArgs exec.RunArgs
+	ostest.Chdir(t, t.TempDir())
+	err := os.MkdirAll("./src/api", osutil.PermissionDirectory)
+	require.NoError(t, err)
+	file, err := os.Create("./src/api/test.csproj")
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+
+	// add another *proj file to test multiple project files condition
+	file2, err := os.Create("./src/api/test2.vbproj")
+	require.NoError(t, err)
+	require.NoError(t, file2.Close())
+
+	mockContext := mocks.NewMockContext(t.Context())
+	mockContext.CommandRunner.
+		When(func(args exec.RunArgs, command string) bool {
+			return strings.Contains(command, "dotnet restore")
+		}).
+		RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+			runArgs = args
+			return exec.NewRunResult(0, "", ""), nil
+		})
+
+	env := environment.New("test")
+	dotNetCli := dotnet.NewCli(mockContext.CommandRunner)
+	serviceConfig := createTestServiceConfig("./src/api/test.csproj", AppServiceTarget, ServiceLanguageCsharp)
+
+	dotnetProject := NewDotNetProject(dotNetCli, env)
+	serviceContext := NewServiceContext()
+	result, err := logProgress(t, func(progess *async.Progress[ServiceProgress]) (*ServiceRestoreResult, error) {
+		return dotnetProject.Restore(*mockContext.Context, serviceConfig, serviceContext, progess)
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "dotnet", runArgs.Cmd)
+	require.Equal(t,
+		[]string{"restore", serviceConfig.RelativePath},
+		runArgs.Args,
+	)
+}
+
+func Test_DotNetProject_Build(t *testing.T) {
+	tempDir := t.TempDir()
+	ostest.Chdir(t, tempDir)
+
+	var runArgs exec.RunArgs
+	err := os.MkdirAll("./src/api", osutil.PermissionDirectory)
+	require.NoError(t, err)
+	// add only one project file to test only project file condition
+	file, err := os.Create("./src/api/test.csproj")
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+
+	mockContext := mocks.NewMockContext(t.Context())
+	mockContext.CommandRunner.
+		When(func(args exec.RunArgs, command string) bool {
+			return strings.Contains(command, "dotnet build")
+		}).
+		RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+			runArgs = args
+			return exec.NewRunResult(0, "", ""), nil
+		})
+
+	env := environment.New("test")
+	dotNetCli := dotnet.NewCli(mockContext.CommandRunner)
+	serviceConfig := createTestServiceConfig("./src/api", AppServiceTarget, ServiceLanguageCsharp)
+
+	buildOutputDir := filepath.Join(serviceConfig.Path(), "bin", "Release", "net8.0")
+	err = os.MkdirAll(buildOutputDir, osutil.PermissionDirectory)
+	require.NoError(t, err)
+
+	dotnetProject := NewDotNetProject(dotNetCli, env)
+	result, err := logProgress(
+		t, func(progress *async.Progress[ServiceProgress]) (*ServiceBuildResult, error) {
+			return dotnetProject.Build(*mockContext.Context, serviceConfig, nil, progress)
+		},
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "dotnet", runArgs.Cmd)
+	require.Equal(t,
+		[]string{"build", filepath.Join(serviceConfig.RelativePath, "test.csproj"), "-c", "Release"},
+		runArgs.Args,
+	)
+}
+
+func Test_DotNetProject_Package(t *testing.T) {
+	var runArgs exec.RunArgs
+
+	tempDir := t.TempDir()
+	ostest.Chdir(t, tempDir)
+	err := os.MkdirAll("./src/api", osutil.PermissionDirectory)
+	require.NoError(t, err)
+	file, err := os.Create("./src/api/test.csproj")
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+
+	// add another two *proj files to test multiple project files condition
+	file2, err := os.Create("./src/api/test2.vbproj")
+	require.NoError(t, err)
+	require.NoError(t, file2.Close())
+
+	file3, err := os.Create("./src/api/test3.csproj")
+	require.NoError(t, err)
+	require.NoError(t, file3.Close())
+
+	var packageDest string
+
+	mockContext := mocks.NewMockContext(t.Context())
+	mockContext.CommandRunner.
+		When(func(args exec.RunArgs, command string) bool {
+			packageDest = args.Args[5]
+			err := os.WriteFile(filepath.Join(packageDest, "test.txt"), nil, osutil.PermissionFile)
+			require.NoError(t, err)
+
+			return strings.Contains(command, "dotnet publish")
+		}).
+		RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+			runArgs = args
+			return exec.NewRunResult(0, "", ""), nil
+		})
+
+	env := environment.New("test")
+	dotNetCli := dotnet.NewCli(mockContext.CommandRunner)
+	serviceConfig := createTestServiceConfig("./src/api/test3.csproj", AppServiceTarget, ServiceLanguageCsharp)
+
+	dotnetProject := NewDotNetProject(dotNetCli, env)
+
+	serviceContext := NewServiceContext()
+	serviceContext.Build = ArtifactCollection{
+		{
+			Kind:         ArtifactKindDirectory,
+			Location:     serviceConfig.Path(),
+			LocationKind: LocationKindLocal,
+			Metadata: map[string]string{
+				"framework": "dotnet",
+			},
+		},
+	}
+
+	result, err := logProgress(t, func(progress *async.Progress[ServiceProgress]) (*ServicePackageResult, error) {
+		return dotnetProject.Package(
+			*mockContext.Context,
+			serviceConfig,
+			serviceContext,
+			progress,
+		)
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Len(t, result.Artifacts, 1)
+	require.Equal(t, ArtifactKindDirectory, result.Artifacts[0].Kind)
+	require.NotEmpty(t, result.Artifacts[0].Location)
+	require.Equal(t, "dotnet", runArgs.Cmd)
+	require.Equal(t,
+		[]string{"publish",
+			serviceConfig.RelativePath,
+			"-c",
+			"Release",
+			"--output",
+			packageDest,
+		},
+		runArgs.Args,
+	)
+}
+
+func Test_DotNetProject_Package_UsesIsolatedArtifacts(t *testing.T) {
+	t.Chdir(t.TempDir())
+	require.NoError(t, os.MkdirAll("./src/api", osutil.PermissionDirectory))
+	file, err := os.Create("./src/api/test.csproj")
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+
+	var publishArgs exec.RunArgs
+	mockContext := mocks.NewMockContext(t.Context())
+	mockContext.CommandRunner.When(func(args exec.RunArgs, _ string) bool {
+		return args.Cmd == "dotnet" && len(args.Args) == 1 && args.Args[0] == "--version"
+	}).Respond(exec.NewRunResult(0, "8.0.100", ""))
+	mockContext.CommandRunner.When(func(args exec.RunArgs, _ string) bool {
+		return args.Cmd == "dotnet" && len(args.Args) > 0 && args.Args[0] == "publish"
+	}).RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+		publishArgs = args
+		packageDest := args.Args[5]
+		require.NoError(t, os.WriteFile(filepath.Join(packageDest, "test.txt"), nil, osutil.PermissionFile))
+		return exec.NewRunResult(0, "", ""), nil
+	})
+
+	serviceConfig := createTestServiceConfig("./src/api/test.csproj", AppServiceTarget, ServiceLanguageCsharp)
+	dotNetProject := NewDotNetProject(
+		dotnet.NewCli(mockContext.CommandRunner),
+		environment.New("test"),
+	)
+	ctx := ContextWithBuildGate(*mockContext.Context, &sync.Mutex{})
+
+	result, err := logProgress(t, func(progress *async.Progress[ServiceProgress]) (*ServicePackageResult, error) {
+		return dotNetProject.Package(ctx, serviceConfig, NewServiceContext(), progress)
+	})
+
+	require.NoError(t, err)
+	require.Len(t, result.Artifacts, 1)
+	packageDest := publishArgs.Args[5]
+	t.Cleanup(func() {
+		require.NoError(t, osutil.RemoveAll(context.WithoutCancel(t.Context()), packageDest))
+	})
+	require.Equal(t, packageDest, result.Artifacts[0].Location)
+	require.FileExists(t, filepath.Join(packageDest, "test.txt"))
+
+	artifactsPath := dotnetArtifactsPathArg(publishArgs.Args)
+	require.NotEmpty(t, artifactsPath)
+	require.NotEqual(t, packageDest, artifactsPath)
+	_, statErr := os.Stat(artifactsPath)
+	require.ErrorIs(t, statErr, os.ErrNotExist)
+}
+
+func Test_dotnetProject_Requirements(t *testing.T) {
+	p := NewDotNetProject(dotnet.NewCli(exec.NewCommandRunner(nil)), environment.NewWithValues("test", nil))
+	reqs := p.Requirements()
+	assert.False(t, reqs.Package.RequireRestore)
+	assert.False(t, reqs.Package.RequireBuild)
+}
+
+func Test_dotnetProject_RequiredExternalTools(t *testing.T) {
+	cli := dotnet.NewCli(exec.NewCommandRunner(nil))
+	p := NewDotNetProject(cli, environment.NewWithValues("test", nil))
+	tools := p.RequiredExternalTools(t.Context(), &ServiceConfig{})
+	require.Len(t, tools, 1)
+	assert.Equal(t, cli, tools[0])
+}

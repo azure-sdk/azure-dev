@@ -1,0 +1,949 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package azapi
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"net/http"
+	"net/url"
+	"slices"
+	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
+	"github.com/azure/azure-dev/cli/azd/internal/tracing"
+	"github.com/azure/azure-dev/cli/azd/internal/tracing/events"
+	"github.com/azure/azure-dev/cli/azd/pkg/account"
+	"github.com/azure/azure-dev/cli/azd/pkg/async"
+	"github.com/azure/azure-dev/cli/azd/pkg/azure"
+	"github.com/azure/azure-dev/cli/azd/pkg/cloud"
+	"github.com/azure/azure-dev/cli/azd/pkg/convert"
+	"github.com/azure/azure-dev/cli/azd/pkg/output"
+	"github.com/benbjohnson/clock"
+)
+
+// cArmDeploymentNameLengthMax is the maximum length of the name of a deployment in ARM.
+const (
+	cArmDeploymentNameLengthMax = 64
+	cPortalUrlFragment          = "#view/HubsExtension/DeploymentDetailsBlade/~/overview/id"
+	cOutputsUrlFragment         = "#view/HubsExtension/DeploymentDetailsBlade/~/outputs/id"
+
+	// deployPollFrequency is the polling interval for ARM deploy/delete operations.
+	// Deployments complete in variable time, so polling faster than the 30s SDK default
+	// reduces tail latency. At 5s intervals each poller consumes ~12 reads/min. With the
+	// ARM read-rate limit of 1200 reads/5min/subscription, this is safe for up to ~20
+	// parallel LROs. If higher concurrency is needed, consider adaptive backoff on HTTP 429.
+	deployPollFrequency = 5 * time.Second
+
+	// slowPollFrequency is the polling interval for ARM WhatIf and Validate operations.
+	// These are consistently slow (30-90s), so aggressive polling provides no benefit and
+	// risks hitting the ARM read rate limit (1200 reads/5min) during large parallel deployments.
+	slowPollFrequency = 15 * time.Second
+)
+
+// Retry tuning for transient HTTP 404 (DeploymentNotFound) responses returned while
+// creating/polling an ARM deployment. ARM can briefly report DeploymentNotFound for a
+// deployment that was just submitted (read-after-write inconsistency, most often observed on
+// subscription-scoped deployments) even though the deployment was accepted and ultimately
+// succeeds. These are declared as vars (not consts) so tests can shorten the delays.
+var (
+	// deploymentRetryMaxRetries is the number of additional attempts made when ARM returns a
+	// retryable status code (including a transient 404) for a deployment create/poll request.
+	deploymentRetryMaxRetries int32 = 5
+
+	// deploymentRetryDelay is the initial backoff between retries of a deployment create/poll
+	// request. The SDK applies exponential backoff up to deploymentRetryMaxDelay.
+	deploymentRetryDelay = 3 * time.Second
+
+	// deploymentRetryMaxDelay caps the exponential backoff between deployment create/poll retries.
+	deploymentRetryMaxDelay = 15 * time.Second
+)
+
+// withDeploymentRetry returns a context configured to retry transient HTTP 404
+// (DeploymentNotFound) responses in addition to the default ARM-retryable status codes. ARM
+// occasionally returns a transient 404 while polling a deployment that was just submitted
+// (read-after-write inconsistency, most often on subscription-scoped deployments) even though
+// the deployment was accepted and ultimately succeeds. This context is applied only to the LRO
+// poller (not the initial submit), so a genuine submit-time 404 (e.g. missing resource group)
+// still fails fast while the poller converges with ARM instead of failing with
+// DeploymentNotFound. This mirrors the existing handling for transient 404s in
+// pkg/azsdk/zip_deploy_client.go.
+func withDeploymentRetry(ctx context.Context) context.Context {
+	return policy.WithRetryOptions(ctx, policy.RetryOptions{
+		MaxRetries:    deploymentRetryMaxRetries,
+		RetryDelay:    deploymentRetryDelay,
+		MaxRetryDelay: deploymentRetryMaxDelay,
+		StatusCodes: []int{
+			http.StatusRequestTimeout,      // 408
+			http.StatusTooManyRequests,     // 429
+			http.StatusInternalServerError, // 500
+			http.StatusBadGateway,          // 502
+			http.StatusServiceUnavailable,  // 503
+			http.StatusGatewayTimeout,      // 504
+			http.StatusNotFound,            // 404 (transient DeploymentNotFound)
+		},
+	})
+}
+
+type StandardDeployments struct {
+	credentialProvider account.SubscriptionCredentialProvider
+	armClientOptions   *arm.ClientOptions
+	resourceService    *ResourceService
+	cloud              *cloud.Cloud
+	clock              clock.Clock
+}
+
+func NewStandardDeployments(
+	credentialProvider account.SubscriptionCredentialProvider,
+	armClientOptions *arm.ClientOptions,
+	resourceService *ResourceService,
+	cloud *cloud.Cloud,
+	clock clock.Clock,
+) *StandardDeployments {
+	return &StandardDeployments{
+		credentialProvider: credentialProvider,
+		armClientOptions:   armClientOptions,
+		resourceService:    resourceService,
+		cloud:              cloud,
+		clock:              clock,
+	}
+}
+
+// GenerateDeploymentName creates a name to use for the deployment object for a given environment. It appends the current
+// unix time to the environment name (separated by a hyphen) to provide a unique name for each deployment. If the resulting
+// name is longer than the ARM limit, the longest suffix of the name under the limit is returned.
+func (ds *StandardDeployments) GenerateDeploymentName(baseName string) string {
+	name := fmt.Sprintf("%s-%d", baseName, ds.clock.Now().Unix())
+	if len(name) <= cArmDeploymentNameLengthMax {
+		return name
+	}
+
+	return name[len(name)-cArmDeploymentNameLengthMax:]
+}
+
+func (ds *StandardDeployments) CalculateTemplateHash(
+	ctx context.Context,
+	subscriptionId string,
+	template azure.RawArmTemplate,
+) (string, error) {
+	deploymentClient, err := ds.createDeploymentsClient(ctx, subscriptionId)
+	if err != nil {
+		return "", fmt.Errorf("creating deployments client: %w", err)
+	}
+
+	response, err := deploymentClient.CalculateTemplateHash(ctx, template, nil)
+	if err != nil {
+		return "", fmt.Errorf("calculating template hash: %w", err)
+	}
+
+	return *response.TemplateHashResult.TemplateHash, nil
+}
+
+func (ds *StandardDeployments) ListSubscriptionDeployments(
+	ctx context.Context,
+	subscriptionId string,
+) ([]*ResourceDeployment, error) {
+	deploymentClient, err := ds.createDeploymentsClient(ctx, subscriptionId)
+	if err != nil {
+		return nil, fmt.Errorf("creating deployments client: %w", err)
+	}
+
+	results := []*ResourceDeployment{}
+
+	pager := deploymentClient.NewListAtSubscriptionScopePager(nil)
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, deployment := range page.Value {
+			results = append(results, ds.convertFromArmDeployment(deployment))
+		}
+	}
+
+	return results, nil
+}
+
+func (ds *StandardDeployments) GetSubscriptionDeployment(
+	ctx context.Context,
+	subscriptionId string,
+	deploymentName string,
+) (*ResourceDeployment, error) {
+	deploymentClient, err := ds.createDeploymentsClient(ctx, subscriptionId)
+	if err != nil {
+		return nil, fmt.Errorf("creating deployments client: %w", err)
+	}
+
+	deployment, err := deploymentClient.GetAtSubscriptionScope(ctx, deploymentName, nil)
+	if err != nil {
+		if errDetails, ok := errors.AsType[*azcore.ResponseError](err); ok && errDetails.StatusCode == 404 {
+			return nil, ErrDeploymentNotFound
+		}
+		return nil, fmt.Errorf("getting deployment from subscription: %w", err)
+	}
+
+	return ds.convertFromArmDeployment(&deployment.DeploymentExtended), nil
+}
+
+func (ds *StandardDeployments) ListResourceGroupDeployments(
+	ctx context.Context,
+	subscriptionId string,
+	resourceGroupName string,
+) ([]*ResourceDeployment, error) {
+	deploymentClient, err := ds.createDeploymentsClient(ctx, subscriptionId)
+	if err != nil {
+		return nil, fmt.Errorf("creating deployments client: %w", err)
+	}
+
+	results := []*ResourceDeployment{}
+
+	pager := deploymentClient.NewListByResourceGroupPager(resourceGroupName, nil)
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, deployment := range page.Value {
+			results = append(results, ds.convertFromArmDeployment(deployment))
+		}
+	}
+
+	return results, nil
+}
+
+func (ds *StandardDeployments) GetResourceGroupDeployment(
+	ctx context.Context,
+	subscriptionId string,
+	resourceGroupName string,
+	deploymentName string,
+) (*ResourceDeployment, error) {
+	deploymentClient, err := ds.createDeploymentsClient(ctx, subscriptionId)
+	if err != nil {
+		return nil, fmt.Errorf("creating deployments client: %w", err)
+	}
+
+	deployment, err := deploymentClient.Get(ctx, resourceGroupName, deploymentName, nil)
+	if err != nil {
+		if errDetails, ok := errors.AsType[*azcore.ResponseError](err); ok && errDetails.StatusCode == 404 {
+			return nil, ErrDeploymentNotFound
+		}
+		return nil, fmt.Errorf("getting deployment from resource group: %w", err)
+	}
+
+	return ds.convertFromArmDeployment(&deployment.DeploymentExtended), nil
+}
+
+func (ds *StandardDeployments) createDeploymentsClient(
+	ctx context.Context,
+	subscriptionId string,
+) (*armresources.DeploymentsClient, error) {
+	credential, err := ds.credentialProvider.CredentialForSubscription(ctx, subscriptionId)
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := armresources.NewDeploymentsClient(subscriptionId, credential, ds.armClientOptions)
+	if err != nil {
+		return nil, fmt.Errorf("creating deployments client: %w", err)
+	}
+
+	return client, nil
+}
+
+func (ds *StandardDeployments) DeployToSubscription(
+	ctx context.Context,
+	subscriptionId string,
+	location string,
+	deploymentName string,
+	armTemplate azure.RawArmTemplate,
+	parameters azure.ArmParameters,
+	tags map[string]*string,
+	options map[string]any,
+) (_ *ResourceDeployment, err error) {
+	ctx, span := tracing.Start(ctx, events.ArmDeploySubscriptionEvent)
+	defer func() { span.EndWithStatus(err) }()
+
+	deploymentClient, err := ds.createDeploymentsClient(ctx, subscriptionId)
+	if err != nil {
+		return nil, fmt.Errorf("creating deployments client: %w", err)
+	}
+
+	createFromTemplateOperation, err := deploymentClient.BeginCreateOrUpdateAtSubscriptionScope(
+		ctx, deploymentName,
+		armresources.Deployment{
+			Properties: &armresources.DeploymentProperties{
+				Template:   armTemplate,
+				Parameters: parameters,
+				Mode:       to.Ptr(armresources.DeploymentModeIncremental),
+			},
+			Location: new(location),
+			Tags:     tags,
+		}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("starting deployment to subscription: %w", err)
+	}
+
+	// Retry transient DeploymentNotFound (404) responses that ARM can return while polling a
+	// subscription-scoped deployment that was just submitted (read-after-write inconsistency).
+	// Scoped to the poller only so a genuine submit-time 404 still fails fast.
+	pollCtx := withDeploymentRetry(ctx)
+
+	// wait for deployment creation
+	deployResult, err := createFromTemplateOperation.PollUntilDone(pollCtx, &runtime.PollUntilDoneOptions{
+		Frequency: deployPollFrequency,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("deploying to subscription: %w", createDeploymentError(err, DeploymentOperationDeploy))
+	}
+
+	return ds.convertFromArmDeployment(&deployResult.DeploymentExtended), nil
+}
+
+func (ds *StandardDeployments) DeployToResourceGroup(
+	ctx context.Context,
+	subscriptionId, resourceGroup, deploymentName string,
+	armTemplate azure.RawArmTemplate,
+	parameters azure.ArmParameters,
+	tags map[string]*string,
+	options map[string]any,
+) (_ *ResourceDeployment, err error) {
+	ctx, span := tracing.Start(ctx, events.ArmDeployResourceGroupEvent)
+	defer func() { span.EndWithStatus(err) }()
+
+	deploymentClient, err := ds.createDeploymentsClient(ctx, subscriptionId)
+	if err != nil {
+		return nil, fmt.Errorf("creating deployments client: %w", err)
+	}
+
+	createFromTemplateOperation, err := deploymentClient.BeginCreateOrUpdate(
+		ctx, resourceGroup, deploymentName,
+		armresources.Deployment{
+			Properties: &armresources.DeploymentProperties{
+				Template:   armTemplate,
+				Parameters: parameters,
+				Mode:       to.Ptr(armresources.DeploymentModeIncremental),
+			},
+			Tags: tags,
+		}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("starting deployment to resource group: %w", err)
+	}
+
+	// Retry transient DeploymentNotFound (404) responses that ARM can return while polling a
+	// deployment that was just submitted (read-after-write inconsistency). Scoped to the poller
+	// only so a genuine submit-time 404 (e.g. missing resource group) still fails fast.
+	pollCtx := withDeploymentRetry(ctx)
+
+	// wait for deployment creation
+	deployResult, err := createFromTemplateOperation.PollUntilDone(pollCtx, &runtime.PollUntilDoneOptions{
+		Frequency: deployPollFrequency,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("deploying to resource group: %w", createDeploymentError(err, DeploymentOperationDeploy))
+	}
+
+	return ds.convertFromArmDeployment(&deployResult.DeploymentExtended), nil
+}
+
+func (ds *StandardDeployments) ListSubscriptionDeploymentOperations(
+	ctx context.Context,
+	subscriptionId string,
+	deploymentName string,
+) ([]*armresources.DeploymentOperation, error) {
+	result := []*armresources.DeploymentOperation{}
+	deploymentOperationsClient, err := ds.createDeploymentsOperationsClient(ctx, subscriptionId)
+	if err != nil {
+		return nil, fmt.Errorf("creating deployments client: %w", err)
+	}
+
+	// Get all without any filter
+	getDeploymentsPager := deploymentOperationsClient.NewListAtSubscriptionScopePager(deploymentName, nil)
+
+	for getDeploymentsPager.More() {
+		page, err := getDeploymentsPager.NextPage(ctx)
+		if errDetails, ok := errors.AsType[*azcore.ResponseError](err); ok && errDetails.StatusCode == 404 {
+			return nil, ErrDeploymentNotFound
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed getting list of deployment operations from subscription: %w", err)
+		}
+		result = append(result, page.Value...)
+	}
+
+	return result, nil
+}
+
+func (ds *StandardDeployments) ListResourceGroupDeploymentOperations(
+	ctx context.Context,
+	subscriptionId string,
+	resourceGroupName string,
+	deploymentName string,
+) ([]*armresources.DeploymentOperation, error) {
+	result := []*armresources.DeploymentOperation{}
+	deploymentOperationsClient, err := ds.createDeploymentsOperationsClient(ctx, subscriptionId)
+	if err != nil {
+		return nil, fmt.Errorf("creating deployments client: %w", err)
+	}
+
+	// Get all without any filter
+	getDeploymentsPager := deploymentOperationsClient.NewListPager(resourceGroupName, deploymentName, nil)
+
+	for getDeploymentsPager.More() {
+		page, err := getDeploymentsPager.NextPage(ctx)
+		if errDetails, ok := errors.AsType[*azcore.ResponseError](err); ok && errDetails.StatusCode == 404 {
+			return nil, ErrDeploymentNotFound
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed getting list of deployment operations from resource group: %w", err)
+		}
+		result = append(result, page.Value...)
+	}
+
+	return result, nil
+}
+
+func (ds *StandardDeployments) ListSubscriptionDeploymentResources(
+	ctx context.Context,
+	subscriptionId string,
+	deploymentName string,
+) ([]*armresources.ResourceReference, error) {
+	subscriptionDeployment, err := ds.GetSubscriptionDeployment(ctx, subscriptionId, deploymentName)
+	if err != nil {
+		return nil, fmt.Errorf("getting subscription deployment: %w", err)
+	}
+
+	resourceGroupNames := createdResourceGroupsFromDeployment(subscriptionDeployment)
+	allResources := []*armresources.ResourceReference{}
+
+	// Find all the resources from the resource groups created by this deployment.
+	for _, resourceGroupName := range resourceGroupNames {
+		resources, err := ds.resourceService.ListResourceGroupResources(ctx, subscriptionId, resourceGroupName, nil)
+		if err != nil {
+			return nil, fmt.Errorf("listing resource group resources: %w", err)
+		}
+
+		resourceGroupId := azure.ResourceGroupRID(subscriptionId, resourceGroupName)
+		allResources = append(allResources, &armresources.ResourceReference{
+			ID: &resourceGroupId,
+		})
+
+		for _, resource := range resources {
+			allResources = append(allResources, &armresources.ResourceReference{
+				ID: new(resource.Id),
+			})
+		}
+	}
+
+	return allResources, nil
+}
+
+// createdResourceGroupsFromDeployment extracts the unique resource groups created by a deployment.
+func createdResourceGroupsFromDeployment(deployment *ResourceDeployment) []string {
+	resourceGroups := map[string]struct{}{}
+
+	if deployment.ProvisioningState == DeploymentProvisioningStateSucceeded {
+		// For a successful deployment, only resource group output resources represent groups created by
+		// the deployment. Resources deployed into existing resource groups also appear in outputResources,
+		// but their resource group IDs do not.
+		for _, resourceRef := range deployment.Resources {
+			if resourceRef != nil && resourceRef.ID != nil {
+				resId, err := arm.ParseResourceID(*resourceRef.ID)
+				if err == nil && resId.ResourceType.Type == arm.ResourceGroupResourceType.Type {
+					resourceGroups[resId.ResourceGroupName] = struct{}{}
+				}
+			}
+		}
+	} else {
+		// For a non-succeeded deployment, the outputResources field may not be populated.
+		// Instead, look at nested deployment dependencies to find resource groups that were created before
+		// child deployments ran.
+		for _, dependency := range deployment.Dependencies {
+			if dependency.ResourceType != nil && *dependency.ResourceType == string(AzureResourceTypeDeployment) {
+				for _, dependent := range dependency.DependsOn {
+					if dependent.ResourceType != nil && *dependent.ResourceType == arm.ResourceGroupResourceType.String() {
+						if dependent.ResourceName != nil {
+							resourceGroups[*dependent.ResourceName] = struct{}{}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return slices.Collect(maps.Keys(resourceGroups))
+}
+
+func (ds *StandardDeployments) ListResourceGroupDeploymentResources(
+	ctx context.Context,
+	subscriptionId string,
+	resourceGroupName string,
+	deploymentName string,
+) ([]*armresources.ResourceReference, error) {
+	resources, err := ds.resourceService.ListResourceGroupResources(ctx, subscriptionId, resourceGroupName, nil)
+	if err != nil {
+		return nil, fmt.Errorf("listing resource group resources: %w", err)
+	}
+
+	resourceGroupId := azure.ResourceGroupRID(subscriptionId, resourceGroupName)
+
+	allResources := []*armresources.ResourceReference{}
+	allResources = append(allResources, &armresources.ResourceReference{
+		ID: &resourceGroupId,
+	})
+
+	for _, resource := range resources {
+		allResources = append(allResources, &armresources.ResourceReference{
+			ID: new(resource.Id),
+		})
+	}
+
+	return allResources, nil
+}
+
+func (ds *StandardDeployments) DeleteSubscriptionDeployment(
+	ctx context.Context,
+	subscriptionId string,
+	deploymentName string,
+	options map[string]any,
+	progress *async.Progress[DeleteDeploymentProgress],
+) error {
+	resources, err := ds.ListSubscriptionDeploymentResources(ctx, subscriptionId, deploymentName)
+	if err != nil {
+		return err
+	}
+
+	resourceGroups := map[string]struct{}{}
+	for _, resource := range resources {
+		resourceId, err := arm.ParseResourceID(*resource.ID)
+		if err != nil {
+			return fmt.Errorf("parsing resource ID: %w", err)
+		}
+
+		resourceGroups[resourceId.ResourceGroupName] = struct{}{}
+	}
+
+	for resourceGroup := range resourceGroups {
+		progress.SetProgress(DeleteDeploymentProgress{
+			Name:    resourceGroup,
+			Message: fmt.Sprintf("Deleting resource group %s", output.WithHighLightFormat(resourceGroup)),
+			State:   DeleteResourceStateInProgress,
+		})
+
+		if err := ds.resourceService.DeleteResourceGroup(ctx, subscriptionId, resourceGroup); err != nil {
+			progress.SetProgress(DeleteDeploymentProgress{
+				Name:    resourceGroup,
+				Message: fmt.Sprintf("Failed deleting resource group %s", output.WithHighLightFormat(resourceGroup)),
+				State:   DeleteResourceStateFailed,
+			})
+
+			return err
+		}
+
+		progress.SetProgress(DeleteDeploymentProgress{
+			Name:    resourceGroup,
+			Message: fmt.Sprintf("Deleted resource group %s", output.WithHighLightFormat(resourceGroup)),
+			State:   DeleteResourceStateSucceeded,
+		})
+	}
+
+	// Void the deployment state
+	return ds.voidSubscriptionDeploymentState(ctx, subscriptionId, deploymentName, options)
+}
+
+// voidSubscriptionDeploymentState deploys an empty template to void the provision state
+// and keep deployment history instead of deleting previous deployments.
+func (ds *StandardDeployments) voidSubscriptionDeploymentState(
+	ctx context.Context,
+	subscriptionId string,
+	deploymentName string,
+	options map[string]any,
+) error {
+	// Get deployment metadata
+	deployment, err := ds.GetSubscriptionDeployment(ctx, subscriptionId, deploymentName)
+	if err != nil {
+		return fmt.Errorf("subscription deployment '%s' not found: %w", deploymentName, err)
+	}
+
+	envName, has := deployment.Tags[azure.TagKeyAzdEnvName]
+	if has {
+		var emptyTemplate json.RawMessage = []byte(emptySubscriptionArmTemplate)
+		emptyDeploymentName := ds.GenerateDeploymentName(*envName)
+		tags := voidDeploymentTags(deployment)
+
+		_, err = ds.DeployToSubscription(
+			ctx,
+			subscriptionId,
+			deployment.Location,
+			emptyDeploymentName,
+			emptyTemplate,
+			azure.ArmParameters{},
+			tags,
+			options,
+		)
+
+		if err != nil {
+			return fmt.Errorf("deploying empty template to subscription: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func voidDeploymentTags(deployment *ResourceDeployment) map[string]*string {
+	tags := map[string]*string{
+		azure.TagKeyAzdEnvName: deployment.Tags[azure.TagKeyAzdEnvName],
+		"azd-deploy-reason":    new("down"),
+	}
+
+	if projectName, has := deployment.Tags[azure.TagKeyAzdProjectName]; has {
+		tags[azure.TagKeyAzdProjectName] = projectName
+	}
+	if layerName, has := deployment.Tags[azure.TagKeyAzdLayerName]; has {
+		tags[azure.TagKeyAzdLayerName] = layerName
+	}
+
+	return tags
+}
+
+func (ds *StandardDeployments) DeleteResourceGroupDeployment(
+	ctx context.Context,
+	subscriptionId,
+	resourceGroupName string,
+	deploymentName string,
+	options map[string]any,
+	progress *async.Progress[DeleteDeploymentProgress],
+) error {
+	progress.SetProgress(DeleteDeploymentProgress{
+		Name:    resourceGroupName,
+		Message: fmt.Sprintf("Deleting resource group %s", output.WithHighLightFormat(resourceGroupName)),
+		State:   DeleteResourceStateInProgress,
+	})
+
+	if err := ds.resourceService.DeleteResourceGroup(ctx, subscriptionId, resourceGroupName); err != nil {
+		progress.SetProgress(DeleteDeploymentProgress{
+			Name:    resourceGroupName,
+			Message: fmt.Sprintf("Failed resource group %s", output.WithHighLightFormat(resourceGroupName)),
+			State:   DeleteResourceStateFailed,
+		})
+
+		return err
+	}
+
+	progress.SetProgress(DeleteDeploymentProgress{
+		Name:    resourceGroupName,
+		Message: fmt.Sprintf("Deleted resource group %s", output.WithHighLightFormat(resourceGroupName)),
+		State:   DeleteResourceStateSucceeded,
+	})
+
+	return nil
+}
+
+// CancelSubscriptionDeployment requests Azure to cancel a running
+// subscription-scoped deployment. The ARM Cancel call returns immediately once
+// the request is accepted; callers should poll the deployment to observe the
+// terminal state (Canceled, Failed, or Succeeded).
+func (ds *StandardDeployments) CancelSubscriptionDeployment(
+	ctx context.Context,
+	subscriptionId string,
+	deploymentName string,
+) error {
+	deploymentClient, err := ds.createDeploymentsClient(ctx, subscriptionId)
+	if err != nil {
+		return fmt.Errorf("creating deployments client: %w", err)
+	}
+
+	if _, err := deploymentClient.CancelAtSubscriptionScope(ctx, deploymentName, nil); err != nil {
+		return fmt.Errorf("cancelling subscription deployment: %w", err)
+	}
+	return nil
+}
+
+// CancelResourceGroupDeployment requests Azure to cancel a running
+// resource-group-scoped deployment. The ARM Cancel call returns immediately
+// once the request is accepted; callers should poll the deployment to observe
+// the terminal state (Canceled, Failed, or Succeeded).
+func (ds *StandardDeployments) CancelResourceGroupDeployment(
+	ctx context.Context,
+	subscriptionId string,
+	resourceGroupName string,
+	deploymentName string,
+) error {
+	deploymentClient, err := ds.createDeploymentsClient(ctx, subscriptionId)
+	if err != nil {
+		return fmt.Errorf("creating deployments client: %w", err)
+	}
+
+	if _, err := deploymentClient.Cancel(ctx, resourceGroupName, deploymentName, nil); err != nil {
+		return fmt.Errorf("cancelling resource group deployment: %w", err)
+	}
+	return nil
+}
+
+func (ds *StandardDeployments) WhatIfDeployToSubscription(
+	ctx context.Context,
+	subscriptionId string,
+	location string,
+	deploymentName string,
+	armTemplate azure.RawArmTemplate,
+	parameters azure.ArmParameters,
+) (_ *armresources.WhatIfOperationResult, err error) {
+	ctx, span := tracing.Start(ctx, events.ArmWhatIfSubscriptionEvent)
+	defer func() { span.EndWithStatus(err) }()
+
+	deploymentClient, err := ds.createDeploymentsClient(ctx, subscriptionId)
+	if err != nil {
+		return nil, fmt.Errorf("creating deployments client: %w", err)
+	}
+
+	createFromTemplateOperation, err := deploymentClient.BeginWhatIfAtSubscriptionScope(
+		ctx, deploymentName,
+		armresources.DeploymentWhatIf{
+			Properties: &armresources.DeploymentWhatIfProperties{
+				Template:       armTemplate,
+				Parameters:     parameters,
+				Mode:           to.Ptr(armresources.DeploymentModeIncremental),
+				WhatIfSettings: &armresources.DeploymentWhatIfSettings{},
+			},
+			Location: new(location),
+		}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("starting deployment to subscription: %w", err)
+	}
+
+	// wait for deployment creation
+	deployResult, err := createFromTemplateOperation.PollUntilDone(ctx, &runtime.PollUntilDoneOptions{
+		Frequency: slowPollFrequency,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("deploying to subscription: %w", createDeploymentError(err, DeploymentOperationPreview))
+	}
+
+	return &deployResult.WhatIfOperationResult, nil
+}
+
+func (ds *StandardDeployments) WhatIfDeployToResourceGroup(
+	ctx context.Context,
+	subscriptionId, resourceGroup, deploymentName string,
+	armTemplate azure.RawArmTemplate,
+	parameters azure.ArmParameters,
+) (_ *armresources.WhatIfOperationResult, err error) {
+	ctx, span := tracing.Start(ctx, events.ArmWhatIfResourceGroupEvent)
+	defer func() { span.EndWithStatus(err) }()
+
+	deploymentClient, err := ds.createDeploymentsClient(ctx, subscriptionId)
+	if err != nil {
+		return nil, fmt.Errorf("creating deployments client: %w", err)
+	}
+
+	createFromTemplateOperation, err := deploymentClient.BeginWhatIf(
+		ctx, resourceGroup, deploymentName,
+		armresources.DeploymentWhatIf{
+			Properties: &armresources.DeploymentWhatIfProperties{
+				Template:   armTemplate,
+				Parameters: parameters,
+				Mode:       to.Ptr(armresources.DeploymentModeIncremental),
+			},
+		}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("starting deployment to resource group: %w", err)
+	}
+
+	// wait for deployment creation
+	deployResult, err := createFromTemplateOperation.PollUntilDone(ctx, &runtime.PollUntilDoneOptions{
+		Frequency: slowPollFrequency,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("deploying to resource group: %w", createDeploymentError(err, DeploymentOperationPreview))
+	}
+
+	return &deployResult.WhatIfOperationResult, nil
+}
+
+func (ds *StandardDeployments) createDeploymentsOperationsClient(
+	ctx context.Context,
+	subscriptionId string,
+) (*armresources.DeploymentOperationsClient, error) {
+	credential, err := ds.credentialProvider.CredentialForSubscription(ctx, subscriptionId)
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := armresources.NewDeploymentOperationsClient(subscriptionId, credential, ds.armClientOptions)
+	if err != nil {
+		return nil, fmt.Errorf("creating deployments client: %w", err)
+	}
+
+	return client, nil
+}
+
+// Converts from an ARM Extended Deployment to Azd Generic deployment
+func (ds *StandardDeployments) convertFromArmDeployment(deployment *armresources.DeploymentExtended) *ResourceDeployment {
+	return &ResourceDeployment{
+		Id:                *deployment.ID,
+		Location:          convert.ToValueWithDefault(deployment.Location, ""),
+		DeploymentId:      *deployment.ID,
+		Name:              *deployment.Name,
+		Type:              *deployment.Type,
+		Tags:              deployment.Tags,
+		ProvisioningState: convertFromStandardProvisioningState(*deployment.Properties.ProvisioningState),
+		Timestamp:         *deployment.Properties.Timestamp,
+		TemplateHash:      deployment.Properties.TemplateHash,
+		Outputs:           deployment.Properties.Outputs,
+		Resources:         deployment.Properties.OutputResources,
+		Dependencies:      deployment.Properties.Dependencies,
+
+		PortalUrl: fmt.Sprintf("%s/%s/%s",
+			ds.cloud.PortalUrlBase,
+			cPortalUrlFragment,
+			url.PathEscape(*deployment.ID),
+		),
+
+		OutputsUrl: fmt.Sprintf("%s/%s/%s",
+			ds.cloud.PortalUrlBase,
+			cOutputsUrlFragment,
+			url.PathEscape(*deployment.ID),
+		),
+
+		DeploymentUrl: fmt.Sprintf("%s/%s/%s",
+			ds.cloud.PortalUrlBase,
+			cPortalUrlFragment,
+			url.PathEscape(*deployment.ID),
+		),
+	}
+}
+
+func convertFromStandardProvisioningState(state armresources.ProvisioningState) DeploymentProvisioningState {
+	switch state {
+	case armresources.ProvisioningStateAccepted:
+		return DeploymentProvisioningStateAccepted
+	case armresources.ProvisioningStateCanceled:
+		return DeploymentProvisioningStateCanceled
+	case armresources.ProvisioningStateCreating:
+		return DeploymentProvisioningStateCreating
+	case armresources.ProvisioningStateDeleted:
+		return DeploymentProvisioningStateDeleted
+	case armresources.ProvisioningStateDeleting:
+		return DeploymentProvisioningStateDeleting
+	case armresources.ProvisioningStateFailed:
+		return DeploymentProvisioningStateFailed
+	case armresources.ProvisioningStateNotSpecified:
+		return DeploymentProvisioningStateNotSpecified
+	case armresources.ProvisioningStateReady:
+		return DeploymentProvisioningStateReady
+	case armresources.ProvisioningStateRunning:
+		return DeploymentProvisioningStateRunning
+	case armresources.ProvisioningStateSucceeded:
+		return DeploymentProvisioningStateSucceeded
+	case armresources.ProvisioningStateUpdating:
+		return DeploymentProvisioningStateUpdating
+	}
+
+	return DeploymentProvisioningState("")
+}
+
+// Preflight API validates whether the specified template is syntactically correct
+// and will be accepted by Azure Resource Manager.
+func (ds *StandardDeployments) ValidatePreflightToSubscription(
+	ctx context.Context,
+	subscriptionId string,
+	location string,
+	deploymentName string,
+	armTemplate azure.RawArmTemplate,
+	parameters azure.ArmParameters,
+	tags map[string]*string,
+	options map[string]any,
+) (err error) {
+	ctx, span := tracing.Start(ctx, events.ArmValidateSubscriptionEvent)
+	defer func() { span.EndWithStatus(err) }()
+
+	deploymentClient, err := ds.createDeploymentsClient(ctx, subscriptionId)
+	if err != nil {
+		return fmt.Errorf("creating deployments client: %w", err)
+	}
+
+	validateResult, err := deploymentClient.BeginValidateAtSubscriptionScope(
+		ctx, deploymentName,
+		armresources.Deployment{
+			Properties: &armresources.DeploymentProperties{
+				Template:   armTemplate,
+				Parameters: parameters,
+				Mode:       to.Ptr(armresources.DeploymentModeIncremental),
+			},
+			Location: new(location),
+			Tags:     tags,
+		}, nil)
+	if err != nil {
+		return fmt.Errorf(
+			"validating deployment to subscription: %w",
+			createDeploymentError(err, DeploymentOperationValidate),
+		)
+	}
+	_, err = validateResult.PollUntilDone(ctx, &runtime.PollUntilDoneOptions{
+		Frequency: slowPollFrequency,
+	})
+	if err != nil {
+		return fmt.Errorf(
+			"validating deployment to subscription: %w",
+			createDeploymentError(err, DeploymentOperationValidate),
+		)
+	}
+
+	return nil
+}
+
+// Preflight API validates whether the specified template is syntactically correct
+// and will be accepted by Azure Resource Manager.
+func (ds *StandardDeployments) ValidatePreflightToResourceGroup(
+	ctx context.Context,
+	subscriptionId, resourceGroup, deploymentName string,
+	armTemplate azure.RawArmTemplate,
+	parameters azure.ArmParameters,
+	tags map[string]*string,
+	options map[string]any,
+) (err error) {
+	ctx, span := tracing.Start(ctx, events.ArmValidateResourceGroupEvent)
+	defer func() { span.EndWithStatus(err) }()
+
+	deploymentClient, err := ds.createDeploymentsClient(ctx, subscriptionId)
+	if err != nil {
+		return fmt.Errorf("creating deployments client: %w", err)
+	}
+
+	validateResult, err := deploymentClient.BeginValidate(ctx, resourceGroup, deploymentName,
+		armresources.Deployment{
+			Properties: &armresources.DeploymentProperties{
+				Template:   armTemplate,
+				Parameters: parameters,
+				Mode:       to.Ptr(armresources.DeploymentModeIncremental),
+			},
+			Tags: tags,
+		}, nil)
+	if err != nil {
+		return fmt.Errorf(
+			"validating deployment to resource group: %w",
+			createDeploymentError(err, DeploymentOperationValidate),
+		)
+	}
+	_, err = validateResult.PollUntilDone(ctx, &runtime.PollUntilDoneOptions{
+		Frequency: slowPollFrequency,
+	})
+	if err != nil {
+		return fmt.Errorf(
+			"validating deployment to resource group: %w",
+			createDeploymentError(err, DeploymentOperationValidate),
+		)
+	}
+
+	return nil
+}

@@ -1,0 +1,139 @@
+- key: defaults.subscription
+  description: "Default Azure subscription ID to use for operations."
+  type: string
+  example: "00000000-0000-0000-0000-000000000000"
+- key: defaults.location
+  description: "Default Azure location/region to use for deployments."
+  type: string
+  example: "eastus"
+- key: provision.preflight
+  description: "Controls whether the server-side ARM preflight validation call runs before deployment. Set to 'off' to skip it and reduce deployment time."
+  type: string
+  allowedValues: ["on", "off"]
+  example: "on"
+- key: validation.provision
+  description: "Controls whether azd's local (client-side) provision validation runs before deployment. Set to 'off' to skip azd's pre-deployment checks (e.g. role assignment, AI model quota, reserved names)."
+  type: string
+  allowedValues: ["on", "off"]
+  example: "on"
+- key: alpha.all
+  description: "Enable or disable all alpha features at once."
+  type: string
+  allowedValues: ["on", "off"]
+  envVar: "AZD_ALPHA_ENABLE_ALL"
+- key: alpha.aks.helm
+  description: "Enable Helm support for AKS deployments."
+  type: string
+  allowedValues: ["on", "off"]
+  envVar: "AZD_ALPHA_ENABLE_AKS_HELM"
+- key: alpha.aks.kustomize
+  description: "Enable Kustomize support for AKS deployments."
+  type: string
+  allowedValues: ["on", "off"]
+  envVar: "AZD_ALPHA_ENABLE_AKS_KUSTOMIZE"
+- key: alpha.aca.persistDomains
+  description: "Do not change custom domains when deploying Azure Container Apps."
+  type: string
+  allowedValues: ["on", "off"]
+  envVar: "AZD_ALPHA_ENABLE_ACA_PERSISTDOMAINS"
+- key: alpha.azd.operations
+  description: "Extends provisioning providers with azd operations."
+  type: string
+  allowedValues: ["on", "off"]
+  envVar: "AZD_ALPHA_ENABLE_AZD_OPERATIONS"
+- key: alpha.aca.persistIngressSessionAffinity
+  description: "Do not change Ingress Session Affinity when deploying Azure Container Apps."
+  type: string
+  allowedValues: ["on", "off"]
+  envVar: "AZD_ALPHA_ENABLE_ACA_PERSISTINGRESSSESSIONAFFINITY"
+- key: alpha.deployment.stacks
+  description: "Enables Azure deployment stacks for ARM/Bicep based deployments."
+  type: string
+  allowedValues: ["on", "off"]
+  envVar: "AZD_ALPHA_ENABLE_DEPLOYMENT_STACKS"
+- key: alpha.llm
+  description: "Enables the use of LLMs in the CLI."
+  type: string
+  allowedValues: ["on", "off"]
+  envVar: "AZD_ALPHA_ENABLE_LLM"
+- key: alpha.language.custom
+  description: "Enables support for services to use custom language."
+  type: string
+  allowedValues: ["on", "off"]
+  envVar: "AZD_ALPHA_ENABLE_LANGUAGE_CUSTOM"
+- key: template.sources
+  description: "Custom template sources for azd template list and azd init."
+  type: object
+  example: "template.sources.<name>.type"
+- key: auth.useAzCliAuth
+  description: "Use Azure CLI authentication instead of azd-managed credentials."
+  type: string
+  allowedValues: ["true", "false"]
+  example: "true"
+- key: platform.type
+  description: "Platform type override for azd."
+  type: string
+  example: "devcenter"
+- key: platform.config
+  description: "Platform-specific configuration settings."
+  type: object
+  example: "platform.config.name"
+- key: cloud.name
+  description: "Azure cloud name to use for authentication and resource management."
+  type: string
+  allowedValues: ["AzureCloud", "AzureChinaCloud", "AzureUSGovernment"]
+  example: "AzureCloud"
+- key: copilot.model.type
+  description: "Default Copilot model provider."
+  type: string
+  example: "copilot"
+- key: copilot.model
+  description: "Default model to use for Copilot agent sessions."
+  type: string
+  example: "gpt-4.1"
+- key: copilot.reasoningEffort
+  description: "Reasoning effort level for the Copilot agent. Higher effort uses more premium requests."
+  type: string
+  allowedValues: ["low", "medium", "high"]
+  example: "medium"
+- key: copilot.mode
+  description: "Default agent mode for Copilot sessions."
+  type: string
+  allowedValues: ["autopilot", "interactive", "plan"]
+  example: "interactive"
+- key: copilot.mcp.servers
+  description: "Additional MCP servers to load in Copilot agent sessions. Merged with built-in servers."
+  type: object
+  example: "copilot.mcp.servers.<name>.type"
+- key: copilot.tools.available
+  description: "Allowlist of tools available to the Copilot agent. When set, only these tools are active."
+  type: array
+  example: '["read_file", "write_file"]'
+- key: copilot.tools.excluded
+  description: "Denylist of tools blocked from the Copilot agent."
+  type: array
+  example: '["execute_command"]'
+- key: copilot.skills.directories
+  description: "Additional skill directories to load in Copilot agent sessions."
+  type: array
+  example: '["./skills"]'
+- key: copilot.skills.disabled
+  description: "Skills to disable in Copilot agent sessions."
+  type: array
+  example: '["legacy-linter"]'
+- key: copilot.systemMessage
+  description: "Custom system message appended to the Copilot agent's default system prompt."
+  type: string
+  example: "Always use TypeScript for code generation."
+- key: copilot.logLevel
+  description: "Log level for the Copilot SDK client."
+  type: string
+  allowedValues: ["error", "warn", "info", "debug"]
+  example: "info"
+- key: pipeline.config.applicationServiceManagementReference
+  description: "Application Service Management Reference for Azure pipeline configuration."
+  type: string
+- key: (env) AZD_CONFIG_DIR
+  description: "Override the default configuration directory location."
+  type: envvar
+  example: "/path/to/config"

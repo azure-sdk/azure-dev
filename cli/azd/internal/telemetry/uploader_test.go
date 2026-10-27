@@ -1,9 +1,13 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
 package telemetry
 
 import (
 	"context"
 	"fmt"
 	"math/rand"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -11,7 +15,6 @@ import (
 	appinsightsexporter "github.com/azure/azure-dev/cli/azd/internal/telemetry/appinsights-exporter"
 	"github.com/benbjohnson/clock"
 	"github.com/stretchr/testify/assert"
-	"golang.org/x/exp/slices"
 )
 
 type InMemoryItem struct {
@@ -43,7 +46,10 @@ func (tq *InMemoryTelemetryQueue) EnqueueWithDelay(message []byte, delayDuration
 }
 
 func (tq *InMemoryTelemetryQueue) save(message []byte, delayDuration time.Duration, retryCount int) error {
+	//nolint:gosec // G404 - Use of weak random number generator - false positive in test
 	fileName := strconv.FormatUint(rand.Uint64(), 10)
+
+	//nolint:gosec // G404 - Use of weak random number generator - false positive in test
 	for _, exists := tq.itemMap[fileName]; exists; fileName = strconv.FormatUint(rand.Uint64(), 10) {
 	}
 
@@ -109,7 +115,11 @@ func NewTransmitterStub() *TransmitterStub {
 	}
 }
 
-func (tr *TransmitterStub) Transmit(payload []byte, items appinsightsexporter.TelemetryItems) (*appinsightsexporter.TransmissionResult, error) {
+func (tr *TransmitterStub) Transmit(
+	_ context.Context,
+	payload []byte,
+	items appinsightsexporter.TelemetryItems,
+) (*appinsightsexporter.TransmissionResult, error) {
 	tr.seen = append(tr.seen, payload)
 
 	if tr.mockError != nil {
@@ -120,6 +130,7 @@ func (tr *TransmitterStub) Transmit(payload []byte, items appinsightsexporter.Te
 }
 
 func TestUploadEmpty(t *testing.T) {
+	t.Parallel()
 	clock := clock.NewMock()
 	_, _, uploader := setupUploader(clock)
 
@@ -128,6 +139,7 @@ func TestUploadEmpty(t *testing.T) {
 }
 
 func TestUploadSuccess(t *testing.T) {
+	t.Parallel()
 	clock := clock.NewMock()
 	transmitter, queue, uploader := setupUploader(clock)
 	messages := addMessages(queue)
@@ -139,6 +151,7 @@ func TestUploadSuccess(t *testing.T) {
 }
 
 func TestUpload_OnHttpCompleteFailure_DiscardItem(t *testing.T) {
+	t.Parallel()
 	clock := clock.NewMock()
 	transmitter, queue, uploader := setupUploader(clock)
 	messages := addMessages(queue)
@@ -152,6 +165,7 @@ func TestUpload_OnHttpCompleteFailure_DiscardItem(t *testing.T) {
 }
 
 func TestUpload_OnNetworkError_Requeue(t *testing.T) {
+	t.Parallel()
 	clock := clock.NewMock()
 	transmitter, queue, uploader := setupUploader(clock)
 	messages := addMessages(queue)
@@ -166,6 +180,7 @@ func TestUpload_OnNetworkError_Requeue(t *testing.T) {
 }
 
 func TestUpload_OnHttpError_Requeue(t *testing.T) {
+	t.Parallel()
 	clock := clock.NewMock()
 	transmitter, queue, uploader := setupUploader(clock)
 	messages := addMessages(queue)
@@ -180,6 +195,7 @@ func TestUpload_OnHttpError_Requeue(t *testing.T) {
 }
 
 func TestUpload_OnHttpErrorWithRetryAfter_Requeue(t *testing.T) {
+	t.Parallel()
 	clock := clock.NewMock()
 	transmitter, queue, uploader := setupUploader(clock)
 	messages := addMessages(queue)
@@ -197,6 +213,7 @@ func TestUpload_OnHttpErrorWithRetryAfter_Requeue(t *testing.T) {
 }
 
 func TestUpload_OnPartialHttpError_RequeueIndividualItem(t *testing.T) {
+	t.Parallel()
 	clock := clock.NewMock()
 	transmitter, queue, uploader := setupUploader(clock)
 
@@ -233,9 +250,11 @@ func TestUpload_OnPersistentFailure_DiscardItem(t *testing.T) {
 	messages := addMessages(queue)
 
 	transmitter.mockResponse.StatusCode = 503
+	origDelay := defaultTransmitRetryDelay
 	defaultTransmitRetryDelay = time.Duration(1) * time.Second
+	t.Cleanup(func() { defaultTransmitRetryDelay = origDelay })
 
-	for i := 0; i < maxRetryCount; i++ {
+	for i := range maxRetryCount {
 		err := syncUpload(uploader)
 		assert.NoError(t, err)
 		assert.Len(t, transmitter.seen, len(messages)*(i+1))
@@ -295,7 +314,7 @@ func assertRetryDelayOnAllItems(t *testing.T, queue *InMemoryTelemetryQueue, ret
 
 func makeTelemetryPayload(count int) ([]byte, appinsightsexporter.TelemetryItems) {
 	var buffer appinsightsexporter.TelemetryItems
-	for i := 0; i < count; i++ {
+	for range count {
 		buffer = append(buffer, *appinsightsexporter.SpanToEnvelope(GetSpanStub().Snapshot()))
 	}
 

@@ -5,38 +5,24 @@ package tools
 
 import (
 	"context"
+	osexec "os/exec"
 	"regexp"
 	"testing"
 
+	"github.com/blang/semver/v4"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
-
-func Test_toolInPath(t *testing.T) {
-	t.Run("Missing", func(t *testing.T) {
-		has, err := ToolInPath("somethingThatNeverExists")
-		require.NoError(t, err)
-		require.False(t, has)
-	})
-
-	t.Run("Installed", func(t *testing.T) {
-		// 'az' is a prerequisite to even develop in this package right now.
-		has, err := ToolInPath("az")
-		require.NoError(t, err)
-		require.True(t, has)
-	})
-}
 
 func Test_Unique(t *testing.T) {
 	toolOne := &mockTool{
 		name:             "Installed One",
 		installUrl:       "https://example.com/tools/installed1",
-		checkInstalledFn: func(_ context.Context) (bool, error) { return true, nil },
+		checkInstalledFn: func(_ context.Context) error { return nil },
 	}
 	toolTwo := &mockTool{
 		name:             "Installed Two",
 		installUrl:       "https://example.com/tools/installed2",
-		checkInstalledFn: func(_ context.Context) (bool, error) { return true, nil },
+		checkInstalledFn: func(_ context.Context) error { return nil },
 	}
 
 	uniqueTools := Unique([]ExternalTool{toolOne, toolTwo, toolOne})
@@ -45,51 +31,82 @@ func Test_Unique(t *testing.T) {
 	assert.Equal(t, toolTwo, uniqueTools[1])
 }
 
+func TestTelemetryName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		want string
+	}{
+		{name: "Docker", want: "docker"},
+		{name: "Podman", want: "podman"},
+		{name: "Terraform CLI", want: "terraform"},
+		{name: "GitHub CLI", want: "gh"},
+		{name: ".NET CLI", want: "dotnet"},
+		{name: "Go CLI", want: "go"},
+		{name: "git CLI", want: "git"},
+		{name: "Java JDK", want: "javac"},
+		{name: "npm CLI", want: "npm"},
+		{name: "pnpm CLI", want: "pnpm"},
+		{name: "yarn CLI", want: "yarn"},
+		{name: "Python CLI", want: "python"},
+		{name: "SWA CLI", want: "swa"},
+		{name: "kubectl", want: "kubectl"},
+		{name: "helm", want: "helm"},
+		{name: "kustomize", want: "kustomize"},
+		{name: "kubelogin", want: "kubelogin"},
+		{name: "Maven", want: "mvn"},
+		{name: "GitHub Copilot CLI", want: "copilot"},
+		{name: "Test Tool", want: "other"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, TelemetryName(tt.name))
+		})
+	}
+}
+
 func Test_EnsureInstalled(t *testing.T) {
 	installedToolOne := &mockTool{
 		name:             "Installed One",
 		installUrl:       "https://example.com/tools/installed1",
-		checkInstalledFn: func(_ context.Context) (bool, error) { return true, nil },
+		checkInstalledFn: func(_ context.Context) error { return nil },
 	}
 
 	installedToolTwo := &mockTool{
 		name:             "Installed Two",
 		installUrl:       "https://example.com/tools/installed2",
-		checkInstalledFn: func(_ context.Context) (bool, error) { return true, nil },
+		checkInstalledFn: func(_ context.Context) error { return nil },
 	}
 
 	missingToolOne := &mockTool{
 		name:             "Missing One",
 		installUrl:       "https://example.com/tools/missing1",
-		checkInstalledFn: func(_ context.Context) (bool, error) { return false, nil },
+		checkInstalledFn: func(_ context.Context) error { return osexec.ErrNotFound },
 	}
 
 	missingToolTwo := &mockTool{
 		name:             "Missing Two",
 		installUrl:       "https://example.com/tools/missing2",
-		checkInstalledFn: func(_ context.Context) (bool, error) { return false, nil },
+		checkInstalledFn: func(_ context.Context) error { return osexec.ErrNotFound },
 	}
 
 	t.Run("HaveAll", func(t *testing.T) {
-		resetConfirmedTools()
-
-		err := EnsureInstalled(context.Background(), installedToolOne, installedToolTwo)
+		err := EnsureInstalled(t.Context(), installedToolOne, installedToolTwo)
 		assert.NoError(t, err)
 	})
 
 	t.Run("MissingOne", func(t *testing.T) {
-		resetConfirmedTools()
-
-		err := EnsureInstalled(context.Background(), installedToolOne, missingToolOne)
+		err := EnsureInstalled(t.Context(), installedToolOne, missingToolOne)
 		assert.Error(t, err)
 		assert.Regexp(t, regexp.MustCompile(regexp.QuoteMeta(missingToolOne.Name())), err.Error())
 		assert.Regexp(t, regexp.MustCompile(regexp.QuoteMeta(missingToolOne.InstallUrl())), err.Error())
 	})
 
 	t.Run("MissingMany", func(t *testing.T) {
-		resetConfirmedTools()
-
-		err := EnsureInstalled(context.Background(), installedToolOne, missingToolOne, missingToolTwo)
+		err := EnsureInstalled(t.Context(), installedToolOne, missingToolOne, missingToolTwo)
 		assert.Error(t, err)
 		assert.Regexp(t, regexp.MustCompile(regexp.QuoteMeta(missingToolOne.Name())), err.Error())
 		assert.Regexp(t, regexp.MustCompile(regexp.QuoteMeta(missingToolOne.InstallUrl())), err.Error())
@@ -99,14 +116,14 @@ func Test_EnsureInstalled(t *testing.T) {
 }
 
 type mockTool struct {
-	checkInstalledFn func(context.Context) (bool, error)
+	checkInstalledFn func(context.Context) error
 	installUrl       string
 	name             string
 }
 
 var _ ExternalTool = &mockTool{}
 
-func (m *mockTool) CheckInstalled(ctx context.Context) (bool, error) {
+func (m *mockTool) CheckInstalled(ctx context.Context) error {
 	return m.checkInstalledFn(ctx)
 }
 
@@ -118,6 +135,41 @@ func (m *mockTool) Name() string {
 	return m.name
 }
 
-func resetConfirmedTools() {
-	confirmedTools = map[string]bool{}
+func TestExtractVersion(t *testing.T) {
+	type args struct {
+		cliOutput string
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    semver.Version
+		wantErr bool
+	}{
+		// Structured
+		{"BetaWithBuild", args{"tool 18.1.2-beta+1234"}, semver.Version{Major: 18, Minor: 1, Patch: 2}, false},
+		{"Beta", args{"tool 18.1.2-beta"}, semver.Version{Major: 18, Minor: 1, Patch: 2}, false},
+		{"MajorMinorPatch", args{"tool 18.1.2"}, semver.Version{Major: 18, Minor: 1, Patch: 2}, false},
+		{"MajorMinor", args{"tool 18.1"}, semver.Version{Major: 18, Minor: 1}, false},
+		{"MajorMinorWithLetter", args{"18.1.b"}, semver.Version{Major: 18, Minor: 1}, false},
+		{"Major", args{"tool 18"}, semver.Version{Major: 18}, false},
+		{"MajorWithLetters", args{"18.a.b"}, semver.Version{Major: 18}, false},
+		// Less structured output
+		{"Prefixed", args{"tool v18.1.2, build 123"}, semver.Version{Major: 18, Minor: 1, Patch: 2}, false},
+		{"Infixed", args{"tool v18.1.2sha123123"}, semver.Version{Major: 18, Minor: 1, Patch: 2}, false},
+		// Failures
+		{"Empty", args{""}, semver.Version{}, true},
+		{"NoNumber", args{"tool"}, semver.Version{}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ExtractVersion(tt.args.cliOutput)
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }

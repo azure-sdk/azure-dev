@@ -5,60 +5,69 @@ package azureutil
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 
+	"github.com/azure/azure-dev/cli/azd/pkg/account"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment"
 	"github.com/azure/azure-dev/cli/azd/pkg/input"
-	"github.com/azure/azure-dev/cli/azd/pkg/tools/azcli"
 )
 
-type Locs []azcli.AzCliLocation
-
-func (s Locs) Len() int { return len(s) }
-func (s Locs) Less(i, j int) bool {
-	return strings.Compare(strings.ToLower(s[i].RegionalDisplayName), strings.ToLower(s[j].RegionalDisplayName)) < 0
-}
-func (s Locs) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
-
-// PromptLocation asks the user to select a location from a list of supported azure location
-func PromptLocation(ctx context.Context, message string) (string, error) {
-	azCli := azcli.GetAzCli(ctx)
-	console := input.GetConsole(ctx)
-
-	locations, err := azCli.ListAccountLocations(ctx)
+// PromptLocation asks the user to select a location from a list of supported azure locations for a given subscription.
+// shouldDisplay, when non-nil, filters the location being displayed.
+func PromptLocationWithFilter(
+	ctx context.Context,
+	subscriptionId string,
+	message string,
+	help string,
+	console input.Console,
+	accountManager account.Manager,
+	shouldDisplay func(account.Location) bool,
+	defaultSelectedLocation *string,
+) (string, error) {
+	allLocations, err := accountManager.GetLocations(ctx, subscriptionId)
 	if err != nil {
 		return "", fmt.Errorf("listing locations: %w", err)
 	}
 
-	sort.Sort(Locs(locations))
+	locations := make([]account.Location, 0, len(allLocations))
+
+	for _, location := range allLocations {
+		if strings.Contains(location.RegionalDisplayName, "STG") {
+			continue
+		}
+		if shouldDisplay == nil || shouldDisplay(location) {
+			locations = append(locations, location)
+		}
+	}
+
+	slices.SortFunc(locations, func(a, b account.Location) int {
+		return strings.Compare(
+			strings.ToLower(a.RegionalDisplayName), strings.ToLower(b.RegionalDisplayName))
+	})
+
+	// Default location selection.
+	// The order of precedence for selecting the default location is as follows:
+	// 1. The location set in the system environment. (AZURE_LOCATION) -> CI/CD strategy
+	// 2. Parameter passed to the function. (defaultSelectedLocation != nil)
+	// 3. The location set in the azd config. -> CI/CD strategy
 
 	// Allow the environment variable `AZURE_LOCATION` to control the default value for the location
 	// selection.
 	defaultLocation := os.Getenv(environment.LocationEnvVarName)
 
-	// If no location is set in the process environment, see what the CLI default is.
-	if defaultLocation == "" {
-		defaultLocationConfig, err := azCli.GetCliConfigValue(ctx, "defaults.location")
-		if errors.Is(err, azcli.ErrNoConfigurationValue) {
-			// If no value has been configured, that's okay we just won't have a default
-			// in our list.
-		} else if err != nil {
-			return "", fmt.Errorf("detecting default location: %w", err)
-		} else {
-			defaultLocation = defaultLocationConfig.Value
-		}
+	if defaultLocation == "" && defaultSelectedLocation != nil {
+		defaultLocation = *defaultSelectedLocation
 	}
 
-	// If we still couldn't figure out a default location, offer eastus2 as a default
+	// If no location is set in the process environment, see what the azd config default is.
 	if defaultLocation == "" {
-		defaultLocation = "eastus2"
+		defaultLocation = accountManager.GetDefaultLocationName(ctx)
 	}
 
-	var defaultOption string
+	var defaultOption any
 
 	locationOptions := make([]string, len(locations))
 	for index, location := range locations {
@@ -72,6 +81,7 @@ func PromptLocation(ctx context.Context, message string) (string, error) {
 
 	selectedIndex, err := console.Select(ctx, input.ConsoleOptions{
 		Message:      message,
+		Help:         help,
 		Options:      locationOptions,
 		DefaultValue: defaultOption,
 	})

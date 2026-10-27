@@ -1,0 +1,120 @@
+# Release History
+
+## 1.0.0-beta.9 (2026-09-30)
+
+### Bugs Fixed
+
+- [[#10104]](https://github.com/Azure/azure-dev/pull/10104) Reject explicitly supplied `--project-endpoint` flags on commands that do not use a project endpoint instead of silently ignoring them. Thanks @Siglud for the contribution!
+
+### Other Changes
+
+- [[#10104]](https://github.com/Azure/azure-dev/pull/10104) Improve `azd ai connection` help formatting, examples, and configuration and environment guidance. Thanks @Siglud for the contribution!
+
+## 1.0.0-beta.8 (2026-09-24)
+
+### Other Changes
+
+- [[#10114]](https://github.com/Azure/azure-dev/pull/10114) Update gRPC to v1.83.2 to address the GHSA-2v4p-qf9q-27wj security advisory.
+- [[#10128]](https://github.com/Azure/azure-dev/pull/10128) Update OpenTelemetry Go to v1.45.0 to address the GHSA-8wmf-6v46-5gfg security advisory.
+
+## 1.0.0-beta.7 (2026-09-17)
+
+### Breaking Changes
+
+- [[#9997]](https://github.com/Azure/azure-dev/pull/9997) Move declared Foundry Connection reconciliation from project provisioning to `azure.ai.connection` service deployment through `azd deploy` or `azd up`. Thanks @JerryYangKai for the contribution!
+- [[#10024]](https://github.com/Azure/azure-dev/pull/10024) Remove the standalone `azd ai connection deploy` command in favor of `azd deploy <service>`. Thanks @JerryYangKai for the contribution!
+
+### Other Changes
+
+- [[#9841]](https://github.com/Azure/azure-dev/pull/9841) Add a shared best-effort telemetry reporting foundation without emitting new Connection usage events. Thanks @JerryYangKai for the contribution!
+
+## 1.0.0-beta.6 (2026-09-04)
+
+### Features Added
+
+- [[#9735]](https://github.com/Azure/azure-dev/pull/9735) Add local `connection.yaml` definitions and `azd ai connection deploy` for project connections. Thanks @JerryYangKai for the contribution!
+
+### Bugs Fixed
+
+- [[#9741]](https://github.com/Azure/azure-dev/pull/9741) Preserve connection audience and connector name during Foundry connection provisioning.
+
+### Other Changes
+
+- [[#9825]](https://github.com/Azure/azure-dev/pull/9825) Update gRPC to v1.83.1 to address the GHSA-vp52-pcj8-j9qc security advisory.
+
+## 1.0.0-beta.4 (2026-08-06)
+
+### Features Added
+
+- [[#9079]](https://github.com/Azure/azure-dev/pull/9079) Add service-scoped environment support for Foundry connection services while preserving project-wide fallback behavior.
+
+## 1.0.0-beta.3 (2026-07-16)
+
+### Breaking Changes
+
+- [[#9046]](https://github.com/Azure/azure-dev/pull/9046) `azd deploy` for `host: azure.ai.connection` services is now a no-op; connections are created at provision time by the `microsoft.foundry` provider via `azd provision`. This removes the redundant ARM write on every `azd deploy`.
+
+### Other Changes
+
+- [[#9103]](https://github.com/Azure/azure-dev/pull/9103) Pin internal azd module dependency to released version.
+
+## 1.0.0-beta.2 (2026-07-09)
+
+### Bugs Fixed
+
+- [[#9053]](https://github.com/Azure/azure-dev/pull/9053) Fix `azd ai connection` commands and `azd deploy` for `host: azure.ai.connection` services failing with `Tenant provided in token does not match resource token` for multi-tenant/guest users. The extension now scopes the credential to the subscription's user-access tenant. Also fixes first-connection creation on projects with no existing connections. Thanks @therealjohn for the contribution!
+
+## 1.0.0-beta.1 (2026-06-30)
+
+### Features Added
+
+- [[#8818]](https://github.com/Azure/azure-dev/pull/8818) The `azure.ai.connections` extension now registers an `azure.ai.connection` service-target host. `azd deploy`/`azd up` upsert each `host: azure.ai.connection` service in `azure.yaml` onto the Foundry project with an idempotent ARM CreateOrUpdate, expanding `${VAR}` secrets from the azd environment while passing Foundry server-side `${{...}}` expressions through untouched.
+- [[#8890]](https://github.com/Azure/azure-dev/pull/8890) Bump `requiredAzdVersion` to `>=1.27.0`.
+
+## 0.1.2-preview (2026-06-19)
+
+### Bugs Fixed
+
+- [[#8688]](https://github.com/Azure/azure-dev/issues/8688) Resolve the project endpoint that `azd ai agent init` stores. `azd ai connection` commands now fall back to `AZURE_AI_PROJECT_ENDPOINT` (after `FOUNDRY_PROJECT_ENDPOINT`) in both the active azd environment and the host environment, so the resolution cascade no longer fails with "no Foundry project endpoint resolved" when only the `AZURE_AI_*` key is set.
+
+## 0.1.1-preview (2026-06-05)
+
+### Features Added
+
+- [[#8475]](https://github.com/Azure/azure-dev/pull/8475) Add `--metadata key=value` flag (repeatable) to `azd ai connection update`, allowing metadata to be set or merged on existing connections without recreating them. Also fixes the update path for OAuth2 connections: emit the credentials object in the PUT body (resolves HTTP 400 "Credentials Property can't be empty for auth type OAuth2") and preserve existing OAuth2 fields (connectorName, authorizationUrl, tokenUrl, scopes, etc.) on target/metadata-only updates.
+
+### Bugs Fixed
+
+- [[#8539]](https://github.com/Azure/azure-dev/pull/8539) Remove leaked debug log from `resolveConnectionContext` that surfaced the resolved endpoint and source as user-visible noise on every `azd ai connection` invocation.
+
+## 0.1.0-preview (2026-05-28)
+
+Initial release of the `azure.ai.connections` extension. Provides CRUD management
+of Microsoft Foundry project connections directly from the terminal.
+
+- `azd ai connection list` — List all connections in the active Foundry project.
+  Supports `--kind` to filter by connection kind (e.g. `remote-tool`,
+  `cognitive-search`) and `--output json` or `--output table` (default).
+- `azd ai connection show <name>` — Show details of a single connection including
+  kind, auth type, target URL, and metadata. Pass `--show-credentials` to also
+  retrieve secret credential values from the data plane.
+- `azd ai connection create <name>` — Create a new connection. Requires `--kind`
+  and `--target`. Supported auth types via `--auth-type`:
+  - `none` (default) — no credentials.
+  - `api-key` — supply the key with `--key`.
+  - `custom-keys` — supply one or more `--custom-key key=value` pairs.
+  - `oauth2` — either a managed connector (`--connector-name`) or BYO OAuth2
+    (`--authorization-url`, `--token-url`, `--client-id`, `--client-secret`, and
+    optionally `--refresh-url` and `--scopes`).
+  - `user-entra-token`, `project-managed-identity`, `agentic-identity` — token
+    auth types, with optional `--audience`.
+  - Use `--force` to replace an existing connection (upsert).
+- `azd ai connection update <name>` — Update a connection's `--target` URL or
+  credential values (`--key` / `--custom-key`) in-place. All other fields are
+  preserved; delete and recreate to change auth type.
+- `azd ai connection delete <name>` — Delete a connection with an interactive
+  confirmation prompt. Use `--force` to skip the prompt in non-interactive
+  environments.
+- Project-endpoint resolution cascade: `-p` / `--project-endpoint` flag →
+  active azd environment `FOUNDRY_PROJECT_ENDPOINT` → global azd config →
+  host environment variable `FOUNDRY_PROJECT_ENDPOINT`.

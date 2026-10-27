@@ -17,8 +17,16 @@
 # GoLand temp files
 .idea 
 
-# Output of the go coverage tool, specifically when used with LiteIDE
+# go code coverage outputs
+# text format
 *.out
+# binary formats
+covcounters.*
+covmeta.*
+
+# Go workspace files (for local development)
+go.work
+go.work.sum
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
@@ -31,13 +39,57 @@ __pycache__/
 .env
 .azure
 /cli/azd/bin
+/cli/azd/pkg/oneauth/bridge/_build
 *env/
 obj/
 bin/
 node_modules/
 test-results/
 
+# Downloaded by extension-set-metadata-variables.yml during the release
+# pipeline; must not be committed by automation jobs (e.g. Update_Registry).
+/release-metadata/
+
 # terraform .tfstate files
 **/.terraform
 *.tfstate*
 *.terraform*
+
+# Finder state files
+.DS_Store
+cli/azd/azure-dev
+cli/azd/azure-dev.exe
+cli/azd/azd
+cli/azd/azd.exe
+cli/azd/extensions/azure.coding-agent/azurecodingagent
+cli/azd/extensions/azure.coding-agent/azurecodingagent.exe
+cli/azd/extensions/azure.ai.agents/azureaiagent
+cli/azd/extensions/azure.ai.agents/azureaiagent.exe
+cli/azd/extensions/azure.ai.finetune/azure.ai.finetune
+cli/azd/extensions/azure.ai.finetune/azure.ai.finetune.exe
+cli/azd/extensions/microsoft.azd.extensions/microsoft.azd.extensions
+cli/azd/extensions/microsoft.azd.extensions/microsoft.azd.extensions.exe
+cli/azd/extensions/microsoft.azd.ai.builder/microsoft.azd.ai.builder
+cli/azd/extensions/microsoft.azd.ai.builder/microsoft.azd.ai.builder.exe
+cli/azd/extensions/microsoft.azd.demo/microsoft.azd.demo
+cli/azd/extensions/microsoft.azd.demo/microsoft.azd.demo.exe
+cli/azd/extensions/microsoft.azd.concurx/microsoft.azd.concurx
+cli/azd/extensions/microsoft.azd.concurx/microsoft.azd.concurx.exe
+cli/azd/azd-test
+cli/azd/azd
+cli/azd/extensions/microsoft.azd.concurx/concurx
+cli/azd/extensions/microsoft.azd.concurx/concurx.exe
+cli/azd/extensions/azure.appservice/azureappservice
+cli/azd/extensions/azure.appservice/azureappservice.exe
+.squad/
+
+# Session artifacts
+cli/azd/cover-*
+cli/azd/cover_*
+review-*.diff
+
+.playwright-mcp/
+.worktrees/
+
+# Demo video output
+demo-video/

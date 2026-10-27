@@ -1,0 +1,15 @@
+import: ../../.vscode/cspell.yaml
+overrides:
+  - filename: internal/cmd/custom_create.go
+    words:
+      - Qwen
+words:
+  - azcopy
+  - Kimi
+  - myaccount
+  - mycommand
+  - myproject
+  - safetensors
+  - strconv
+  - userinfo
+  - wasbs

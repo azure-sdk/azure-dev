@@ -1,0 +1,750 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package cmd
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"maps"
+	"os"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/azure/azure-dev/cli/azd/pkg/async"
+	"github.com/azure/azure-dev/cli/azd/pkg/environment"
+	"github.com/azure/azure-dev/cli/azd/pkg/exegraph"
+	"github.com/azure/azure-dev/cli/azd/pkg/input"
+	"github.com/azure/azure-dev/cli/azd/pkg/output/ux"
+	"github.com/azure/azure-dev/cli/azd/pkg/project"
+)
+
+// deployGraphState consolidates the shared mutable state produced during
+// service graph execution. Package steps store ServiceContexts (consumed by
+// publish/deploy steps); deploy steps store ServiceDeployResults (consumed by
+// the caller for artifact display and JSON output). Using this struct instead
+// of passing raw maps+mutexes keeps the action layers thin:
+//
+//	create state → build graph → execute → consume results.
+type deployGraphState struct {
+	ctxMu    sync.Mutex
+	contexts map[string]*project.ServiceContext
+
+	resMu   sync.Mutex
+	results map[string]*project.ServiceDeployResult
+}
+
+// newDeployGraphState creates a state container pre-sized for the given services.
+func newDeployGraphState(services []*project.ServiceConfig) *deployGraphState {
+	return &deployGraphState{
+		contexts: make(map[string]*project.ServiceContext, len(services)),
+		results:  make(map[string]*project.ServiceDeployResult, len(services)),
+	}
+}
+
+// StoreContext records the ServiceContext produced by a package step.
+func (s *deployGraphState) StoreContext(name string, ctx *project.ServiceContext) {
+	s.ctxMu.Lock()
+	defer s.ctxMu.Unlock()
+	s.contexts[name] = ctx
+}
+
+// LoadContext retrieves the ServiceContext for a service (nil if not yet stored).
+func (s *deployGraphState) LoadContext(name string) *project.ServiceContext {
+	s.ctxMu.Lock()
+	defer s.ctxMu.Unlock()
+	return s.contexts[name]
+}
+
+// StoreResult records the ServiceDeployResult produced by a deploy step.
+func (s *deployGraphState) StoreResult(name string, result *project.ServiceDeployResult) {
+	s.resMu.Lock()
+	defer s.resMu.Unlock()
+	s.results[name] = result
+}
+
+// GetResult retrieves the ServiceDeployResult for a service (nil if not yet stored).
+func (s *deployGraphState) GetResult(name string) *project.ServiceDeployResult {
+	s.resMu.Lock()
+	defer s.resMu.Unlock()
+	return s.results[name]
+}
+
+// ResultsSnapshot returns a shallow copy of the results map, safe to iterate
+// without holding the lock.
+func (s *deployGraphState) ResultsSnapshot() map[string]*project.ServiceDeployResult {
+	s.resMu.Lock()
+	defer s.resMu.Unlock()
+	snap := make(map[string]*project.ServiceDeployResult, len(s.results))
+	maps.Copy(snap, s.results)
+	return snap
+}
+
+// CleanupTempArtifacts removes temporary package archives created during graph
+// execution. This must be called after the graph finishes because steps run in
+// parallel and may still hold file locks during execution.
+func (s *deployGraphState) CleanupTempArtifacts() {
+	s.ctxMu.Lock()
+	defer s.ctxMu.Unlock()
+	for _, sc := range s.contexts {
+		for _, artifact := range sc.Package {
+			if artifact.Kind == project.ArtifactKindArchive &&
+				strings.HasPrefix(artifact.Location, os.TempDir()) {
+				if rmErr := os.RemoveAll(artifact.Location); rmErr != nil {
+					log.Printf("failed to remove temporary package: %s : %s", artifact.Location, rmErr)
+				}
+			}
+		}
+	}
+}
+
+// serviceGraphOptions configures how the package → publish → deploy service
+// sub-graph is built. Both stand-alone `azd deploy` and the unified `azd up`
+// default path delegate to [addServiceStepsToGraph] so that the step
+// topology — including Aspire build-gate serialization — stays in one place.
+type serviceGraphOptions struct {
+	// services is the list of services, in stable order, for which to add
+	// package/publish/deploy steps.
+	services []*project.ServiceConfig
+
+	// serviceManager runs the package/publish/deploy operations.
+	serviceManager project.ServiceManager
+
+	// deployTimeout bounds each individual deploy step. Must be > 0.
+	deployTimeout time.Duration
+
+	// maxConcurrency is the scheduler concurrency used to execute this graph.
+	// Zero selects the scheduler's bounded default worker count.
+	maxConcurrency int
+
+	// fromPackage — when non-empty — creates a synthetic package artifact at
+	// the supplied path instead of invoking the service packager. Only the
+	// stand-alone `azd deploy` path sets this (the `--from-package` flag);
+	// the `azd up` path always leaves this empty.
+	fromPackage string
+
+	// publishExtraDeps augments every publish step's DependsOn with these
+	// step names. Used by `azd up` to wire publish steps behind the synthetic
+	// `event-predeploy` node (which itself waits for provision sinks + all
+	// package steps). Deploy's stand-alone path leaves this empty.
+	publishExtraDeps []string
+
+	// packageExtraDeps augments every package step's DependsOn with these
+	// step names. Used by `azd up` to wire package steps behind the synthetic
+	// `event-prepackage` node (which itself fans in from the
+	// `cmdhook-prepackage` shell-hook step) so that user-defined
+	// prepackage hooks and the project-level `prepackage` event fire
+	// before any service is packaged — preserving parity with the
+	// stand-alone `azd package` cobra command. Deploy's stand-alone path
+	// leaves this empty (package steps then have no DependsOn and overlap
+	// freely with anything upstream of publish).
+	packageExtraDeps []string
+
+	// deployExtraDeps augments every deploy step's DependsOn with these step
+	// names (beyond the Aspire build gate). Reserved for future use; both
+	// current call sites leave this empty.
+	deployExtraDeps []string
+
+	// state is the shared mutable store for per-service ServiceContexts
+	// (produced by package, consumed by publish/deploy) and
+	// ServiceDeployResults (produced by deploy, consumed by the caller
+	// for artifact display). The caller owns the state and may call
+	// CleanupTempArtifacts() after graph execution.
+	state *deployGraphState
+
+	// onDeployTimeout is invoked when a deploy step's context deadline is
+	// exceeded. It lets the caller emit a richer UX (e.g., a warning box
+	// with hints) before the error bubbles up. Optional.
+	onDeployTimeout func(ctx context.Context, svc *project.ServiceConfig)
+
+	// packagePublishBuildGateKey groups services whose package or publish
+	// phase may perform a concurrent-unsafe local build. Gates are enabled
+	// only when at least two services share a key and maxConcurrency is not
+	// one. This policy does not affect deploy ordering. If nil, package and
+	// publish contexts are not gated.
+	packagePublishBuildGateKey func(svc *project.ServiceConfig) string
+
+	// buildGateKey groups services that share a concurrent-unsafe build
+	// phase: for each non-empty key, a shared mutex is created and injected
+	// into each gated deploy step's context. The service target acquires
+	// the mutex only during image preparation (dotnet publish) and releases
+	// it before the Azure deployment begins. An empty key means "no gate"
+	// (full parallelism). Keys are opaque strings, so multiple independent
+	// gates can coexist (e.g. one group per shared build toolchain).
+	//
+	// The graph builder itself is gate-agnostic: callers (including future
+	// extensions) inject the policy. `azd deploy` and `azd up` supply a
+	// callback that returns "aspire" for services owned by a .NET AppHost
+	// manifest. The preferred approach is --artifacts-path (full
+	// parallelism); the mutex is a fallback. If nil, no gating is applied.
+	buildGateKey func(svc *project.ServiceConfig) string
+
+	// onPhaseProgress, if non-nil, is invoked with intra-phase progress
+	// messages emitted by ServiceManager.Package/Publish/Deploy (e.g.
+	// "Compiling…", "Pushing image…"). The phase argument identifies which
+	// step is reporting (phasePackaging / phasePublish / phaseDeploying).
+	// Callers wire this to a deployProgressTracker so the table's "Detail"
+	// column reflects what each step is doing in real time, not just which
+	// phase it is in. When nil, progress messages are silently drained.
+	//
+	// IMPORTANT: This callback is invoked from worker goroutines and must
+	// not block. Blocking implementations stall the graph scheduler.
+	onPhaseProgress func(serviceName string, phase deployPhase, detail string)
+}
+
+// serviceGraphHandles exposes the names of the steps that addServiceStepsToGraph
+// added, in service order, so the caller can wire additional synthetic nodes
+// (e.g. pre/post-deploy-event sinks) against them.
+type serviceGraphHandles struct {
+	PackageSteps []string
+	PublishSteps []string
+	DeploySteps  []string
+}
+
+// addServiceStepsToGraph appends the shared package → publish → deploy
+// topology — plus optional per-service build-gate serialization — to g for
+// each service in opts.services. It is the single source of truth for
+// service-step wiring used by both `azd deploy` (stand-alone) and the
+// unified `azd up` default path.
+//
+// Topology per service `<svc>`:
+//
+//	opts.packageExtraDeps ──▶ package-<svc> ──▶ opts.publishExtraDeps ──▶ publish-<svc> ──▶ deploy-<svc>
+//	                                                                                            │
+//	                                                                     opts.buildGateKey:
+//	                                                             services sharing a non-empty key
+//	                                                            get a runtime mutex in their context
+//	                                                              (no graph edges between deploys).
+//
+// Deploy ordering: when no service declares a `uses:` edge targeting
+// another service in this graph, deploy steps chain sequentially in the
+// order provided by opts.services (alphabetical via ServiceStable()) for
+// backward compatibility with templates that relied on implicit ordering.
+// When at least one service declares `uses:`, the graph uses explicit
+// edges and services without mutual `uses:` edges deploy in parallel.
+// Package and publish steps always run in parallel regardless.
+//
+// When opts.packageExtraDeps is empty (stand-alone `azd deploy`), package
+// steps have no DependsOn and packaging can overlap with whatever provision
+// steps the caller added upstream of publish.
+//
+// The graph builder is intentionally agnostic to why a gate exists; it
+// only understands the opaque-string grouping produced by
+// [serviceGraphOptions.buildGateKey]. That keeps Aspire-specific (or any
+// other ecosystem-specific) sequencing policy out of the DAG layer and
+// makes it extensible without changing this file.
+func addServiceStepsToGraph(g *exegraph.Graph, opts serviceGraphOptions) (*serviceGraphHandles, error) {
+	if g == nil {
+		return nil, fmt.Errorf("graph is nil")
+	}
+	if opts.serviceManager == nil {
+		return nil, fmt.Errorf("serviceManager is nil")
+	}
+	if opts.deployTimeout <= 0 {
+		return nil, fmt.Errorf("deployTimeout must be > 0, got %s", opts.deployTimeout)
+	}
+	if opts.state == nil {
+		return nil, fmt.Errorf("state must be provided")
+	}
+
+	handles := &serviceGraphHandles{
+		PackageSteps: make([]string, 0, len(opts.services)),
+		PublishSteps: make([]string, 0, len(opts.services)),
+		DeploySteps:  make([]string, 0, len(opts.services)),
+	}
+
+	// buildGateMu holds a per-gate-key mutex used to serialize only the
+	// image-preparation phase (dotnet publish) inside Aspire deploy steps,
+	// while leaving the Azure deployment portion fully parallel. The mutex
+	// is injected into the deploy step's context so the service target can
+	// acquire it during the build-only window. See build_gate.go in the
+	// project package.
+	//
+	// Services whose gate key is "" (or when buildGateKey is nil) are
+	// unconstrained and run in full parallelism.
+	buildGateMu := make(map[string]*sync.Mutex)
+
+	// Standard .NET package and publish operations use a separate gate map.
+	// Precompute membership before graph execution so worker goroutines only
+	// read these maps.
+	packagePublishBuildGates := make(map[string]*sync.Mutex)
+	packagePublishGateKeys := make(map[string]string)
+	packagePublishGateCounts := make(map[string]int)
+	if opts.packagePublishBuildGateKey != nil && opts.maxConcurrency != 1 {
+		for _, svc := range opts.services {
+			key := opts.packagePublishBuildGateKey(svc)
+			packagePublishGateKeys[svc.Name] = key
+			if key != "" {
+				packagePublishGateCounts[key]++
+			}
+		}
+
+		packagePublishGateMu := make(map[string]*sync.Mutex)
+		for serviceName, key := range packagePublishGateKeys {
+			if key == "" || packagePublishGateCounts[key] < 2 {
+				continue
+			}
+			if packagePublishGateMu[key] == nil {
+				packagePublishGateMu[key] = &sync.Mutex{}
+			}
+			packagePublishBuildGates[serviceName] = packagePublishGateMu[key]
+		}
+	}
+
+	// serviceNames is the set of service names in this graph, used to
+	// resolve service-to-service edges declared via `services.<name>.uses`
+	// in azure.yaml. Resource-valued `uses:` entries (targeting entries
+	// under `resources:` rather than `services:`) are ignored here because
+	// the provision layer already owns their lifecycle.
+	serviceNames := make(map[string]struct{}, len(opts.services))
+	for _, svc := range opts.services {
+		serviceNames[svc.Name] = struct{}{}
+	}
+
+	// hasExplicitOrdering is true when the graph has an explicit execution
+	// policy — either:
+	//   (a) at least one service declares `uses: [otherService]`, OR
+	//   (b) a buildGateKey policy applies (e.g. Aspire's shared AppHost
+	//       build serialization).
+	//
+	// When false, no service has declared explicit deploy ordering and no
+	// build-gate policy is in effect, so we fall back to sequential
+	// deployment in azure.yaml slice order to preserve backward
+	// compatibility with templates that relied on implicit ordering.
+	// Package/publish gates deliberately do not participate.
+	hasExplicitOrdering := false
+
+	// Check (a): service-to-service `uses:` edges.
+	for _, svc := range opts.services {
+		for _, dep := range svc.Uses {
+			if dep != svc.Name {
+				if _, ok := serviceNames[dep]; ok {
+					hasExplicitOrdering = true
+					break
+				}
+			}
+		}
+		if hasExplicitOrdering {
+			break
+		}
+	}
+
+	// Check (b): buildGateKey policy — when any service produces a
+	// non-empty gate key, the gate provides runtime serialization of the
+	// build phase via a shared mutex. The sequential fallback would be
+	// redundant and would prevent parallelism for non-gated services.
+	if !hasExplicitOrdering && opts.buildGateKey != nil {
+		for _, svc := range opts.services {
+			if opts.buildGateKey(svc) != "" {
+				hasExplicitOrdering = true
+				break
+			}
+		}
+	}
+
+	if !hasExplicitOrdering && len(opts.services) > 1 {
+		log.Printf(
+			"deploying %d services sequentially (no uses: edges declared; "+
+				"add uses: to azure.yaml to enable parallel deployment)",
+			len(opts.services),
+		)
+		// Advisory: scan service env configs for SERVICE_<OTHER>_* references
+		// and suggest uses: declarations. This does NOT change execution order
+		// — it only logs hints to help template authors opt into parallelism.
+		suggestServiceDeps(opts.services)
+	}
+
+	// phaseProgress bundles an async.Progress with a wait function that
+	// blocks until the drain goroutine has finished. Callers MUST call
+	// Done() to close the channel, then Wait() before returning to ensure
+	// no late onPhaseProgress callback fires after the step completes.
+	type phaseProgress struct {
+		*async.Progress[project.ServiceProgress]
+		Wait func()
+	}
+
+	// newPhaseProgress returns a phaseProgress whose channel is drained
+	// by a background goroutine that forwards each ServiceProgress.Message
+	// to opts.onPhaseProgress (if non-nil). Callers MUST call Done() —
+	// typically deferred — to terminate the goroutine, then call Wait()
+	// to block until the goroutine exits. When onPhaseProgress is nil the
+	// channel is still drained (matching the NewNoopProgress contract) so
+	// ServiceManager goroutines never block on an unbuffered SetProgress
+	// send.
+	newPhaseProgress := func(serviceName string, phase deployPhase) phaseProgress {
+		p := async.NewProgress[project.ServiceProgress]()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for sp := range p.Progress() {
+				if opts.onPhaseProgress != nil && sp.Message != "" {
+					opts.onPhaseProgress(serviceName, phase, sp.Message)
+				}
+			}
+		}()
+		return phaseProgress{
+			Progress: p,
+			Wait:     func() { <-done },
+		}
+	}
+
+	for _, svc := range opts.services {
+		pkgStepName := "package-" + svc.Name
+		publishStepName := "publish-" + svc.Name
+		deployStepName := "deploy-" + svc.Name
+
+		handles.PackageSteps = append(handles.PackageSteps, pkgStepName)
+		handles.PublishSteps = append(handles.PublishSteps, publishStepName)
+		handles.DeploySteps = append(handles.DeploySteps, deployStepName)
+
+		// ── package-<svc> ── opts.packageExtraDeps (empty for stand-alone
+		// deploy → no deps → packaging overlaps with anything upstream).
+		pkgSvc := svc
+		if err := g.AddStep(&exegraph.Step{
+			Name:             pkgStepName,
+			DependsOn:        opts.packageExtraDeps,
+			Tags:             []string{"package"},
+			ConcurrencyGroup: packageConcurrencyGroup,
+			Action: func(ctx context.Context) error {
+				sc := project.NewServiceContext()
+
+				if opts.fromPackage != "" {
+					// --from-package bypasses the packager and wraps the
+					// user-supplied artifact directly.
+					if pkgErr := sc.Package.Add(&project.Artifact{
+						Kind:         determineArtifactKind(opts.fromPackage),
+						Location:     opts.fromPackage,
+						LocationKind: project.LocationKindLocal,
+					}); pkgErr != nil {
+						return fmt.Errorf("packaging service %s: %w", pkgSvc.Name, pkgErr)
+					}
+				} else {
+					progress := newPhaseProgress(pkgSvc.Name, phasePackaging)
+					defer progress.Wait()
+					defer progress.Done()
+					if buildGate := packagePublishBuildGates[pkgSvc.Name]; buildGate != nil {
+						ctx = project.ContextWithBuildGate(ctx, buildGate)
+					}
+					if _, pkgErr := opts.serviceManager.Package(
+						ctx, pkgSvc, sc, progress.Progress, nil,
+					); pkgErr != nil {
+						return fmt.Errorf("packaging service %s: %w", pkgSvc.Name, pkgErr)
+					}
+				}
+
+				opts.state.StoreContext(pkgSvc.Name, sc)
+				return nil
+			},
+		}); err != nil {
+			return nil, fmt.Errorf("building package step %s: %w", pkgStepName, err)
+		}
+
+		// ── publish-<svc> ── package + any caller-supplied fan-in (e.g.
+		// event-predeploy for up).
+		publishDeps := make([]string, 0, 1+len(opts.publishExtraDeps))
+		publishDeps = append(publishDeps, pkgStepName)
+		publishDeps = append(publishDeps, opts.publishExtraDeps...)
+
+		pubSvc := svc
+		if err := g.AddStep(&exegraph.Step{
+			Name:             publishStepName,
+			DependsOn:        publishDeps,
+			Tags:             []string{"publish"},
+			ConcurrencyGroup: deployConcurrencyGroup,
+			Action: func(stepCtx context.Context) error {
+				sc := opts.state.LoadContext(pubSvc.Name)
+
+				if sc == nil {
+					return fmt.Errorf(
+						"service context for %s not found — package step may have failed",
+						pubSvc.Name,
+					)
+				}
+
+				// Apply the same timeout as the deploy step. The publish
+				// action resolves the Azure target resource (API calls to
+				// find the resource group and service resource) and can
+				// block indefinitely without a bound — especially right
+				// after provisioning when Azure resources may not yet be
+				// visible due to eventual consistency.
+				pubCtx, pubCancel := context.WithTimeout(
+					stepCtx, opts.deployTimeout)
+				defer pubCancel()
+				if buildGate := packagePublishBuildGates[pubSvc.Name]; buildGate != nil {
+					pubCtx = project.ContextWithBuildGate(pubCtx, buildGate)
+				}
+
+				progress := newPhaseProgress(pubSvc.Name, phasePublish)
+				defer progress.Wait()
+				defer progress.Done()
+				if _, pubErr := opts.serviceManager.Publish(
+					pubCtx, pubSvc, sc, progress.Progress, nil,
+				); pubErr != nil {
+					if errors.Is(pubCtx.Err(),
+						context.DeadlineExceeded) {
+						return &serviceOperationTimeoutError{
+							message: fmt.Sprintf(
+								"publishing service '%s' timed out"+
+									" after %d seconds",
+								pubSvc.Name,
+								int(opts.deployTimeout.Seconds()),
+							),
+							cause: pubErr,
+						}
+					}
+					return fmt.Errorf(
+						"publishing service %s: %w",
+						pubSvc.Name, pubErr)
+				}
+				return nil
+			},
+		}); err != nil {
+			return nil, fmt.Errorf("building publish step %s: %w", publishStepName, err)
+		}
+
+		// ── deploy-<svc> ── publish + declared service-to-service `uses:`
+		// edges + any caller-supplied fan-in.
+		//
+		// Build-gate synchronization is handled at RUNTIME, not via graph
+		// topology: the deploy step's context carries a per-gate-key mutex
+		// that the service target acquires only during image preparation
+		// (dotnet publish) and releases before the Azure deployment begins.
+		// This serializes the race-prone build phase while keeping the slow
+		// Azure deployment portion fully parallel.
+		deployDeps := make([]string, 0, 1+len(svc.Uses)+len(opts.deployExtraDeps))
+		deployDeps = append(deployDeps, publishStepName)
+		if opts.buildGateKey != nil {
+			if key := opts.buildGateKey(svc); key != "" {
+				if _, ok := buildGateMu[key]; !ok {
+					buildGateMu[key] = &sync.Mutex{}
+				}
+			}
+		}
+		// Translate `services.<name>.uses: [depSvc]` into a deploy-step
+		// edge so hooks that pass values between services (e.g. api's
+		// postdeploy writes an env var that web's predeploy reads) retain
+		// the deploy ordering they had under the old sequential loop.
+		// Entries that don't match another service's name target a
+		// resource and are left to the provision layer. Duplicates are
+		// filtered so the build-gate and `uses:` edges collapse when they
+		// name the same predecessor.
+		for _, dep := range svc.Uses {
+			if dep == svc.Name {
+				continue
+			}
+			if _, ok := serviceNames[dep]; !ok {
+				log.Printf(
+					"debug: service %q declares uses: %q — not a known service name",
+					svc.Name, dep,
+				)
+				continue
+			}
+			depStep := "deploy-" + dep
+			if !slices.Contains(deployDeps, depStep) {
+				deployDeps = append(deployDeps, depStep)
+			}
+		}
+		// Sequential fallback: when no service in this graph declares a
+		// `uses:` edge to another service, chain deploy steps in the
+		// order provided (alphabetical via ServiceStable()) so that
+		// templates relying on implicit sequential ordering continue to
+		// work. This preserves backward compatibility with existing
+		// templates while still allowing parallel deployment for templates
+		// that opt in via `uses:`. Package and publish steps remain parallel
+		// regardless.
+		if !hasExplicitOrdering && len(handles.DeploySteps) >= 2 {
+			prevDeploy := handles.DeploySteps[len(handles.DeploySteps)-2]
+			if !slices.Contains(deployDeps, prevDeploy) {
+				deployDeps = append(deployDeps, prevDeploy)
+			}
+		}
+		deployDeps = append(deployDeps, opts.deployExtraDeps...)
+
+		depSvc := svc
+		if err := g.AddStep(&exegraph.Step{
+			Name:             deployStepName,
+			DependsOn:        deployDeps,
+			Tags:             []string{"deploy"},
+			ConcurrencyGroup: deployConcurrencyGroup,
+			Action: func(stepCtx context.Context) error {
+				sc := opts.state.LoadContext(depSvc.Name)
+
+				if sc == nil {
+					return fmt.Errorf(
+						"service context for %s not found — publish step may have failed",
+						depSvc.Name,
+					)
+				}
+
+				deployCtx, deployCancel := context.WithTimeout(stepCtx, opts.deployTimeout)
+				defer deployCancel()
+
+				// Inject the build gate mutex into the deploy context so the
+				// service target can serialize only the image-preparation phase.
+				if opts.buildGateKey != nil {
+					if key := opts.buildGateKey(depSvc); key != "" {
+						if mu, ok := buildGateMu[key]; ok {
+							deployCtx = project.ContextWithBuildGate(deployCtx, mu)
+						}
+					}
+				}
+
+				progress := newPhaseProgress(depSvc.Name, phaseDeploying)
+				defer progress.Wait()
+				defer progress.Done()
+
+				result, depErr := opts.serviceManager.Deploy(deployCtx, depSvc, sc, progress.Progress)
+				if depErr != nil {
+					if errors.Is(deployCtx.Err(), context.DeadlineExceeded) {
+						if opts.onDeployTimeout != nil {
+							opts.onDeployTimeout(stepCtx, depSvc)
+						}
+						return &serviceOperationTimeoutError{
+							message: fmt.Sprintf(
+								"deployment of service '%s' timed out after %d seconds."+
+									" To increase, use --timeout flag or AZD_DEPLOY_TIMEOUT env var."+
+									" Note: azd has stopped waiting, but the deployment may still be"+
+									" running in Azure. Check the Azure Portal for current deployment status.",
+								depSvc.Name,
+								int(opts.deployTimeout.Seconds()),
+							),
+							cause: depErr,
+						}
+					}
+					return fmt.Errorf("deploying service %s: %w", depSvc.Name, depErr)
+				}
+
+				opts.state.StoreResult(depSvc.Name, result)
+
+				return nil
+			},
+		}); err != nil {
+			return nil, fmt.Errorf("building deploy step %s: %w", deployStepName, err)
+		}
+	}
+
+	return handles, nil
+}
+
+type serviceOperationTimeoutError struct {
+	message string
+	cause   error
+}
+
+func isServiceOperationTimeoutError(err error) bool {
+	_, ok := errors.AsType[*serviceOperationTimeoutError](err)
+	return ok
+}
+
+func serviceStepCompletionProgress(err error) (deployPhase, string) {
+	if err == nil {
+		return phaseDone, ""
+	}
+	if exegraph.IsStepSkipped(err) {
+		return phaseSkipped, ""
+	}
+	if errors.Is(err, context.Canceled) && !isServiceOperationTimeoutError(err) {
+		return phaseSkipped, "canceled"
+	}
+
+	return phaseFailed, err.Error()
+}
+
+func (e *serviceOperationTimeoutError) Error() string {
+	return e.message
+}
+
+// IsServiceOperationTimeoutError marks this error for CLI UX handling.
+func (*serviceOperationTimeoutError) IsServiceOperationTimeoutError() bool {
+	return true
+}
+
+func (e *serviceOperationTimeoutError) Unwrap() []error {
+	if e == nil {
+		return nil
+	}
+
+	return []error{e.cause, context.DeadlineExceeded}
+}
+
+// deployTimeoutWarning is the UX element emitted when a deploy step exceeds
+// its timeout. Kept next to the graph builder so both call sites share
+// identical wording.
+func deployTimeoutWarning(svcName string, timeout time.Duration) *ux.WarningMessage {
+	return &ux.WarningMessage{
+		Description: fmt.Sprintf(
+			"Deployment of service '%s' exceeded the azd wait timeout (%s)."+
+				" azd has stopped waiting, but the deployment may still be running in Azure.",
+			svcName, timeout,
+		),
+		Hints: []string{
+			"Check the Azure Portal for current deployment status.",
+			fmt.Sprintf(
+				"Increase timeout with --timeout flag (e.g. azd deploy --timeout %d)"+
+					" or AZD_DEPLOY_TIMEOUT env var (e.g. AZD_DEPLOY_TIMEOUT=%d).",
+				int(timeout.Seconds())*2, int(timeout.Seconds())*2),
+		},
+	}
+}
+
+func displayDeployWarnings(
+	ctx context.Context,
+	console input.Console,
+	services []*project.ServiceConfig,
+	state *deployGraphState,
+) {
+	for _, svc := range services {
+		if result := state.GetResult(svc.Name); result != nil {
+			for _, warning := range result.Warnings {
+				console.MessageUxItem(ctx, &ux.WarningMessage{
+					Description: fmt.Sprintf("Service '%s': %s", svc.Name, warning),
+				})
+			}
+		}
+	}
+}
+
+// suggestServiceDeps scans each service's Environment map for references to
+// other services' env vars (SERVICE_<OTHER>_*) and logs advisory hints
+// suggesting uses: declarations. This does NOT affect execution order — it
+// only helps template authors discover implicit dependencies so they can
+// opt into parallel deployment.
+func suggestServiceDeps(services []*project.ServiceConfig) {
+	// Build a lookup from normalized env key prefix to service name.
+	prefixToService := make(map[string]string, len(services))
+	for _, svc := range services {
+		prefix := "SERVICE_" + environment.Key(svc.Name) + "_"
+		prefixToService[prefix] = svc.Name
+	}
+
+	for _, svc := range services {
+		if svc.Environment == nil {
+			continue
+		}
+		deps := map[string]bool{}
+		for _, expandable := range svc.Environment {
+			// Use Envsubst with a recording mapper: each ${VAR} reference
+			// calls the mapper, letting us see which env vars are referenced
+			// without needing access to the unexported template field.
+			expandable.Envsubst(func(key string) string {
+				for prefix, depName := range prefixToService {
+					if depName != svc.Name && strings.HasPrefix(key, prefix) {
+						deps[depName] = true
+					}
+				}
+				return "" // value doesn't matter — we only care about the key
+			})
+		}
+		for dep := range deps {
+			log.Printf(
+				"  hint: service %q references SERVICE_%s_* env vars; "+
+					"consider adding 'uses: [%s]' for parallel deployment",
+				svc.Name, environment.Key(dep), dep,
+			)
+		}
+	}
+}

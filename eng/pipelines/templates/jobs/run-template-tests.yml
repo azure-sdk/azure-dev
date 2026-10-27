@@ -1,0 +1,128 @@
+parameters:
+- name: AzdVersion
+  displayName: |
+    Version of azd to test against.
+    For PR builds, specify 'pr/<PRNumber>'. The PR validation build must have succeeded prior.
+    For official build, 'daily', 'latest', or a specific version number: '0.3.0-beta.6-daily.1947218'.
+  type: string
+  default: daily
+
+- name: TemplateList
+  displayName: |
+    Comma-delimited list of templates to test against (by default, 'all' to run all). Example: 'Azure-Samples/todo-csharp-sql, Azure-Samples/todo-nodejs-mongo'
+  type: string
+  default: 'all'
+
+- name: TemplateListFilter
+  displayName: |
+    Regex filter expression to filter templates. Examples: 'csharp', 'terraform', 'python-mongo'
+  type: string
+  default: '^Azure-Samples/todo-.*$'
+
+- name: TemplateBranchName
+  displayName: The template repository branch to test against
+  type: string
+  default: main
+
+- name: TemplateRunEnvironmentVariables
+  displayName: |
+    Comma-delimited list of environment variables in the format of (KEY=VALUE) to set for the template test run.
+    Example: USE_APIM=true,ENV_SUFFIX=MYSUFFIX
+  type: string
+  default: ''
+
+- name: AzureLocation
+  displayName: Azure location for templates to be deployed to
+  type: string
+  default: eastus2
+
+- name: CleanupHoursDelay
+  displayName: Delay, in hours, before cleaning up Azure resources. Useful for debugging purposes
+  type: number
+  default: 0
+
+- name: JobCondition
+  type: string
+  default: 'succeeded()'
+
+- name: JobDependsOn
+  type: string
+  default: ''
+
+- name: UseAzdVersionFromPrNumber
+  type: boolean
+  default: false
+
+- name: Pool
+  type: string
+  default: azsdk-pool
+
+# Image name (compliant image required for 1ES pipelines that release)
+- name: Image
+  type: string
+  default: ubuntu-22.04
+
+jobs:
+  - job: TemplateTest_CreateMatrix
+    condition: ${{ parameters.JobCondition }}
+    dependsOn: ${{ parameters.JobDependsOn }}
+    pool:
+      name: ${{ parameters.Pool }}
+      image: ${{ parameters.Image }}
+      os: linux
+
+    variables:
+    - name: AzdVersion
+      value: ${{ parameters.AzdVersion }}
+
+    - name: TemplateList
+      value: ${{ parameters.TemplateList }}
+
+    - name: TemplateBranchName
+      value: ${{ parameters.TemplateBranchName }}
+
+    steps:
+      - checkout: self
+
+      - ${{ if parameters.UseAzdVersionFromPrNumber }}:
+        - pwsh: |
+            $AzdVersion = '$(AzdVersion)'
+            if ($env:SYSTEM_PULLREQUEST_PULLREQUESTNUMBER) {
+              $AzdVersion = 'pr/' + $env:SYSTEM_PULLREQUEST_PULLREQUESTNUMBER
+              Write-Host "PR build detected, overriding to use azd version: $AzdVersion"
+              Write-Host "##vso[task.setvariable variable=AzdVersion]$AzdVersion"
+            } else {
+              Write-Host "Non PR build, using azd version: $AzdVersion."
+            }
+          displayName: Set azd version from PR run
+
+      - template: /eng/pipelines/templates/steps/template-test-generate-jobs.yml
+        parameters:
+          # Generation parameters
+          TemplateList: $(TemplateList)
+          TemplateListFilter: ${{ parameters.TemplateListFilter }}
+          TemplateRunEnvironmentVariables: ${{ parameters.TemplateRunEnvironmentVariables }}
+          OutputMatrixStepName: Generate
+          OutputMatrixVariable: Matrix
+          # Variables to set on the matrix job below
+          AzdVersion: $(AzdVersion)
+          AzureLocation: ${{ parameters.AzureLocation }}
+          TemplateBranchName: $(TemplateBranchName)
+          CleanupHoursDelay: ${{ parameters.CleanupHoursDelay }}
+
+  - job: TemplateTest_RunTest
+    timeoutInMinutes: 180
+    dependsOn: TemplateTest_CreateMatrix
+
+    strategy:
+      matrix: $[ dependencies.TemplateTest_CreateMatrix.outputs['Generate.Matrix'] ]
+      maxParallel: 10
+
+    pool:
+      name: ${{ parameters.Pool }}
+      image: ${{ parameters.Image }}
+      os: linux
+
+    steps:
+      - checkout: self
+      - template: /eng/pipelines/templates/steps/template-test-run-job.yml

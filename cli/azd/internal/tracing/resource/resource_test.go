@@ -1,0 +1,574 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package resource
+
+import (
+	"os"
+	"slices"
+	"testing"
+
+	"github.com/azure/azure-dev/cli/azd/internal"
+	"github.com/azure/azure-dev/cli/azd/internal/runcontext/agentdetect"
+	"github.com/azure/azure-dev/cli/azd/internal/tracing/fields"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+)
+
+// clearCIEnvVars unsets all CI-related environment variables so tests are deterministic.
+func clearCIEnvVars(t *testing.T) {
+	t.Helper()
+
+	ciVars := []string{
+		"TF_BUILD", "GITHUB_ACTIONS", "APPVEYOR", "TRAVIS", "CIRCLECI", "GITLAB_CI",
+		"CODEBUILD_BUILD_ID", "JENKINS_URL", "TEAMCITY_VERSION", "JB_SPACE_API_URL",
+		"bamboo.buildKey", "BITBUCKET_BUILD_NUMBER", "CI", "BUILD_ID",
+	}
+
+	for _, v := range ciVars {
+		t.Setenv(v, "")
+		os.Unsetenv(v)
+	}
+}
+
+func TestExecEnvForCi_GitHub_Actions(t *testing.T) {
+	clearCIEnvVars(t)
+	t.Setenv("GITHUB_ACTIONS", "true")
+
+	result := execEnvForCi()
+	if result != fields.EnvGitHubActions {
+		t.Fatalf("execEnvForCi() = %q, want %q", result, fields.EnvGitHubActions)
+	}
+}
+
+func TestExecEnvForCi_Azure_Pipelines(t *testing.T) {
+	clearCIEnvVars(t)
+	t.Setenv("TF_BUILD", "True")
+
+	result := execEnvForCi()
+	if result != fields.EnvAzurePipelines {
+		t.Fatalf("execEnvForCi() = %q, want %q", result, fields.EnvAzurePipelines)
+	}
+}
+
+func TestExecEnvForCi_case_insensitive_bool(t *testing.T) {
+	clearCIEnvVars(t)
+	t.Setenv("APPVEYOR", "TRUE")
+
+	result := execEnvForCi()
+	if result != fields.EnvAppVeyor {
+		t.Fatalf("execEnvForCi() = %q, want %q", result, fields.EnvAppVeyor)
+	}
+}
+
+func TestExecEnvForCi_Travis(t *testing.T) {
+	clearCIEnvVars(t)
+	t.Setenv("TRAVIS", "true")
+
+	result := execEnvForCi()
+	if result != fields.EnvTravisCI {
+		t.Fatalf("execEnvForCi() = %q, want %q", result, fields.EnvTravisCI)
+	}
+}
+
+func TestExecEnvForCi_CircleCI(t *testing.T) {
+	clearCIEnvVars(t)
+	t.Setenv("CIRCLECI", "true")
+
+	result := execEnvForCi()
+	if result != fields.EnvCircleCI {
+		t.Fatalf("execEnvForCi() = %q, want %q", result, fields.EnvCircleCI)
+	}
+}
+
+func TestExecEnvForCi_GitLabCI(t *testing.T) {
+	clearCIEnvVars(t)
+	t.Setenv("GITLAB_CI", "true")
+
+	result := execEnvForCi()
+	if result != fields.EnvGitLabCI {
+		t.Fatalf("execEnvForCi() = %q, want %q", result, fields.EnvGitLabCI)
+	}
+}
+
+func TestExecEnvForCi_Jenkins(t *testing.T) {
+	clearCIEnvVars(t)
+	t.Setenv("JENKINS_URL", "https://jenkins.example.com")
+
+	result := execEnvForCi()
+	if result != fields.EnvJenkins {
+		t.Fatalf("execEnvForCi() = %q, want %q", result, fields.EnvJenkins)
+	}
+}
+
+func TestExecEnvForCi_AWS_CodeBuild(t *testing.T) {
+	clearCIEnvVars(t)
+	t.Setenv("CODEBUILD_BUILD_ID", "build:123")
+
+	result := execEnvForCi()
+	if result != fields.EnvAwsCodeBuild {
+		t.Fatalf("execEnvForCi() = %q, want %q", result, fields.EnvAwsCodeBuild)
+	}
+}
+
+func TestExecEnvForCi_TeamCity(t *testing.T) {
+	clearCIEnvVars(t)
+	t.Setenv("TEAMCITY_VERSION", "2023.1")
+
+	result := execEnvForCi()
+	if result != fields.EnvTeamCity {
+		t.Fatalf("execEnvForCi() = %q, want %q", result, fields.EnvTeamCity)
+	}
+}
+
+func TestExecEnvForCi_JetBrains_Space(t *testing.T) {
+	clearCIEnvVars(t)
+	t.Setenv("JB_SPACE_API_URL", "https://space.example.com/api")
+
+	result := execEnvForCi()
+	if result != fields.EnvJetBrainsSpace {
+		t.Fatalf("execEnvForCi() = %q, want %q", result, fields.EnvJetBrainsSpace)
+	}
+}
+
+func TestExecEnvForCi_BitBucket_Pipelines(t *testing.T) {
+	clearCIEnvVars(t)
+	t.Setenv("BITBUCKET_BUILD_NUMBER", "42")
+
+	result := execEnvForCi()
+	if result != fields.EnvBitBucketPipelines {
+		t.Fatalf("execEnvForCi() = %q, want %q", result, fields.EnvBitBucketPipelines)
+	}
+}
+
+func TestExecEnvForCi_unknown_CI_var(t *testing.T) {
+	clearCIEnvVars(t)
+	t.Setenv("CI", "1")
+
+	result := execEnvForCi()
+	if result != fields.EnvUnknownCI {
+		t.Fatalf("execEnvForCi() = %q, want %q", result, fields.EnvUnknownCI)
+	}
+}
+
+func TestExecEnvForCi_unknown_BUILD_ID(t *testing.T) {
+	clearCIEnvVars(t)
+	t.Setenv("BUILD_ID", "some-build")
+
+	result := execEnvForCi()
+	if result != fields.EnvUnknownCI {
+		t.Fatalf("execEnvForCi() = %q, want %q", result, fields.EnvUnknownCI)
+	}
+}
+
+func TestExecEnvForCi_no_CI_vars(t *testing.T) {
+	clearCIEnvVars(t)
+
+	result := execEnvForCi()
+	if result != "" {
+		t.Fatalf("execEnvForCi() = %q, want empty string", result)
+	}
+}
+
+func TestExecEnvForCi_bool_false_not_matched(t *testing.T) {
+	clearCIEnvVars(t)
+	t.Setenv("GITHUB_ACTIONS", "false")
+
+	result := execEnvForCi()
+	if result != "" {
+		t.Fatalf("execEnvForCi() with GITHUB_ACTIONS=false = %q, want empty string", result)
+	}
+}
+
+func TestExecEnvForCi_bool_precedence(t *testing.T) {
+	clearCIEnvVars(t)
+	// Bool rules are checked before set rules.
+	// TF_BUILD (bool) should win over CI (set)
+	t.Setenv("TF_BUILD", "true")
+	t.Setenv("CI", "1")
+
+	result := execEnvForCi()
+	if result != fields.EnvAzurePipelines {
+		t.Fatalf("execEnvForCi() = %q, want %q (bool rule should win)", result, fields.EnvAzurePipelines)
+	}
+}
+
+func TestIsRunningOnCI_true(t *testing.T) {
+	clearCIEnvVars(t)
+	t.Setenv("GITHUB_ACTIONS", "true")
+
+	if !IsRunningOnCI() {
+		t.Fatal("IsRunningOnCI() should return true when GITHUB_ACTIONS=true")
+	}
+}
+
+func TestIsRunningOnCI_false(t *testing.T) {
+	clearCIEnvVars(t)
+
+	if IsRunningOnCI() {
+		t.Fatal("IsRunningOnCI() should return false with no CI env vars")
+	}
+}
+
+func TestIsValidMacAddress(t *testing.T) {
+	tests := []struct {
+		name    string
+		addr    string
+		isValid bool
+	}{
+		{"valid address", "01:23:45:67:89:ab", true},
+		{"all zeros", "00:00:00:00:00:00", false},
+		{"all ff", "ff:ff:ff:ff:ff:ff", false},
+		{"hyper-v default", "ac:de:48:00:11:22", false},
+		{"another valid", "de:ad:be:ef:ca:fe", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isValidMacAddress(tt.addr)
+			if result != tt.isValid {
+				t.Fatalf("isValidMacAddress(%q) = %v, want %v", tt.addr, result, tt.isValid)
+			}
+		})
+	}
+}
+
+func TestExecEnvForHosts_codespaces(t *testing.T) {
+	clearCIEnvVars(t)
+	// Clear host vars — t.Setenv registers cleanup, os.Unsetenv removes for LookupEnv checks
+	t.Setenv("AZD_IN_CLOUDSHELL", "")
+	os.Unsetenv("AZD_IN_CLOUDSHELL")
+	t.Setenv("CODESPACES", "")
+	os.Unsetenv("CODESPACES")
+
+	t.Setenv("CODESPACES", "true")
+
+	result := execEnvForHosts()
+	if result != fields.EnvCodespaces {
+		t.Fatalf("execEnvForHosts() = %q, want %q", result, fields.EnvCodespaces)
+	}
+}
+
+func TestExecEnvForHosts_no_host(t *testing.T) {
+	t.Setenv("AZD_IN_CLOUDSHELL", "")
+	os.Unsetenv("AZD_IN_CLOUDSHELL")
+	t.Setenv("CODESPACES", "")
+	os.Unsetenv("CODESPACES")
+
+	result := execEnvForHosts()
+	if result != "" {
+		t.Fatalf("execEnvForHosts() = %q, want empty string", result)
+	}
+}
+
+func clearAgentEnvVars(t *testing.T) {
+	t.Helper()
+
+	for _, envVar := range []string{
+		"AGENCY_SESSION_ID", "AI_AGENT",
+		"ANTIGRAVITY_AGENT", "ANTIGRAVITY_CONVERSATION_ID",
+		"CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT",
+		"CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "CODEX_CI", "CODEX_THREAD_ID", "CODEX_SESSION_ID",
+		"CURSOR_AGENT", "CURSOR_CONVERSATION_ID",
+		"COPILOT_CLI", "GEMINI_CLI", "GEMINI_CLI_NO_RELAUNCH", "OPENCODE",
+	} {
+		t.Setenv(envVar, "")
+		require.NoError(t, os.Unsetenv(envVar))
+	}
+}
+
+func TestGetExecutionEnvironment_Agents(t *testing.T) {
+	tests := []struct {
+		name       string
+		aiAgent    string
+		envVar     string
+		envValue   string
+		entrypoint string
+		userAgent  string
+		want       string
+	}{
+		{
+			name:    "GitHub Copilot App",
+			aiAgent: "github_copilot_app_agent",
+			want:    fields.EnvGitHubCopilotApp,
+		},
+		{
+			name:     "Antigravity",
+			envVar:   "ANTIGRAVITY_AGENT",
+			envValue: "1",
+			want:     fields.EnvAntigravity,
+		},
+		{
+			name:    "GitHub Copilot VSCode",
+			aiAgent: "github_copilot_vscode_agent",
+			want:    fields.EnvGitHubCopilotVSCode,
+		},
+		{
+			name:    "GitHub Copilot cloud agent",
+			aiAgent: "github_copilot_cloud_agent",
+			want:    fields.EnvGitHubCopilotCloudAgent,
+		},
+		{
+			name:    "Pi coding agent",
+			aiAgent: "pi",
+			want:    fields.EnvPi,
+		},
+		{
+			name:     "Codex",
+			envVar:   "CODEX_THREAD_ID",
+			envValue: "thread-id",
+			want:     fields.EnvCodex,
+		},
+		{
+			name:     "Codex Desktop",
+			envVar:   "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+			envValue: "Codex Desktop",
+			want:     fields.EnvCodexDesktop,
+		},
+		{
+			name:     "Cursor",
+			envVar:   "CURSOR_AGENT",
+			envValue: "1",
+			want:     fields.EnvCursor,
+		},
+		{
+			name:     "Claude Code",
+			envVar:   "CLAUDECODE",
+			envValue: "1",
+			want:     fields.EnvClaudeCode,
+		},
+		{
+			name:       "Claude Code Desktop",
+			envVar:     "CLAUDECODE",
+			envValue:   "1",
+			entrypoint: "claude-desktop",
+			want:       fields.EnvClaudeCodeDesktop,
+		},
+		{
+			name:       "Claude Code VSCode",
+			envVar:     "CLAUDECODE",
+			envValue:   "1",
+			entrypoint: "claude-vscode",
+			want:       fields.EnvClaudeCodeVSCode,
+		},
+		{
+			name:      "VS Code Azure GitHub Copilot",
+			userAgent: internal.VsCodeAzureCopilotAgentPrefix + "/1.0.0",
+			want:      fields.EnvVSCodeAzureCopilot,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearAgentEnvVars(t)
+			t.Setenv("AI_AGENT", tt.aiAgent)
+			t.Setenv(internal.AzdUserAgentEnvVar, tt.userAgent)
+			t.Setenv("CLAUDE_CODE_ENTRYPOINT", tt.entrypoint)
+			if tt.envVar != "" {
+				t.Setenv(tt.envVar, tt.envValue)
+			}
+			t.Setenv(agentdetect.DisableAgentDetectEnvVar, "")
+			os.Unsetenv(agentdetect.DisableAgentDetectEnvVar)
+			agentdetect.ResetDetection()
+			t.Cleanup(agentdetect.ResetDetection)
+
+			if got := getExecutionEnvironment(); got != tt.want {
+				t.Fatalf("getExecutionEnvironment() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExecEnvModifiers(t *testing.T) {
+	tests := []struct {
+		name      string
+		userAgent string
+		sessionID *string
+		want      []string
+	}{
+		{
+			name:      "no modifiers",
+			userAgent: "custom-user-agent",
+			want:      []string{},
+		},
+		{
+			name:      "Azure App Spaces portal",
+			userAgent: "azure_app_space_portal:v1.0.0",
+			want:      []string{fields.EnvModifierAzureSpace},
+		},
+		{
+			name:      "Microsoft Foundry skill",
+			userAgent: "microsoft_foundry_skill",
+			want:      []string{fields.EnvModifierMicrosoftFoundrySkill},
+		},
+		{
+			name:      "empty Agency session",
+			sessionID: new(""),
+			want:      []string{},
+		},
+		{
+			name:      "Agency session",
+			sessionID: new("synthetic-agency-session"),
+			want:      []string{"agency"},
+		},
+		{
+			name:      "Agency session is not parsed",
+			sessionID: new("false;not-an-environment"),
+			want:      []string{"agency"},
+		},
+		{
+			name:      "Agency with multiple modifiers",
+			userAgent: "azure_app_space_portal microsoft_foundry_skill",
+			sessionID: new("another-synthetic-session"),
+			want:      []string{fields.EnvModifierAzureSpace, fields.EnvModifierMicrosoftFoundrySkill, "agency"},
+		},
+		{
+			name:      "multiple modifiers",
+			userAgent: "azure_app_space_portal microsoft_foundry_skill",
+			want: []string{
+				fields.EnvModifierAzureSpace,
+				fields.EnvModifierMicrosoftFoundrySkill,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("AZURE_DEV_USER_AGENT", tt.userAgent)
+			t.Setenv("AGENCY_SESSION_ID", "")
+			require.NoError(t, os.Unsetenv("AGENCY_SESSION_ID"))
+			if tt.sessionID != nil {
+				t.Setenv("AGENCY_SESSION_ID", *tt.sessionID)
+			}
+
+			if got := execEnvModifiers(); !slices.Equal(got, tt.want) {
+				t.Fatalf("execEnvModifiers() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetExecutionEnvironment_Agency(t *testing.T) {
+	const sessionID = "synthetic-agency-session-do-not-emit"
+	tests := []struct {
+		name      string
+		sessionID *string
+		aiAgent   string
+		userAgent string
+		disabled  bool
+		want      string
+	}{
+		{name: "unset", want: "GitHub Copilot CLI"},
+		{name: "empty", sessionID: new(""), want: "GitHub Copilot CLI"},
+		{name: "Copilot CLI", sessionID: new(sessionID), want: "GitHub Copilot CLI;agency"},
+		{name: "different session", sessionID: new("different-session"), want: "GitHub Copilot CLI;agency"},
+		{
+			name: "Copilot App and CLI", sessionID: new(sessionID),
+			aiAgent: "github_copilot_app_agent", want: "GitHub Copilot App;agency",
+		},
+		{
+			name: "caller precedence", sessionID: new(sessionID),
+			userAgent: internal.VsCodeAgentPrefix, want: "Visual Studio Code;agency",
+		},
+		{
+			name: "agent detection disabled", sessionID: new(sessionID),
+			disabled: true, want: "Desktop;agency",
+		},
+		{
+			name: "all modifiers", sessionID: new(sessionID),
+			userAgent: "azure_app_space_portal microsoft_foundry_skill",
+			want:      "GitHub Copilot CLI;Azure App Spaces Portal;Microsoft Foundry Skill;agency",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearCIEnvVars(t)
+			clearAgentEnvVars(t)
+			for _, key := range []string{"AZD_IN_CLOUDSHELL", "CODESPACES"} {
+				t.Setenv(key, "")
+				require.NoError(t, os.Unsetenv(key))
+			}
+			t.Setenv(internal.AzdUserAgentEnvVar, tt.userAgent)
+			t.Setenv("AI_AGENT", tt.aiAgent)
+			t.Setenv("COPILOT_CLI", "1")
+			t.Setenv(agentdetect.DisableAgentDetectEnvVar, "")
+			if tt.disabled {
+				t.Setenv(agentdetect.DisableAgentDetectEnvVar, "1")
+			}
+			if tt.sessionID != nil {
+				t.Setenv("AGENCY_SESSION_ID", *tt.sessionID)
+			}
+			agentdetect.ResetDetection()
+			t.Cleanup(agentdetect.ResetDetection)
+
+			require.Equal(t, tt.want, getExecutionEnvironment())
+			for _, attr := range New().Attributes() {
+				if attr.Key == fields.ExecutionEnvironmentKey.Key {
+					require.Equal(t, tt.want, attr.Value.AsString())
+				}
+				if tt.sessionID != nil && *tt.sessionID != "" {
+					require.NotContains(t, attr.Value.String(), *tt.sessionID)
+				}
+			}
+		})
+	}
+}
+
+func TestNewReturnsCanonicalResource(t *testing.T) {
+	clearCIEnvVars(t)
+	t.Setenv("AZD_IN_CLOUDSHELL", "")
+	os.Unsetenv("AZD_IN_CLOUDSHELL")
+	t.Setenv("CODESPACES", "")
+	os.Unsetenv("CODESPACES")
+	t.Setenv("AZURE_DEV_USER_AGENT", "")
+	os.Unsetenv("AZURE_DEV_USER_AGENT")
+	t.Setenv("AGENCY_SESSION_ID", "synthetic-agency-canonical-resource-session")
+	t.Setenv(
+		"OTEL_RESOURCE_ATTRIBUTES",
+		"user.email=customer@example.com,custom.resource=value,service.instance.id=customer-instance",
+	)
+	t.Setenv("OTEL_SERVICE_NAME", "ambient-service")
+	t.Setenv("OTEL_GO_X_RESOURCE", "true")
+
+	r := New()
+	require.NotNil(t, r)
+	require.Equal(t, semconv.SchemaURL, r.SchemaURL())
+
+	attributes := map[attribute.Key]attribute.Value{}
+	for _, kv := range r.Attributes() {
+		attributes[kv.Key] = kv.Value
+		require.NotContains(t, kv.Value.String(), "synthetic-agency-canonical-resource-session")
+	}
+
+	expectedKeys := []attribute.Key{
+		fields.ServiceNameKey.Key,
+		fields.ServiceVersionKey.Key,
+		fields.OSTypeKey.Key,
+		fields.OSVersionKey.Key,
+		fields.HostArchKey.Key,
+		fields.ProcessRuntimeVersionKey.Key,
+		fields.ExecutionEnvironmentKey.Key,
+		fields.MachineIdKey.Key,
+		fields.InstalledByKey.Key,
+		fields.DevDeviceIdKey.Key,
+		semconv.TelemetrySDKNameKey,
+		semconv.TelemetrySDKLanguageKey,
+		semconv.TelemetrySDKVersionKey,
+	}
+	require.Len(t, attributes, len(expectedKeys))
+	for _, key := range expectedKeys {
+		require.Contains(t, attributes, key)
+	}
+
+	require.Equal(t, fields.ServiceNameAzd, attributes[fields.ServiceNameKey.Key].AsString())
+	require.Equal(t, "opentelemetry", attributes[semconv.TelemetrySDKNameKey].AsString())
+	require.Equal(t, "go", attributes[semconv.TelemetrySDKLanguageKey].AsString())
+	require.Equal(t, sdk.Version(), attributes[semconv.TelemetrySDKVersionKey].AsString())
+
+	require.NotContains(t, attributes, attribute.Key("user.email"))
+	require.NotContains(t, attributes, attribute.Key("custom.resource"))
+	require.NotContains(t, attributes, semconv.ServiceInstanceIDKey)
+}

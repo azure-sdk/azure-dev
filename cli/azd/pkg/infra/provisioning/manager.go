@@ -5,327 +5,633 @@ package provisioning
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
-	"log"
-	"strings"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
+	"sync"
 
-	"github.com/azure/azure-dev/cli/azd/pkg/azureutil"
+	"github.com/azure/azure-dev/cli/azd/internal/tracing"
+	"github.com/azure/azure-dev/cli/azd/internal/tracing/fields"
+	"github.com/azure/azure-dev/cli/azd/pkg/alpha"
+	"github.com/azure/azure-dev/cli/azd/pkg/azapi"
+	"github.com/azure/azure-dev/cli/azd/pkg/azsdk/storage"
+	"github.com/azure/azure-dev/cli/azd/pkg/cloud"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment"
-	"github.com/azure/azure-dev/cli/azd/pkg/infra"
 	"github.com/azure/azure-dev/cli/azd/pkg/input"
+	"github.com/azure/azure-dev/cli/azd/pkg/ioc"
+	"github.com/azure/azure-dev/cli/azd/pkg/osutil"
 	"github.com/azure/azure-dev/cli/azd/pkg/output"
-	"github.com/azure/azure-dev/cli/azd/pkg/spin"
-	"github.com/azure/azure-dev/cli/azd/pkg/tools"
-	"github.com/azure/azure-dev/cli/azd/pkg/tools/azcli"
+	"github.com/azure/azure-dev/cli/azd/pkg/output/ux"
+	"github.com/azure/azure-dev/cli/azd/pkg/prompt"
+	"github.com/braydonk/yaml"
 )
+
+type DefaultProviderResolver func() (ProviderKind, error)
 
 // Manages the orchestration of infrastructure provisioning
 type Manager struct {
-	azCli       azcli.AzCli
-	env         *environment.Environment
-	provider    Provider
-	formatter   output.Formatter
-	writer      io.Writer
-	console     input.Console
-	interactive bool
+	serviceLocator      ioc.ServiceLocator
+	defaultProvider     DefaultProviderResolver
+	envManager          environment.Manager
+	env                 *environment.Environment
+	console             input.Console
+	provider            Provider
+	alphaFeatureManager *alpha.FeatureManager
+	projectPath         string
+	options             *Options
+	fileShareService    storage.FileShareService
+	cloud               *cloud.Cloud
 }
 
-// Prepares for an infrastructure provision operation
-func (m *Manager) Plan(ctx context.Context) (*DeploymentPlan, error) {
-	deploymentPlan, err := m.plan(ctx)
+var (
+	defaultOptions = Options{
+		Module: "main",
+		Path:   "infra",
+	}
+)
+
+func (m *Manager) Initialize(ctx context.Context, projectPath string, options Options) error {
+	infraOptions, err := options.GetWithDefaults()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	return deploymentPlan, nil
+	m.projectPath = projectPath
+	m.options = &infraOptions
+
+	provider, err := m.newProvider(ctx)
+	if err != nil {
+		return fmt.Errorf("initializing infrastructure provider: %w", err)
+	}
+
+	m.provider = provider
+	return m.provider.Initialize(ctx, projectPath, infraOptions)
+}
+
+// Parameters gets the list of parameters and its value which will be used to provision the infrastructure.
+func (m *Manager) Parameters(ctx context.Context) ([]Parameter, error) {
+	if m.provider == nil {
+		panic("called parameters() with provider not initialized. Make sure to call manager.Initialize() first.")
+	}
+	return m.provider.Parameters(ctx)
+}
+
+// PlannedOutputs returns the list of outputs in the current plan.
+func (m *Manager) PlannedOutputs(ctx context.Context) ([]PlannedOutput, error) {
+	if m.provider == nil {
+		panic("called PlannedOutputs() with provider not initialized. Make sure to call manager.Initialize() first.")
+	}
+	return m.provider.PlannedOutputs(ctx)
 }
 
 // Gets the latest deployment details for the specified scope
-func (m *Manager) GetDeployment(ctx context.Context, scope infra.Scope) (*DeployResult, error) {
-	var deployResult *DeployResult
-
-	err := m.runAction(ctx, "Retrieving Azure Deployment", m.interactive, func(ctx context.Context, spinner *spin.Spinner) error {
-		queryTask := m.provider.GetDeployment(ctx, scope)
-
-		go func() {
-			for progress := range queryTask.Progress() {
-				m.updateSpinnerTitle(spinner, progress.Message)
-			}
-		}()
-
-		go m.monitorInteraction(spinner, queryTask.Interactive())
-
-		result, err := queryTask.Await()
-		if err != nil {
-			return err
-		}
-
-		deployResult = result
-
-		return nil
-	})
-
+func (m *Manager) State(ctx context.Context, options *StateOptions) (*StateResult, error) {
+	result, err := m.provider.State(ctx, options)
 	if err != nil {
-		return nil, fmt.Errorf("error retrieving deployment: %w", err)
+		return nil, fmt.Errorf("error retrieving state: %w", err)
 	}
 
-	return deployResult, nil
+	return result, nil
 }
 
+var AzdOperationsFeatureKey = alpha.MustFeatureKey("azd.operations")
+
 // Deploys the Azure infrastructure for the specified project
-func (m *Manager) Deploy(ctx context.Context, plan *DeploymentPlan, scope infra.Scope) (*DeployResult, error) {
-	// Ensure that a location has been set prior to provisioning
-	location, err := m.ensureLocation(ctx, &plan.Deployment)
-	if err != nil {
-		return nil, err
-	}
-
+func (m *Manager) Deploy(ctx context.Context) (*DeployResult, error) {
 	// Apply the infrastructure deployment
-	deployResult, err := m.deploy(ctx, location, plan, scope)
+	deployResult, err := m.provider.Deploy(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error deploying infrastructure: %w", err)
 	}
 
-	if err := UpdateEnvironment(m.env, &deployResult.Deployment.Outputs); err != nil {
+	skippedDueToDeploymentState := deployResult.SkippedReason == DeploymentStateSkipped
+
+	if deployResult.SkippedReason == ProvisionValidationCanceledSkipped {
+		// Validation intentionally canceled provisioning. There is no Deployment to process.
+		return deployResult, nil
+	}
+
+	if skippedDueToDeploymentState {
+		m.console.StopSpinner(ctx, "Didn't find new changes.", input.StepSkipped)
+	}
+
+	if err := UpdateEnvironment(ctx, deployResult.Deployment.Outputs, m.env, m.envManager); err != nil {
 		return nil, fmt.Errorf("updating environment with deployment outputs: %w", err)
 	}
 
+	infraRoot := m.options.Path
+	if !filepath.IsAbs(infraRoot) {
+		infraRoot = filepath.Join(m.projectPath, m.options.Path)
+	}
+	bindMountOperations, err := azdFileShareUploadOperations(infraRoot, m.env)
+	azdOperationsEnabled := m.alphaFeatureManager.IsEnabled(AzdOperationsFeatureKey)
+	if !azdOperationsEnabled && len(bindMountOperations) > 0 {
+		m.console.Message(ctx, ErrBindMountOperationDisabled.Error())
+	}
+	if azdOperationsEnabled {
+		if err != nil {
+			return nil, fmt.Errorf("looking for azd fileShare upload operations: %w", err)
+		}
+		if err := doBindMountOperation(
+			ctx, bindMountOperations, m.env, m.console, m.fileShareService, m.cloud.StorageEndpointSuffix); err != nil {
+			return nil, fmt.Errorf("error running bind mount operation: %w", err)
+		}
+	}
+
+	// make sure any spinner is stopped
+	m.console.StopSpinner(ctx, "", input.StepDone)
+
 	return deployResult, nil
 }
 
-// Destroys the Azure infrastructure for the specified project
-func (m *Manager) Destroy(ctx context.Context, deployment *Deployment, options DestroyOptions) (*DestroyResult, error) {
-	// Call provisioning provider to destroy the infrastructure
-	destroyResult, err := m.destroy(ctx, deployment, options)
+const (
+	fileShareUploadOperation string = "FileShareUpload"
+	azdOperationsFileName    string = "azd.operations.yaml"
+)
+
+type azdOperation struct {
+	Type        string
+	Description string
+	Config      any
+}
+
+type azdOperationFileShareUpload struct {
+	Description    string
+	StorageAccount string
+	FileShareName  string
+	Path           string
+}
+
+type azdOperationsModel struct {
+	Operations []azdOperation
+}
+
+func azdOperations(infraPath string, env *environment.Environment) (azdOperationsModel, error) {
+	path := filepath.Join(infraPath, azdOperationsFileName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// file not found is not an error, there's just nothing to do
+			return azdOperationsModel{}, nil
+		}
+		return azdOperationsModel{}, err
+	}
+
+	// resolve environment variables
+	expString := osutil.NewExpandableString(string(data))
+	evaluated, err := expString.Envsubst(env.Getenv)
+	if err != nil {
+		return azdOperationsModel{}, err
+	}
+	data = []byte(evaluated)
+
+	// Unmarshal the file into azdOperationsModel
+	var operations azdOperationsModel
+	err = yaml.Unmarshal(data, &operations)
+	if err != nil {
+		return azdOperationsModel{}, err
+	}
+
+	return operations, nil
+}
+
+func azdFileShareUploadOperations(infraPath string, env *environment.Environment) ([]azdOperationFileShareUpload, error) {
+	model, err := azdOperations(infraPath, env)
 	if err != nil {
 		return nil, err
+	}
+
+	var fileShareUploadOperations []azdOperationFileShareUpload
+	for _, operation := range model.Operations {
+		if operation.Type == fileShareUploadOperation {
+			var fileShareUpload azdOperationFileShareUpload
+			bytes, err := json.Marshal(operation.Config)
+			if err != nil {
+				return nil, err
+			}
+			err = json.Unmarshal(bytes, &fileShareUpload)
+			if err != nil {
+				return nil, err
+			}
+			fileShareUpload.Description = operation.Description
+			fileShareUploadOperations = append(fileShareUploadOperations, fileShareUpload)
+		}
+	}
+	return fileShareUploadOperations, nil
+}
+
+var ErrAzdOperationsNotEnabled = fmt.Errorf(
+	"azd operations (alpha feature) is required but disabled. You can enable azd operations by running: %s",
+	output.WithGrayFormat("%s", alpha.GetEnableCommand(AzdOperationsFeatureKey)))
+
+var ErrBindMountOperationDisabled = fmt.Errorf(
+	"%sYour project has bind mounts.\n  - %w\n%s\n",
+	output.WithWarningFormat("*Note: "),
+	ErrAzdOperationsNotEnabled,
+	output.WithWarningFormat("Ignoring bind mounts."),
+)
+
+func doBindMountOperation(
+	ctx context.Context,
+	fileShareUploadOperations []azdOperationFileShareUpload,
+	env *environment.Environment,
+	console input.Console,
+	fileShareService storage.FileShareService,
+	cloudStorageEndpointSuffix string,
+) error {
+	if len(fileShareUploadOperations) > 0 {
+		console.ShowSpinner(ctx, "uploading files to fileShare", input.StepFailed)
+	}
+	for _, op := range fileShareUploadOperations {
+		if err := bindMountOperation(
+			ctx,
+			fileShareService,
+			cloudStorageEndpointSuffix,
+			env.GetSubscriptionId(),
+			op.StorageAccount,
+			op.FileShareName,
+			op.Path); err != nil {
+			return fmt.Errorf("error binding mount: %w", err)
+		}
+		console.MessageUxItem(ctx, &ux.DisplayedResource{
+			Type:  fileShareUploadOperation,
+			Name:  op.Description,
+			State: ux.SucceededState,
+		})
+	}
+	return nil
+}
+
+func bindMountOperation(
+	ctx context.Context,
+	fileShareService storage.FileShareService,
+	cloud, subId, storageAccount, fileShareName, source string) error {
+
+	shareUrl := fmt.Sprintf("https://%s.file.%s/%s", storageAccount, cloud, fileShareName)
+	return fileShareService.UploadPath(ctx, subId, shareUrl, source)
+}
+
+// Preview generates the list of changes to be applied as part of the provisioning.
+func (m *Manager) Preview(ctx context.Context) (*DeployPreviewResult, error) {
+	// Apply the infrastructure deployment
+	deployResult, err := m.provider.Preview(ctx)
+
+	if err != nil {
+		return nil, fmt.Errorf("error deploying infrastructure: %w", err)
+	}
+
+	// apply resource mapping
+	filteredResult := DeployPreviewResult{
+		Preview: &DeploymentPreview{
+			Status:     deployResult.Preview.Status,
+			Properties: &DeploymentPreviewProperties{},
+		},
+	}
+
+	for index, result := range deployResult.Preview.Properties.Changes {
+		mappingName := azapi.GetResourceTypeDisplayName(azapi.AzureResourceType(result.ResourceType))
+		if mappingName == "" {
+			// ignore
+			continue
+		}
+		deployResult.Preview.Properties.Changes[index].ResourceType = mappingName
+		filteredResult.Preview.Properties.Changes = append(
+			filteredResult.Preview.Properties.Changes, deployResult.Preview.Properties.Changes[index])
+	}
+
+	// make sure any spinner is stopped
+	m.console.StopSpinner(ctx, "", input.StepDone)
+
+	return &filteredResult, nil
+}
+
+// Destroys the Azure infrastructure for the specified project
+func (m *Manager) Destroy(ctx context.Context, options DestroyOptions) (*DestroyResult, error) {
+	destroyResult, err := m.provider.Destroy(ctx, options)
+	if err != nil {
+		return nil, fmt.Errorf("error deleting Azure resources: %w", err)
 	}
 
 	// Remove any outputs from the template from the environment since destroying the infrastructure
 	// invalidated them all.
-	for outputName := range destroyResult.Outputs {
-		delete(m.env.Values, outputName)
+	for _, key := range destroyResult.InvalidatedEnvKeys {
+		m.env.DotenvDelete(key)
 	}
 
 	// Update environment files to remove invalid infrastructure parameters
-	if err := m.env.Save(); err != nil {
+	if err := m.envManager.Save(ctx, m.env); err != nil {
 		return nil, fmt.Errorf("saving environment: %w", err)
 	}
 
 	return destroyResult, nil
 }
 
-// Plans the infrastructure provisioning and orchestrates interactive terminal operations
-func (m *Manager) plan(ctx context.Context) (*DeploymentPlan, error) {
-	var deploymentPlan *DeploymentPlan
-
-	err := m.runAction(ctx, "Planning infrastructure provisioning", m.interactive, func(ctx context.Context, spinner *spin.Spinner) error {
-		planningTask := m.provider.Plan(ctx)
-
-		go func() {
-			for progress := range planningTask.Progress() {
-				m.updateSpinnerTitle(spinner, progress.Message)
-			}
-		}()
-
-		go m.monitorInteraction(spinner, planningTask.Interactive())
-
-		result, err := planningTask.Await()
-		if err != nil {
-			return err
-		}
-
-		deploymentPlan = result
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, fmt.Errorf("planning infrastructure provisioning: %w", err)
-	}
-
-	m.console.Message(ctx, output.WithSuccessFormat("\nInfrastructure provisioning plan completed successfully"))
-
-	return deploymentPlan, nil
-}
-
-// Applies the specified infrastructure provisioning and orchestrates the interactive terminal operations
-func (m *Manager) deploy(ctx context.Context, location string, plan *DeploymentPlan, scope infra.Scope) (*DeployResult, error) {
-	var deployResult *DeployResult
-
-	err := m.runAction(ctx, "Provisioning Azure resources", m.interactive, func(ctx context.Context, spinner *spin.Spinner) error {
-		deployTask := m.provider.Deploy(ctx, plan, scope)
-
-		go func() {
-			for progress := range deployTask.Progress() {
-				m.updateSpinnerTitle(spinner, progress.Message)
-
-				if m.formatter.Kind() == output.JsonFormat {
-					m.writeJsonOutput(ctx, progress.Operations)
+func UpdateEnvironment(
+	ctx context.Context,
+	outputs map[string]OutputParameter,
+	env *environment.Environment,
+	envManager environment.Manager,
+) error {
+	if len(outputs) > 0 {
+		for key, param := range outputs {
+			// Complex types marshalled as JSON strings, simple types marshalled as simple strings
+			if param.Type == ParameterTypeArray || param.Type == ParameterTypeObject {
+				bytes, err := json.Marshal(param.Value)
+				if err != nil {
+					return fmt.Errorf("invalid value for output parameter '%s' (%s): %w", key, string(param.Type), err)
 				}
+				env.DotenvSet(key, string(bytes))
+			} else {
+				env.DotenvSet(key, fmt.Sprintf("%v", param.Value))
 			}
-		}()
+		}
 
-		go m.monitorInteraction(spinner, deployTask.Interactive())
+		if err := envManager.Save(ctx, env); err != nil {
+			return fmt.Errorf("writing environment: %w", err)
+		}
+	}
 
-		result, err := deployTask.Await()
+	return nil
+}
+
+type EnsureSubscriptionAndLocationOptions struct {
+	// LocationFilterPredicate is a function to filter the locations being displayed if prompting the user for the location.
+	LocationFiler prompt.LocationFilterPredicate
+	// SelectDefaultLocation is the default location that azd mark as selected when prompting the user for the location.
+	SelectDefaultLocation *string
+}
+
+// EnsureSubscriptionAndLocation ensures that that that subscription (AZURE_SUBSCRIPTION_ID) and location (AZURE_LOCATION)
+// variables are set in the environment, prompting the user for the values if they do not exist.
+// locationFilter, when non-nil, filters the locations being displayed.
+func EnsureSubscriptionAndLocation(
+	ctx context.Context,
+	envManager environment.Manager,
+	env *environment.Environment,
+	prompter prompt.Prompter,
+	options EnsureSubscriptionAndLocationOptions,
+) error {
+	subId := env.GetSubscriptionId()
+	if subId == "" {
+		if prompter.IsNoPromptMode() {
+			return &input.PromptRequiredError{
+				Inputs: []input.RequiredInput{
+					{
+						Name: "subscription",
+						Sources: []input.InputSource{
+							{
+								Kind: input.InputSourceEnvironment,
+								Name: environment.SubscriptionIdEnvVarName,
+							},
+						},
+					},
+				},
+			}
+		}
+		subscriptionId, err := prompter.PromptSubscription(ctx, "Select an Azure Subscription to use:")
 		if err != nil {
 			return err
 		}
-
-		deployResult = result
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, fmt.Errorf("error deploying infrastructure: %w", err)
+		subId = subscriptionId
+	}
+	// GetSubscriptionId() can get the value from the .env file or from system environment.
+	// We want to ensure that, if the value came from the system environment, it is persisted in the .env file.
+	// By doing this, we ensure that any command depending on .env values does not need to read system env.
+	// For example, on CI, when running `azd provision`, we want the .env to have the subscription id and location
+	// so that `azd deploy` can just use the values from .env w/o checking os-env again.
+	env.SetSubscriptionId(subId)
+	if err := envManager.Save(ctx, env); err != nil {
+		return err
 	}
 
-	if m.formatter.Kind() == output.JsonFormat {
-		m.writeJsonOutput(ctx, deployResult.Operations)
-	}
-
-	m.console.Message(ctx, output.WithSuccessFormat("\nAzure resource provisioning completed successfully"))
-
-	return deployResult, nil
-}
-
-// Destroys the specified infrastructure provisioning and orchestrates the interactive terminal operations
-func (m *Manager) destroy(ctx context.Context, deployment *Deployment, options DestroyOptions) (*DestroyResult, error) {
-	var destroyResult *DestroyResult
-
-	err := m.runAction(ctx, "Destroying Azure resources", m.interactive, func(ctx context.Context, spinner *spin.Spinner) error {
-		destroyTask := m.provider.Destroy(ctx, deployment, options)
-
-		go func() {
-			for progress := range destroyTask.Progress() {
-				m.updateSpinnerTitle(spinner, progress.Message)
+	location := env.GetLocation()
+	if env.GetLocation() == "" {
+		if prompter.IsNoPromptMode() {
+			return &input.PromptRequiredError{
+				Inputs: []input.RequiredInput{
+					{
+						Name: "location",
+						Sources: []input.InputSource{
+							{
+								Kind: input.InputSourceEnvironment,
+								Name: environment.LocationEnvVarName,
+							},
+						},
+					},
+				},
 			}
-		}()
-
-		go m.monitorInteraction(spinner, destroyTask.Interactive())
-
-		result, err := destroyTask.Await()
+		}
+		loc, err := prompter.PromptLocation(
+			ctx,
+			env.GetSubscriptionId(),
+			"Select an Azure location to use:",
+			options.LocationFiler,
+			options.SelectDefaultLocation,
+		)
 		if err != nil {
 			return err
 		}
-
-		destroyResult = result
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, fmt.Errorf("error destroying Azure resources: %w", err)
+		location = loc
 	}
 
-	m.console.Message(ctx, output.WithSuccessFormat("\nDestroyed Azure resources"))
-
-	return destroyResult, nil
+	// Same as before, this make sure the location is persisted in the .env file.
+	env.SetLocation(location)
+	return envManager.Save(ctx, env)
 }
 
-// Ensures a provisioning location has been identified within the deployment or prompts the user for input
-func (m *Manager) ensureLocation(ctx context.Context, deployment *Deployment) (string, error) {
-	var location string
-
-	for key, param := range deployment.Parameters {
-		if key == "location" {
-			location = fmt.Sprint(param.Value)
-			if strings.TrimSpace(location) != "" {
-				return location, nil
+func EnsureSubscription(
+	ctx context.Context,
+	envManager environment.Manager,
+	env *environment.Environment,
+	prompter prompt.Prompter,
+) error {
+	subId := env.GetSubscriptionId()
+	if subId == "" {
+		if prompter.IsNoPromptMode() {
+			return &input.PromptRequiredError{
+				Inputs: []input.RequiredInput{
+					{
+						Name: "subscription",
+						Sources: []input.InputSource{
+							{
+								Kind: input.InputSourceEnvironment,
+								Name: environment.SubscriptionIdEnvVarName,
+							},
+						},
+					},
+				},
 			}
 		}
-	}
-
-	for location == "" {
-		// TODO: We will want to store this information somewhere (so we don't have to prompt the
-		// user on every deployment if they don't have a `location` parameter in their bicep file.
-		// When we store it, we should store it /per environment/ not as a property of the entire
-		// project.
-		selected, err := azureutil.PromptLocation(ctx, "Please select an Azure location to use to store deployment metadata:")
+		subscriptionId, err := prompter.PromptSubscription(ctx, "Select an Azure Subscription to use:")
 		if err != nil {
-			return "", fmt.Errorf("prompting for deployment metadata region: %w", err)
+			return err
 		}
-
-		location = selected
+		subId = subscriptionId
 	}
-
-	return location, nil
-}
-
-func (m *Manager) runAction(ctx context.Context, title string, interactive bool, action func(ctx context.Context, spinner *spin.Spinner) error) error {
-	var spinner *spin.Spinner
-
-	if interactive {
-		spinner, ctx = spin.GetOrCreateSpinner(ctx, title)
-		defer spinner.Stop()
-		defer m.console.SetWriter(nil)
-
-		spinner.Start()
-		m.console.SetWriter(spinner)
+	// GetSubscriptionId() can get the value from the .env file or from system environment.
+	// We want to ensure that, if the value came from the system environment, it is persisted in the .env file.
+	// By doing this, we ensure that any command depending on .env values does not need to read system env.
+	// For example, on CI, when running `azd provision`, we want the .env to have the subscription id and location
+	// so that `azd deploy` can just use the values from .env w/o checking os-env again.
+	env.SetSubscriptionId(subId)
+	if err := envManager.Save(ctx, env); err != nil {
+		return err
 	}
-
-	return action(ctx, spinner)
-}
-
-// Updates the spinner title during interactive console session
-func (m *Manager) updateSpinnerTitle(spinner *spin.Spinner, message string) {
-	if spinner == nil {
-		return
-	}
-
-	spinner.Title(fmt.Sprintf("%s...", message))
-}
-
-func (m *Manager) writeJsonOutput(ctx context.Context, output any) {
-	err := m.formatter.Format(output, m.writer, nil)
-	if err != nil {
-		log.Printf("error formatting output: %s", err.Error())
-	}
-}
-
-// Monitors the interactive channel and starts/stops the terminal spinner as needed
-func (m *Manager) monitorInteraction(spinner *spin.Spinner, interactiveChannel <-chan bool) {
-	for isInteractive := range interactiveChannel {
-		if spinner == nil {
-			continue
-		}
-
-		if isInteractive {
-			spinner.Stop()
-		} else {
-			spinner.Start()
-		}
-	}
+	return envManager.Save(ctx, env)
 }
 
 // Creates a new instance of the Provisioning Manager
-func NewManager(ctx context.Context, env *environment.Environment, projectPath string, infraOptions Options, interactive bool) (*Manager, error) {
-	infraProvider, err := NewProvider(ctx, env, projectPath, infraOptions)
-	if err != nil {
-		return nil, fmt.Errorf("error creating infra provider: %w", err)
+func NewManager(
+	serviceLocator ioc.ServiceLocator,
+	defaultProvider DefaultProviderResolver,
+	envManager environment.Manager,
+	env *environment.Environment,
+	console input.Console,
+	alphaFeatureManager *alpha.FeatureManager,
+	fileShareService storage.FileShareService,
+	cloud *cloud.Cloud,
+) *Manager {
+	return &Manager{
+		serviceLocator:      serviceLocator,
+		defaultProvider:     defaultProvider,
+		envManager:          envManager,
+		env:                 env,
+		console:             console,
+		alphaFeatureManager: alphaFeatureManager,
+		fileShareService:    fileShareService,
+		cloud:               cloud,
 	}
+}
 
-	requiredTools := infraProvider.RequiredExternalTools()
-	if err := tools.EnsureInstalled(ctx, requiredTools...); err != nil {
+func (m *Manager) newProvider(ctx context.Context) (Provider, error) {
+	var err error
+	m.options.Provider, err = ParseProvider(m.options.Provider)
+	if err != nil {
 		return nil, err
 	}
 
-	azCli := azcli.GetAzCli(ctx)
-	console := input.GetConsole(ctx)
-	formatter := output.GetFormatter(ctx)
-	writer := output.GetWriter(ctx)
-	interactive = interactive && formatter.Kind() == output.NoneFormat
+	if alphaFeatureId, isAlphaFeature := alpha.IsFeatureKey(string(m.options.Provider)); isAlphaFeature {
+		if !m.alphaFeatureManager.IsEnabled(alphaFeatureId) {
+			return nil, fmt.Errorf("provider '%s' is alpha feature and it is not enabled. Run `%s` to enable it.",
+				m.options.Provider,
+				alpha.GetEnableCommand(alphaFeatureId),
+			)
+		}
 
-	return &Manager{
-		azCli:       azCli,
-		env:         env,
-		provider:    infraProvider,
-		formatter:   formatter,
-		writer:      writer,
-		console:     console,
-		interactive: interactive,
-	}, nil
+		m.console.WarnForFeature(ctx, alphaFeatureId)
+	}
+
+	providerKey := m.options.Provider
+	if providerKey == NotSpecified {
+		defaultProvider, err := m.defaultProvider()
+		if err != nil {
+			return nil, err
+		}
+
+		providerKey = defaultProvider
+	}
+
+	var provider Provider
+	err = m.serviceLocator.ResolveNamed(string(providerKey), &provider)
+	if err != nil {
+		return nil, fmt.Errorf("failed resolving IaC provider '%s': %w", providerKey, err)
+	}
+
+	return provider, nil
+}
+
+const (
+	// InfraProviderCustom is the infra.provider telemetry value recorded for a provider that is
+	// not one of the built-in kinds (for example an extension-registered provider). The raw name
+	// is never emitted because it may embed user-chosen project or organization identifiers.
+	InfraProviderCustom = "custom"
+)
+
+// RecordInfraProviderUsage records the resolved IaC provider(s) for a provisioning command
+// (provision / up / down) as the infra.provider attribute directly on the current command span in
+// ctx. The attribute is a sorted, de-duplicated string slice of the distinct providers the
+// command's layers resolve to: built-in kinds are recorded verbatim (for example "bicep",
+// "terraform", "arm"), while non-built-in (extension) providers are bucketed to
+// InfraProviderCustom ("custom") so raw user-chosen names are never emitted. A single-provider
+// project records a one-element slice (for example ["bicep"]); a multi-layer project that mixes
+// providers records each distinct value (for example ["bicep", "terraform"]) rather than a lossy
+// "mixed" marker, preserving which providers were combined while staying low-cardinality. Layers
+// that leave the provider unspecified resolve through the manager's default provider. It is a
+// no-op when no provider can be resolved.
+//
+// The value is attached directly to the span in ctx (not the process-global usage bag) so it stays
+// scoped to that single command span and does not leak onto sibling in-process child commands (for
+// example a custom `workflows.up` running `provision` then `deploy`). Callers must invoke this once
+// per command, before provider work begins, so the attribute is present on success, failure, and
+// preview spans alike. The value is computed deterministically from configuration (rather than
+// racing concurrent per-layer resolution).
+func (m *Manager) RecordInfraProviderUsage(ctx context.Context, layers []Options) {
+	providers := m.resolveInfraProviders(layers)
+	if len(providers) == 0 {
+		return
+	}
+
+	tracing.SetAttributesInContext(ctx, fields.InfraProviderKey.StringSlice(providers))
+}
+
+// resolveInfraProviders returns the sorted, de-duplicated telemetry-safe provider values for the
+// given layers — built-in kinds verbatim, non-built-in (extension) providers bucketed to
+// InfraProviderCustom. Layers that leave the provider unspecified resolve through the manager's
+// default provider. Returns nil when no provider can be resolved.
+func (m *Manager) resolveInfraProviders(layers []Options) []string {
+	// Resolve the default provider at most once per call, memoized (and concurrency-safe) via
+	// sync.OnceValues: every unspecified layer resolves to the same default, so this keeps the
+	// value deterministic and avoids repeating resolver work (which may do I/O) per layer.
+	var resolveDefault func() (ProviderKind, error)
+	if m.defaultProvider != nil {
+		resolveDefault = sync.OnceValues(m.defaultProvider)
+	}
+
+	// Collect the distinct telemetry-safe provider values in a single pass — built-in kinds
+	// verbatim, non-built-in (extension) providers bucketed to InfraProviderCustom. De-duplicating
+	// after bucketing means two different extension providers both collapse to a single "custom".
+	providers := map[string]struct{}{}
+	for _, layer := range layers {
+		kind := layer.Provider
+		if kind == NotSpecified {
+			if resolveDefault == nil {
+				continue
+			}
+
+			resolved, err := resolveDefault()
+			if err != nil {
+				continue
+			}
+
+			kind = resolved
+		}
+
+		if kind == NotSpecified {
+			continue
+		}
+
+		providers[InfraProviderTelemetryValue(kind)] = struct{}{}
+	}
+
+	if len(providers) == 0 {
+		return nil
+	}
+
+	return slices.Sorted(maps.Keys(providers))
+}
+
+// InfraProviderTelemetryValue maps a provider kind to a value that is safe to emit raw. Built-in
+// kinds are returned verbatim; any other (custom / extension-registered) provider is bucketed to
+// InfraProviderCustom so a user-chosen provider name is never sent as telemetry.
+func InfraProviderTelemetryValue(kind ProviderKind) string {
+	switch kind {
+	case Bicep, Terraform, Arm, Pulumi:
+		return string(kind)
+	default:
+		return InfraProviderCustom
+	}
 }

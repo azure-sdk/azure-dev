@@ -1,0 +1,15 @@
+name: agent-framework-agent-with-foundry-toolbox-responses
+metadata:
+  description: An Agent Framework agent with Foundry Toolbox integration.
+services:
+  agent:
+    host: azure.ai.agent
+    project: ./src/agent
+    kind: hosted
+    name: agent-framework-agent-with-foundry-toolbox-responses
+    protocols:
+      - protocol: responses
+        version: 1.0.0
+    env:
+      AZURE_AI_MODEL_DEPLOYMENT_NAME: ${AZURE_AI_MODEL_DEPLOYMENT_NAME}
+      TOOLBOX_ENDPOINT: ${TOOLBOX_ENDPOINT}

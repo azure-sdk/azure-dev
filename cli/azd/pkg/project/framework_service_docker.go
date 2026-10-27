@@ -5,78 +5,179 @@ package project
 
 import (
 	"context"
-	"fmt"
-	"log"
+	"errors"
+	"os"
 
+	"github.com/azure/azure-dev/cli/azd/pkg/alpha"
+	"github.com/azure/azure-dev/cli/azd/pkg/async"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment"
+	"github.com/azure/azure-dev/cli/azd/pkg/exec"
+	"github.com/azure/azure-dev/cli/azd/pkg/input"
+	"github.com/azure/azure-dev/cli/azd/pkg/osutil"
 	"github.com/azure/azure-dev/cli/azd/pkg/tools"
 	"github.com/azure/azure-dev/cli/azd/pkg/tools/docker"
 )
 
 type DockerProjectOptions struct {
-	Path     string `json:"path"`
-	Context  string `json:"context"`
-	Platform string `json:"platform"`
+	Path             string                    `yaml:"path,omitempty" json:"path,omitempty"`
+	Context          string                    `yaml:"context,omitempty" json:"context,omitempty"`
+	Platform         string                    `yaml:"platform,omitempty" json:"platform,omitempty"`
+	Target           string                    `yaml:"target,omitempty" json:"target,omitempty"`
+	Registry         osutil.ExpandableString   `yaml:"registry,omitempty" json:"registry"`
+	Image            osutil.ExpandableString   `yaml:"image,omitempty" json:"image"`
+	Tag              osutil.ExpandableString   `yaml:"tag,omitempty" json:"tag"`
+	RemoteBuild      bool                      `yaml:"remoteBuild,omitempty" json:"remoteBuild,omitempty"`
+	ImagePassthrough bool                      `yaml:"imagePassthrough,omitempty" json:"imagePassthrough,omitempty"`
+	Network          string                    `yaml:"network,omitempty" json:"network,omitempty"`
+	BuildArgs        []osutil.ExpandableString `yaml:"buildArgs,omitempty" json:"buildArgs,omitempty"`
+	// not supported from azure.yaml directly yet. Adding it for Aspire to use it, initially.
+	// Aspire would pass the secret keys, which are env vars that azd will set just to run docker build.
+	BuildSecrets []string `yaml:"-"                     json:"-"`
+	BuildEnv     []string `yaml:"-"                     json:"-"`
+	//InMemDockerfile allow projects to specify a dockerfile contents directly instead of a path on disk.
+	// This is not supported from azure.yaml.
+	// This is used by projects like Aspire that can generate a dockerfile on the fly and don't want to write it to disk.
+	// When this is set, whatever value in Path is ignored and the dockerfile contents in this property is used instead.
+	InMemDockerfile []byte `yaml:"-"                     json:"-"`
 }
 
 type dockerProject struct {
-	config    *ServiceConfig
-	env       *environment.Environment
-	docker    *docker.Docker
-	framework FrameworkService
+	env                 *environment.Environment
+	docker              *docker.Cli
+	framework           FrameworkService
+	containerHelper     *ContainerHelper
+	console             input.Console
+	alphaFeatureManager *alpha.FeatureManager
+	commandRunner       exec.CommandRunner
 }
 
-func (p *dockerProject) RequiredExternalTools() []tools.ExternalTool {
-	return []tools.ExternalTool{p.docker}
-}
-
-func (p *dockerProject) Package(ctx context.Context, progress chan<- string) (string, error) {
-	dockerOptions := getDockerOptionsWithDefaults(p.config.Docker)
-
-	log.Printf("building image for service %s, cwd: %s, path: %s, context: %s)", p.config.Name, p.config.Path(), dockerOptions.Path, dockerOptions.Context)
-
-	// Build the container
-	progress <- "Building docker image"
-	imageId, err := p.docker.Build(ctx, p.config.Path(), dockerOptions.Path, dockerOptions.Platform, dockerOptions.Context)
-	if err != nil {
-		return "", fmt.Errorf("building container: %s at %s: %w", p.config.Name, dockerOptions.Context, err)
+// NewDockerProject creates a new instance of a Azd project that
+// leverages docker for building
+func NewDockerProject(
+	env *environment.Environment,
+	docker *docker.Cli,
+	containerHelper *ContainerHelper,
+	console input.Console,
+	alphaFeatureManager *alpha.FeatureManager,
+	commandRunner exec.CommandRunner,
+) CompositeFrameworkService {
+	return &dockerProject{
+		env:                 env,
+		docker:              docker,
+		containerHelper:     containerHelper,
+		console:             console,
+		alphaFeatureManager: alphaFeatureManager,
+		commandRunner:       commandRunner,
+		framework:           NewNoOpProject(env),
 	}
-
-	log.Printf("built image %s for %s", imageId, p.config.Name)
-	return imageId, nil
 }
 
-func (p *dockerProject) InstallDependencies(ctx context.Context) error {
+// NewDockerProjectAsFrameworkService is the same as NewDockerProject().(FrameworkService) and exists to support our
+// use of DI and ServiceLocators, where we sometimes need to resolve this type as a FrameworkService instance instead
+// of a CompositeFrameworkService as [NewDockerProject] does.
+func NewDockerProjectAsFrameworkService(
+	env *environment.Environment,
+	docker *docker.Cli,
+	containerHelper *ContainerHelper,
+	console input.Console,
+	alphaFeatureManager *alpha.FeatureManager,
+	commandRunner exec.CommandRunner,
+) FrameworkService {
+	return NewDockerProject(env, docker, containerHelper, console, alphaFeatureManager, commandRunner)
+}
+
+func (p *dockerProject) Requirements() FrameworkRequirements {
+	return FrameworkRequirements{
+		Package: FrameworkPackageRequirements{
+			RequireRestore: false,
+			// Docker project needs to build a container image
+			RequireBuild: true,
+		},
+	}
+}
+
+// Gets the required external tools for the project
+func (p *dockerProject) RequiredExternalTools(ctx context.Context, sc *ServiceConfig) []tools.ExternalTool {
+	return p.containerHelper.RequiredExternalTools(ctx, sc)
+}
+
+// Initializes the docker project
+func (p *dockerProject) Initialize(ctx context.Context, serviceConfig *ServiceConfig) error {
+	return p.framework.Initialize(ctx, serviceConfig)
+}
+
+// Sets the inner framework service used for restore and build command
+func (p *dockerProject) SetSource(inner FrameworkService) {
+	p.framework = inner
+}
+
+// Restores the dependencies for the docker project
+func (p *dockerProject) Restore(
+	ctx context.Context,
+	serviceConfig *ServiceConfig,
+	serviceContext *ServiceContext,
+	progress *async.Progress[ServiceProgress],
+) (*ServiceRestoreResult, error) {
 	// When the program runs the restore actions for the underlying project (containerapp),
 	// the dependencies are installed locally
-	return p.framework.InstallDependencies(ctx)
+	return p.framework.Restore(ctx, serviceConfig, serviceContext, progress)
 }
 
-func (p *dockerProject) Initialize(ctx context.Context) error {
-	return nil
+// ignoreAspireMultiStageDeployment determines if the docker build and package steps should be skipped
+// Build and Package logic is handled directly by the service target (dotnet containerapp)
+// when Aspire multi-stage docker deployment is used.
+func ignoreAspireMultiStageDeployment(serviceConfig *ServiceConfig) bool {
+	// Ignore services which are build-only - they are built and used by another service
+	if serviceConfig.BuildOnly {
+		return true
+	}
+	// The containerFiles configuration defines multi-stage docker builds for Aspire projects
+	if serviceConfig.DotNetContainerApp != nil && len(serviceConfig.DotNetContainerApp.ContainerFiles) > 0 {
+		return true
+	}
+	return false
 }
 
-func NewDockerProject(config *ServiceConfig, env *environment.Environment, docker *docker.Docker, framework FrameworkService) FrameworkService {
-	return &dockerProject{
-		config:    config,
-		env:       env,
-		docker:    docker,
-		framework: framework,
+// Builds the docker project based on the docker options specified within the Service configuration
+func (p *dockerProject) Build(
+	ctx context.Context,
+	serviceConfig *ServiceConfig,
+	serviceContext *ServiceContext,
+	progress *async.Progress[ServiceProgress],
+) (*ServiceBuildResult, error) {
+	if ignoreAspireMultiStageDeployment(serviceConfig) {
+		return &ServiceBuildResult{}, nil
 	}
+	return p.containerHelper.Build(ctx, serviceConfig, serviceContext, p.env, progress)
 }
 
-func getDockerOptionsWithDefaults(options DockerProjectOptions) DockerProjectOptions {
-	if options.Path == "" {
-		options.Path = "./Dockerfile"
+func (p *dockerProject) Package(
+	ctx context.Context,
+	serviceConfig *ServiceConfig,
+	serviceContext *ServiceContext,
+	progress *async.Progress[ServiceProgress],
+) (*ServicePackageResult, error) {
+	if ignoreAspireMultiStageDeployment(serviceConfig) {
+		return &ServicePackageResult{}, nil
+	}
+	return p.containerHelper.Package(ctx, serviceConfig, serviceContext, p.env, progress)
+}
+
+func useDotnetPublishForDockerBuild(serviceConfig *ServiceConfig) bool {
+	if serviceConfig.useDotNetPublishForDockerBuild != nil {
+		return *serviceConfig.useDotNetPublishForDockerBuild
 	}
 
-	if options.Platform == "" {
-		options.Platform = "amd64"
+	serviceConfig.useDotNetPublishForDockerBuild = new(false)
+
+	if serviceConfig.Language.IsDotNet() {
+		dockerOptions := getDockerOptionsWithDefaults(serviceConfig.Docker)
+		resolveDockerPaths(serviceConfig, &dockerOptions)
+
+		if _, err := os.Stat(dockerOptions.Path); errors.Is(err, os.ErrNotExist) {
+			serviceConfig.useDotNetPublishForDockerBuild = new(true)
+		}
 	}
 
-	if options.Context == "" {
-		options.Context = "."
-	}
-
-	return options
+	return *serviceConfig.useDotNetPublishForDockerBuild
 }

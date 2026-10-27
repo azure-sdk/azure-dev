@@ -1,0 +1,289 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "azd extensions Schema",
+    "description": "Schema defining the structure of azd extensions, including versions, artifacts, and dependencies.",
+    "type": "object",
+    "definitions": {
+        "Extension": {
+            "type": "object",
+            "title": "Extension",
+            "description": "Defines an extension that can have multiple versions and associated metadata.",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Unique identifier for the extension. Must be unique across all extensions.",
+                    "pattern": "^[a-z0-9-.]+$"
+                },
+                "namespace": {
+                    "type": "string",
+                    "description": "Namespace for organizing extensions. Required for proper classification."
+                },
+                "displayName": {
+                    "type": "string",
+                    "description": "Human-readable name of the extension."
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Detailed description of the extension."
+                },
+                "website": {
+                    "type": "string",
+                    "format": "uri",
+                    "description": "URL to the extension's documentation or homepage."
+                },
+                "versions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "List of versions available for this extension.",
+                    "items": {
+                        "$ref": "#/definitions/Version"
+                    }
+                },
+                "tags": {
+                    "type": "array",
+                    "description": "Tags categorizing the extension.",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            },
+            "required": [
+                "id",
+                "namespace",
+                "displayName",
+                "description",
+                "versions"
+            ]
+        },
+        "Version": {
+            "type": "object",
+            "title": "Version",
+            "description": "Defines a specific version of an extension, including artifacts and dependencies.",
+            "properties": {
+                "version": {
+                    "type": "string",
+                    "description": "Version number following semantic versioning.",
+                    "pattern": "^\\d+\\.\\d+\\.\\d+$"
+                },
+                "requiredAzdVersion": {
+                    "type": "string",
+                    "description": "azd core version constraint required to use this extension version. Supports semantic versioning constraint expressions (e.g. \">= 1.24.0\")."
+                },
+                "capabilities": {
+                    "type": "array",
+                    "description": "List of capabilities provided by this extension version.",
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "custom-commands",
+                            "lifecycle-events",
+                            "mcp-server",
+                            "service-target-provider",
+                            "framework-service-provider",
+                            "provisioning-provider",
+                            "validation-provider",
+                            "metadata"
+                        ]
+                    }
+                },
+                "usage": {
+                    "type": "string",
+                    "description": "Usage instructions for this version."
+                },
+                "examples": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "Examples of usage commands.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Name of the example."
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Description of what the example does."
+                            },
+                            "usage": {
+                                "type": "string",
+                                "description": "Command to execute the example."
+                            }
+                        },
+                        "required": [
+                            "name",
+                            "description",
+                            "usage"
+                        ]
+                    }
+                },
+                "artifacts": {
+                    "type": "object",
+                    "description": "Collection of artifacts where each key is a unique identifier for the artifact.",
+                    "minProperties": 1,
+                    "additionalProperties": {
+                        "$ref": "#/definitions/Artifact"
+                    }
+                },
+                "dependencies": {
+                    "type": "array",
+                    "description": "List of dependencies required by this version.",
+                    "items": {
+                        "$ref": "#/definitions/Dependency"
+                    },
+                    "minItems": 1
+                },
+                "providers": {
+                    "type": "array",
+                    "description": "List of providers that this extension version registers.",
+                    "items": {
+                        "$ref": "#/definitions/Provider"
+                    }
+                },
+                "entryPoint": {
+                    "type": "string",
+                    "description": "Executable or script that serves as the entry point of the extension version."
+                },
+                "mcp": {
+                    "type": "object",
+                    "description": "MCP server configuration for this extension version.",
+                    "properties": {
+                        "args": {
+                            "type": "array",
+                            "description": "Command-line arguments to pass when starting the MCP server.",
+                            "items": {
+                                "type": "string"
+                            }
+                        },
+                        "env": {
+                            "type": "array",
+                            "description": "Additional environment variables to set when starting the MCP server.",
+                            "items": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "required": [
+                "version",
+                "usage",
+                "examples"
+            ],
+            "anyOf": [
+                {
+                    "required": [
+                        "artifacts"
+                    ]
+                },
+                {
+                    "required": [
+                        "dependencies"
+                    ]
+                }
+            ]
+        },
+        "Artifact": {
+            "type": "object",
+            "title": "Artifact",
+            "description": "Defines a downloadable artifact for an extension version.",
+            "properties": {
+                "checksum": {
+                    "type": "object",
+                    "description": "Checksum for verifying artifact integrity.",
+                    "properties": {
+                        "algorithm": {
+                            "type": "string",
+                            "description": "Checksum algorithm used."
+                        },
+                        "value": {
+                            "type": "string",
+                            "description": "Checksum value for verification."
+                        }
+                    },
+                    "required": [
+                        "algorithm",
+                        "value"
+                    ]
+                },
+                "entryPoint": {
+                    "type": "string",
+                    "description": "Executable entry point for the artifact."
+                },
+                "url": {
+                    "type": "string",
+                    "format": "uri",
+                    "description": "Download URL for the artifact."
+                }
+            },
+            "required": [
+                "url"
+            ]
+        },
+        "Dependency": {
+            "type": "object",
+            "title": "Dependency",
+            "description": "Defines a dependency required by an extension version.",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "ID of the dependency extension."
+                },
+                "version": {
+                    "type": "string",
+                    "description": "Required version of the dependency. Supports semantic versioning constraints."
+                }
+            },
+            "required": [
+                "id",
+                "version"
+            ]
+        },
+        "Provider": {
+            "type": "object",
+            "title": "Provider",
+            "description": "A provider registered by an extension version.",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Unique identifier for this provider within the extension."
+                },
+                "type": {
+                    "type": "string",
+                    "description": "The type of provider.",
+                    "enum": [
+                        "service-target"
+                    ]
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Description of what this provider does."
+                }
+            },
+            "required": [
+                "name",
+                "type",
+                "description"
+            ]
+        }
+    },
+    "properties": {
+        "schemaVersion": {
+            "type": "string",
+            "description": "Semantic version string for the registry format (e.g., '1.0', '1.0.0')."
+        },
+        "extensions": {
+            "$comment": "Each extension must have a unique 'id' within the array.",
+            "type": "array",
+            "title": "Extensions",
+            "description": "List of all available extensions.",
+            "items": {
+                "$ref": "#/definitions/Extension"
+            }
+        },
+        "signature": {
+            "type": "string",
+            "description": "Optional signature for verifying schema integrity."
+        }
+    }
+}

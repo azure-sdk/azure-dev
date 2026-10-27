@@ -1,19 +1,174 @@
-# Copyright (c) Microsoft Corporation. All rights reserved.
-# Licensed under the MIT License.
-
-# cspell settings azd cli
-
-# Use global config
 import: ../../../.vscode/cspell.global.yaml
-
-# Use words for non-project-specific words only.
-# Use azdProjectDictionary to add project-specific words.
 words:
+  - braydonk
+  - osutil
+  - upserted
+  - upserting
+  - upserts
+  - yamlnode
+  - agentcopilot
+  - agentdetect
+  - Authenticode
+  - azdignore
+  - borderless
+  - gofmt
+  - golangci
+  - golangtools
+  - lightspeed
+  - runewidth
+  - toplevel
+  - truncatable
+  - wrappable
+  - myacr
+  - myconn
+  - myorg
+  - myprivacr
+  - privatelink
+  - cheatsheet
+  - aerr
+  - rerr
+  - perr
+  - azcloud
+  - azdext
+  - azdxignore
+  - azurefd
+  - azcontainerregistry
+  - CGNAT
   - backoff
+  - Canonicalize
+  - Chans
+  - chinacloudapi
+  - CLAUDECODE
+  - ojson
+  - otable
+  - cmds
   - Codespace
   - Codespaces
+  - codesign
+  - cooldown
+  - customtype
+  - devcontainers
+  - errchain
+  - errgroup
+  - errorchain
+  - errorhandler
+  - extendee
+  - eiannone
+  - firstrun
+  - CICD
+  # CDN host name
+  - gfgac2cmf7b8cuay
+  - Getenv
+  - GOWORK
+  - Gowork
+  - goversioninfo
+  - OPENCODE
+  - opencode
+  - grpcbroker
+  - msiexec
+  - manylinux
+  - nosec
+  - npx
+  - oneof
+  - idxs
+  # Looks like the protogen has a spelling error for panics
+  - pancis
+  - Paren
+  - OIDCREQUESTURI
+  - pkgux
+  - ppid
+  - PPID
+  - proto
+  - Protos
+  - protobuf
+  - protoc
+  - protoimpl
+  - protojson
+  - protoreflect
+  - SNAPPROCESS
+  - structpb
+  - statuspb
+  - subtest
+  - subtests
+  - syncmap
+  - syscall
+  - tsx
+  - triaging
   - Retryable
-  - Canonicalize
+  - runcontext
+  - surveyterm
+  - Toolhelp
+  - unmarshals
+  - unmarshaling
+  - unsetting
+  - usgovcloudapi
+  - worktrees
+  - jdbc
+  - springframework
+  - santhosh
+  - tekuri
+  - jsonschema
+  - innererror
+  - rustc
+  - figspec
+  - finetune
+  - gitdir
+  - bubbletea
+  - lipgloss
+  - gopxl
+  - subcmd
+  - genproto
+  - errdetails
+  - slogger
+  - SSRF
+  - ssrf
+  - Teredo
+  - allowlist
+  - blocklist
+  - metacharacter
+  - metacharacters
+  - yarnpkg
+  - azconfig
+  - hostnames
+  - managedhsm
+  - microsoftazure
+  - seekable
+  - seekability
+  - APFS
+  - NTFS
+  - mcpgo
+  - cpus
+  - unsanitized
+  - PATHEXT
+  - mintty
+  - dockerenv
+  - dedup
+  - delisted
+  - exfiltration
+  - Fprintf
+  - gocritic
+  - gocyclo
+  - gradlew
+  - IMDS
+  - managedhsm
+  - microsoftazure
+  - myhost
+  - newtag
+  - preconfigured
+  - Println
+  - sctx
+  - secretname
+  - secretversion
+  - TTLs
+  - vaultname
+  - DYLD
+  - dyld
+  - LDLIBS
+  - vally
+languageSettings:
+  - languageId: go
+    ignoreRegExpList:
+      - /mock.*/
 dictionaryDefinitions:
   - name: azdProjectDictionary
     path: ./cspell-azd-dictionary.txt
@@ -23,19 +178,60 @@ dictionaryDefinitions:
 dictionaries:
   - azdProjectDictionary
 overrides:
+  - filename: "**/internal/agent/types.go"
+    words:
+      - billionized
+  - filename: internal/appdetect/aspire_polyglot.go
+    words:
+      - pylock
+  - filename: internal/appdetect/dotnet_apphost.go
+    words:
+      - buildpack
+      - upvote
+  - filename: cmd/mcp.go
+    words:
+      - internalcmd
+  - filename: cmd/extension.go
+    words:
+      - compatResult
+      - compatCopy
+      - Incompat
+  - filename: pkg/tools/dotnet/dotnet.go
+    words:
+      - MSBUILDDISABLENODEREUSE
+  - filename: pkg/output/pretty_table.go
+    words:
+      - runewidth
+  - filename: pkg/azdext/config_helper.go
+    words:
+      - myext
+  - filename: internal/tracing/fields/domains.go
+    words:
+      - azmk
+      - azurecontainerapps
+      - azureedge
+      - azurefd
+      - cloudapp
+      - mediaservices
+      - msecnd
   - filename: docs/docgen.go
     words:
+      - alexwolf
+      - alexwolfmsft
       - pname
       - puichan
       - devx
       - azdevcli
+      - azdeveloper
+      - hannahhunter
+      - hhunter
   - filename: pkg/tools/python/python.go
     words:
       - venv
   - filename: pkg/spin/run.go
     words:
       - errored
-  - filename: pkg/project/framework_service_python.go
+  - filename: pkg/project/project_utils.go
     words:
       - __pycache__
       - Venv
@@ -53,3 +249,312 @@ overrides:
     words:
       - ents
       - unmarshalled
+  - filename: pkg/exec/util_test.go
+    words:
+      - keychain
+      - crusername
+      - azurecr
+  - filename: pkg/tools/dotnet/dotnet.go
+    words:
+      - PWORD
+  - filename: pkg/tools/kubectl/kubectl.go
+    words:
+      - tmpl
+  - filename: pkg/experimentation/assignment.go
+    words:
+      - assignmentcache
+      - machineid
+      - azdversion
+  - filename: pkg/experimentation/client.go
+    words:
+      - variantassignment
+  - filename: pkg/azsdk/storage/storage_blob_client.go
+    words:
+      - azblob
+  - filename: pkg/project/service_target_aks.go
+    words:
+      - kustomization
+      - templating
+  - filename: pkg/project/scaffold_gen.go
+    words:
+      - GUNICORN
+      - MULTIWORKERS
+  - filename: pkg/extensions/command_resolver.go
+    words:
+      - intarray
+      - stringarray
+  - filename: CHANGELOG.md
+    words:
+      - aistudio
+      - apiserver
+      - azdevify
+      - Chdir
+      - creds
+      - Moby
+      - postflight
+      - upsert
+  - filename: docs/proxy-configuration.md
+    words:
+      - Telerik
+  - filename: test/recording/recording.go
+    words:
+      - oidctoken
+  - filename: test/recording/proxy.go
+    words:
+      - WSAECONNRESET
+  - filename: test/azurecleanup/**
+    words:
+      - azurecleanup
+  - filename: test/cmd/cleanup-subscription-deployments/**
+    words:
+      - azurecleanup
+  - filename: test/functional/testdata/samples/funcapp/getting_started.md
+    words:
+      - funcignore
+  - filename: internal/vsrpc/handler.go
+    words:
+      - arity
+  - filename: test/internal/tfoidc/main.go
+    words:
+      - tfoidc
+      - OIDCREQUESTURI
+      - oidctoken
+  - filename: CHANGELOG.md
+    words:
+      - GHSA
+      - gjrc
+  - filename: pkg/apphost/generate.go
+    words:
+      - alue
+  - filename: docs/extensions/extension-framework.md
+    words:
+      - getenv
+      - errorf
+      - println
+      - myext
+      - Fatalf
+      - CODEOWNERS
+      - codeowners
+  - filename: extensions/microsoft.azd.ai.builder/internal/cmd/start.go
+    words:
+      - dall
+      - datasource
+      - vectorizing
+  - filename: pkg/project/dockerfile_builder.go
+    words:
+      - WORKDIR
+      - workdir
+  - filename: docs/style-guidelines/new-azd-command.md
+    words:
+      - pflag
+      - struct
+      - Errorf
+      - Sprintf
+      - mycommand
+      - omitempty
+      - Fprintf
+      - tabwriter
+      - azdcontext
+      - azapi
+      - eastus
+  - filename: cmd/cmd_help.go
+    words:
+      - cmdinternal
+  - filename: .github/copilot-instructions.md
+    words:
+      - golines
+      - technicalterm
+      - Errorf
+  - filename: internal/mcp/tools/azd_yaml_schema.go
+    words:
+      - santhosh
+      - tekuri
+      - jsonschema
+  - filename: internal/mcp/host.go
+    words:
+      - Streamable
+  - filename: cmd/completion.go
+    words:
+      - compinit
+  - filename: pkg/project/service_target_dotnet_containerapp.go
+    words:
+      - IMAGENAME
+  - filename: internal/vsrpc/server.go
+    words:
+      - CSWSH
+  - filename: pkg/extensions/manager.go
+    words:
+      - myext
+  - filename: docs/recording-functional-tests-guide.md
+    words:
+      - httptest
+      - Logf
+      - Getenv
+      - httptest
+  - filename: docs/extensions/extension-framework.md
+    words:
+      - invopop
+  - filename: docs/style-guidelines/azd-style-guide.md
+    words:
+      - camelCase
+      - checkmark
+      - Colorization
+      - gofmt
+      - myService
+      - NewMyService
+      - PascalCase
+      - SomeDependency
+      - testify
+      - userConfig
+      - Println
+      - adrz
+      - rvwxu
+  - filename: pkg/extensions/metadata.go
+    words:
+      - invopop
+  - filename: pkg/extensions/schema_validator.go
+    words:
+      - invopop
+      - jsonschemav
+  - filename: pkg/project/dockerfile_builder.go
+    words:
+      - WORKDIR
+      - workdir
+  - filename: extensions/microsoft.azd.demo/internal/cmd/metadata.go
+    words:
+      - invopop
+  - filename: extensions/microsoft.azd.concurx/internal/cmd/prompt_model.go
+    words:
+      - textinput
+  - filename: pkg/azdext/scope_detector.go
+    words:
+      - fakeazure
+  - filename: "{pkg/azapi/permissions.go,pkg/infra/provisioning/bicep/bicep_provider.go}"
+    words:
+      - ABAC
+  - filename: extensions/azure.ai.models/internal/cmd/custom_create.go
+    words:
+      - Qwen
+  - filename: pkg/infra/provisioning/bicep/provision_validation.go
+    words:
+      - actioned
+  - filename: pkg/project/project.go
+    words:
+      - copylocks
+      - covdata
+      - GOWORK
+  - filename: pkg/ext/models.go
+    words:
+      - unvalidated
+      - venvs
+      - workdir
+  - filename: pkg/tools/language/python_executor.go
+    words:
+      - venvs
+  - filename: extensions/azure.ai.agents/internal/cmd/init_locations.go
+    words:
+      - swedencentral
+  - filename: docs/code-coverage-guide.md
+    words:
+      - covdata
+      - GOWORK
+      - textfmt
+      - logissue
+      - runbook
+      - AMRD
+  - filename: magefile.go
+    words:
+      - textfmt
+      - covcounters
+      - covmeta
+      - AMRD
+      - coreutils
+      - wslc
+  - filename: pkg/infra/provisioning/bicep/bicep_provider.go
+    words:
+      - BIZSPARK
+      - BIZTALK
+      - CORTANA
+      - DIRECTX
+      - GLOBALRESOURCES
+      - HOLOLENS
+      - HYPERV
+      - KINECT
+      - LOCALRESOURCES
+      - LYNC
+      - ONEDRIVE
+      - ONENOTE
+      - VISIO
+      - WEBREFERENCES
+      - sharepointonline
+  - filename: pkg/tool/manifest.go
+    words:
+      - azureresourcegroups
+  - filename: pkg/tool/installer.go
+    words:
+      - filesystems
+      - redirections
+      - APPINSTALLER
+      - idempotently
+  - filename: internal/agent/copilot/session_config.go
+    words:
+      - MCPHTTP
+  - filename: pkg/tool/version_provider.go
+    words:
+      - extensionquery
+      - bitmask
+  - filename: pkg/infra/provisioning/bicep/bicep_provider.go
+    words:
+      - azurekubernetesservicechaosmesh
+  - filename: AGENTS.md
+    words:
+      - forbidigo
+      - Logf
+  - filename: extensions/azure.ai.dataset/README.md
+    words:
+      - CODEOWNERS
+  - filename: .golangci.yaml
+    words:
+      - forbidigo
+      - Logf
+  - filename: internal/cmd/up_graph.go
+    words:
+      - finalizer
+  - filename: cmd/auth_transport_peer_linux.go
+    words:
+      - Getsockopt
+      - PEERCRED
+      - Ucred
+  - filename: cmd/auth_transport_peer_darwin.go
+    words:
+      - Getsockopt
+      - PEERCRED
+      - Xucred
+  - filename: grpc/generateadapters/main.go
+    words:
+      - generateadapters
+  - filename: grpc/generatefacade/main.go
+    words:
+      - generatefacade
+  - filename: internal/grpcserver/versioned_services.go
+    words:
+      - anypb
+      - protoregistry
+  - filename: internal/grpcserver/versioned_services_generated.go
+    words:
+      - generateadapters
+  - filename: "{internal/grpcserver/legacy_services.go,internal/grpcserver/legacybridge/bridge.go,internal/grpcserver/server.go}"
+    words:
+      - legacybridge
+  - filename: pkg/azdext/contracts_v1_aliases.go
+    words:
+      - generatefacade
+  - filename: extensions/telemetry/*.go
+    words:
+      - elts
+      - fset
+      - unkeyed
+ignorePaths:
+  - "**/*_test.go"
+  - "**/mock*.go"
+  - "**/*.pb.go"

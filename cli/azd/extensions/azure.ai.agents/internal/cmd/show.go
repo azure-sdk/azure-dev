@@ -1,0 +1,585 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package cmd
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"maps"
+	"os"
+	"slices"
+	"strings"
+	"text/tabwriter"
+	"time"
+
+	"azureaiagent/internal/cmd/nextstep"
+	"azureaiagent/internal/pkg/agents/agent_api"
+	"azureaiagent/internal/pkg/agents/agent_yaml"
+	projectpkg "azureaiagent/internal/project"
+
+	"github.com/azure/azure-dev/cli/azd/pkg/azdext"
+	"github.com/spf13/cobra"
+)
+
+type showFlags struct {
+	name   string
+	output string
+}
+
+// ShowAction handles the execution of the show command.
+type ShowAction struct {
+	*AgentContext
+	flags     *showFlags
+	azdClient *azdext.AzdClient
+	envName   string
+	// serviceName is the azure.yaml service name used by the unknown-status
+	// re-check fallback that suggests `azd ai agent show <serviceName>`.
+	serviceName string
+	// serviceKey is the uppercase/underscored form of the service name,
+	// used to look up per-service env vars (e.g. AGENT_{KEY}_RESPONSES_ENDPOINT).
+	serviceKey string
+	isVoice    bool
+}
+
+func newShowCommand(extCtx *azdext.ExtensionContext) *cobra.Command {
+	flags := &showFlags{}
+	extCtx = ensureExtensionContext(extCtx)
+
+	cmd := &cobra.Command{
+		Use:   "show [name]",
+		Short: "Show the status of a prompt, hosted, or voice agent.",
+		Long: `Show the status of a prompt, hosted, or voice agent.
+
+The agent name and version are resolved automatically from the azure.yaml service
+configuration and the current azd environment. Optionally specify the service name
+(from azure.yaml) as a positional argument when multiple agent services exist.`,
+		Example: `  # Show status (auto-resolves from azure.yaml)
+  azd ai agent show
+
+  # Show status for a specific agent service
+  azd ai agent show my-agent
+
+  # Show status as JSON
+  azd ai agent show --output json`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 0 {
+				flags.name = args[0]
+			}
+			flags.output = extCtx.OutputFormat
+
+			ctx := azdext.WithAccessToken(cmd.Context())
+
+			azdClient, err := azdext.NewAzdClient()
+			if err != nil {
+				return fmt.Errorf("failed to create azd client: %w", err)
+			}
+			defer azdClient.Close()
+
+			// Prompt (kind=managed) agents are azd services too, but they live
+			// on the harness rather than the Foundry service. Resolve the
+			// service and, when it is a prompt agent, query the harness for
+			// status instead of the Foundry agent endpoint.
+			if pctx, isPrompt, pErr := resolvePromptAgentService(
+				ctx, azdClient, flags.name, extCtx.NoPrompt,
+			); pErr != nil {
+				return pErr
+			} else if isPrompt {
+				return runPromptShow(ctx, flags, pctx)
+			}
+
+			info, err := resolveAgentServiceFromProject(ctx, azdClient, flags.name, extCtx.NoPrompt, withVoiceKind())
+			if err != nil {
+				return err
+			}
+
+			if info.AgentName == "" {
+				return fmt.Errorf(
+					"agent name could not be resolved from azd environment for service '%s'\n\n"+
+						"Run 'azd deploy' first to deploy the agent, or check your azd environment values",
+					info.ServiceName,
+				)
+			}
+			if info.Version == "" {
+				return fmt.Errorf(
+					"agent version could not be resolved from azd environment for service '%s'\n\n"+
+						"Run 'azd deploy' first to deploy the agent, or check your azd environment values",
+					info.ServiceName,
+				)
+			}
+
+			agentContext, err := newAgentContext(ctx, "", "", info.AgentName, info.Version)
+			if err != nil {
+				return err
+			}
+
+			// Resolve the current environment name for env var lookups
+			var envName string
+			if envResp, err := azdClient.Environment().GetCurrent(ctx, &azdext.EmptyRequest{}); err == nil {
+				envName = envResp.Environment.Name
+			}
+
+			action := &ShowAction{
+				AgentContext: agentContext,
+				flags:        flags,
+				azdClient:    azdClient,
+				envName:      envName,
+				serviceName:  info.ServiceName,
+				serviceKey:   toServiceKey(info.ServiceName),
+				isVoice:      info.IsVoice,
+			}
+
+			return action.Run(ctx)
+		},
+	}
+
+	azdext.RegisterFlagOptions(cmd, azdext.FlagOptions{
+		Name:          "output",
+		AllowedValues: []string{"json", "table"},
+		Default:       "table",
+	})
+
+	return cmd
+}
+
+// showResult wraps the API response with additional computed links.
+type showResult struct {
+	*agent_api.AgentVersionObject
+	PlaygroundURL string            `json:"playground_url,omitempty"`
+	Endpoints     map[string]string `json:"agent_endpoints,omitempty"`
+	NextStep      *nextStepEnvelope `json:"next_step,omitempty"`
+}
+
+// nextStepEnvelope is the JSON shape for context-aware guidance attached to
+// `azd ai agent show --output json`. Mirrors []nextstep.Suggestion but
+// omits the internal Priority/Trailing renderer hints — JSON consumers
+// only need the command + description.
+type nextStepEnvelope struct {
+	Suggestions []nextStepSuggestion `json:"suggestions"`
+}
+
+type nextStepSuggestion struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
+func toNextStepEnvelope(suggestions []nextstep.Suggestion) *nextStepEnvelope {
+	if len(suggestions) == 0 {
+		return nil
+	}
+	out := &nextStepEnvelope{Suggestions: make([]nextStepSuggestion, 0, len(suggestions))}
+	for _, s := range suggestions {
+		out.Suggestions = append(out.Suggestions, nextStepSuggestion{
+			Command:     s.Command,
+			Description: s.Description,
+		})
+	}
+	return out
+}
+
+// Run executes the show command logic.
+func (a *ShowAction) Run(ctx context.Context) error {
+	agentClient, err := a.NewClient()
+	if err != nil {
+		return err
+	}
+
+	version, err := a.getVersion(ctx, agentClient)
+	if err != nil {
+		return fmt.Errorf("failed to get agent version: %w", err)
+	}
+
+	result := &showResult{AgentVersionObject: version}
+
+	// Resolve playground URL (best-effort)
+	result.PlaygroundURL = a.resolvePlaygroundURL(ctx)
+
+	// Resolve deployed endpoint URLs from env vars (best-effort)
+	result.Endpoints = a.resolveEndpointURLs(ctx)
+
+	// Resolve context-aware next-step guidance only for statuses that need
+	// action. Active agents intentionally omit next_step so `show` stays a
+	// pure inspection command and JSON output remains close to the API shape.
+	var suggestions []nextstep.Suggestion
+	if shouldResolveShowNextStep(version.Status) {
+		suggestions = a.resolveNextStep(version.Status)
+	}
+
+	return printShowResult(result, a.flags.output, suggestions)
+}
+
+type showVersionReader interface {
+	GetAgentVersion(context.Context, string, string, string, bool) (*agent_api.AgentVersionObject, error)
+	GetVoiceAgentVersion(context.Context, string, string, string) (*agent_api.AgentVersionObject, error)
+}
+
+func (a *ShowAction) getVersion(ctx context.Context, client showVersionReader) (*agent_api.AgentVersionObject, error) {
+	if a.isVoice {
+		return client.GetVoiceAgentVersion(ctx, a.Name, a.Version, DefaultAgentAPIVersion)
+	}
+	return client.GetAgentVersion(ctx, a.Name, a.Version, DefaultAgentAPIVersion, false)
+}
+
+// runPromptShow handles `azd ai agent show` for a prompt (kind=prompt) agent.
+// It is dispatched from RunE when the resolved azure.ai.agent service resolves
+// to a prompt-agent definition. The status comes from the harness GetAgent API
+// rather than the Foundry agent endpoint.
+func runPromptShow(ctx context.Context, flags *showFlags, pctx *promptServiceContext) error {
+	agentName := pctx.AgentName()
+	client, err := pctx.newClient(ctx)
+	if err != nil {
+		return err
+	}
+
+	agent, err := client.GetAgent(ctx, agentName, projectpkg.ProjectEndpointAPIVersion, false)
+	if err != nil {
+		return fmt.Errorf("failed to get prompt agent %q: %w", agentName, err)
+	}
+
+	switch flags.output {
+	case "json":
+		data, jsonErr := json.MarshalIndent(agent, "", "  ")
+		if jsonErr != nil {
+			return fmt.Errorf("failed to marshal response: %w", jsonErr)
+		}
+		fmt.Println(string(data))
+	default:
+		printPromptShowTable(agent, pctx)
+	}
+	return nil
+}
+
+// printPromptShowTable renders a concise status table for a prompt agent.
+func printPromptShowTable(agent *agent_api.AgentObject, pctx *promptServiceContext) {
+	latest := agent.Versions.Latest
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(w, "Name:\t%s\n", agent.Name)
+	fmt.Fprintf(w, "Kind:\t%s\n", "prompt")
+	if latest.Version != "" {
+		fmt.Fprintf(w, "Version:\t%s\n", latest.Version)
+	}
+	if latest.Status != "" {
+		fmt.Fprintf(w, "Status:\t%s\n", latest.Status)
+	}
+
+	def := promptDefinitionMap(latest)
+
+	// Harness is the execution harness the platform runs the agent on, taken
+	// from the deployed definition's `harness` block. The previous
+	// implementation printed settings.BaseURL here, which is the harness *API
+	// base URL*, not the harness itself.
+	printPromptHarness(w, promptHarnessFromMap(def), pctx.Agent.Harness)
+
+	// Project endpoint is where the agent is actually served/invoked. This is
+	// the useful "where does this live" value that Harness was standing in for.
+	if endpoint := promptAgentEndpoint(pctx.Settings); endpoint != "" {
+		fmt.Fprintf(w, "Project Endpoint:\t%s\n", endpoint)
+	}
+
+	if latest.Error != nil && latest.Error.Message != "" {
+		fmt.Fprintf(w, "Error:\t%s (%s)\n", latest.Error.Message, latest.Error.Code)
+	}
+
+	printPromptToolboxTools(w, def)
+	_ = w.Flush()
+}
+
+// promptDefinitionMap extracts the deployed agent version's definition as a
+// generic map. The API models Definition as `any`, which decodes from JSON into
+// a map[string]any; returns nil when the definition is absent or another shape.
+func promptDefinitionMap(version agent_api.AgentVersionObject) map[string]any {
+	if def, ok := version.Definition.(map[string]any); ok {
+		return def
+	}
+	return nil
+}
+
+// stringFromMap returns m[key] as a trimmed string, or "" when absent/non-string.
+func stringFromMap(m map[string]any, key string) string {
+	if m == nil {
+		return ""
+	}
+	if v, ok := m[key].(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+// promptHarnessFromMap decodes the `harness` block of a deployed definition.
+func promptHarnessFromMap(def map[string]any) *agent_yaml.PromptHarness {
+	if def == nil {
+		return nil
+	}
+	switch harness := def["harness"].(type) {
+	case map[string]any:
+		data, err := json.Marshal(harness)
+		if err != nil {
+			return nil
+		}
+		var out agent_yaml.PromptHarness
+		if err := json.Unmarshal(data, &out); err != nil {
+			return nil
+		}
+		return &out
+	default:
+		return nil
+	}
+}
+
+// harnessTypeFromMap returns the harness discriminator from a deployed
+// definition.
+func harnessTypeFromMap(def map[string]any) string {
+	harness := promptHarnessFromMap(def)
+	if harness == nil {
+		return ""
+	}
+	return strings.TrimSpace(harness.Type)
+}
+
+// printPromptHarness renders the execution harness the agent runs on.
+//
+// The deployed block wins because it describes what is actually running, but the
+// locally authored one is used as a fallback so the rows stay populated for an
+// agent whose deployed definition predates the `harness:` object.
+func printPromptHarness(w io.Writer, deployed, local *agent_yaml.PromptHarness) {
+	harness := deployed
+	if harness == nil || strings.TrimSpace(harness.Type) == "" {
+		harness = local
+	}
+	if harness == nil || strings.TrimSpace(harness.Type) == "" {
+		return
+	}
+
+	fmt.Fprintf(w, "Harness:\t%s\n", displayHarness(strings.TrimSpace(harness.Type)))
+}
+
+// displayHarness maps a harness identifier to a friendlier label, preserving
+// the raw identifier in parentheses for unambiguous reference.
+func displayHarness(harness string) string {
+	switch harness {
+	case agent_api.ManagedAgentHarnessGitHubCopilot:
+		return fmt.Sprintf("GitHub Copilot (%s)", harness)
+	default:
+		return harness
+	}
+}
+
+// promptAgentEndpoint returns the Foundry project endpoint the prompt agent is
+// served from.
+func promptAgentEndpoint(settings *projectpkg.PromptAgentSettings) string {
+	if settings == nil {
+		return ""
+	}
+	return strings.TrimSpace(settings.ProjectEndpoint)
+}
+
+// printPromptToolboxTools lists the mcp/toolbox tools attached to the deployed
+// prompt agent, including the backing project connection that authenticates the
+// agent to each toolbox. This surfaces the toolbox created during deploy without
+// mutating the authored agent definition.
+func printPromptToolboxTools(w io.Writer, def map[string]any) {
+	if def == nil {
+		return
+	}
+	rawTools, ok := def["tools"].([]any)
+	if !ok || len(rawTools) == 0 {
+		return
+	}
+	for _, raw := range rawTools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if stringFromMap(tool, "type") != "mcp" {
+			continue
+		}
+		label := stringFromMap(tool, "server_label")
+		if label == "" {
+			label = "mcp"
+		}
+		fmt.Fprintf(w, "Toolbox (%s):\t%s\n", label, stringFromMap(tool, "server_url"))
+		if conn := stringFromMap(tool, "project_connection_id"); conn != "" {
+			fmt.Fprintf(w, "  Connection:\t%s\n", conn)
+		}
+	}
+}
+
+func printShowResult(result *showResult, output string, suggestions []nextstep.Suggestion) error {
+	switch output {
+	case "", "table":
+		return printShowResultTable(result, suggestions)
+	case "json":
+		result.NextStep = toNextStepEnvelope(suggestions)
+		return printShowResultJSON(result)
+	default:
+		return fmt.Errorf("unsupported output format %q", output)
+	}
+}
+
+func shouldResolveShowNextStep(status string) bool {
+	switch nextstep.AgentVersionStatus(status) {
+	case nextstep.AgentVersionActive, nextstep.AgentVersionIdle:
+		return false
+	default:
+		return true
+	}
+}
+
+// resolveNextStep asks the resolver for the post-show guidance block.
+func (a *ShowAction) resolveNextStep(status string) []nextstep.Suggestion {
+	return resolveNextStepFromStatus(a.serviceName, status)
+}
+
+// resolveNextStepFromStatus is the testable core of resolveNextStep.
+func resolveNextStepFromStatus(serviceName, status string) []nextstep.Suggestion {
+	if !shouldResolveShowNextStep(status) {
+		return nil
+	}
+
+	state := &nextstep.State{AgentStatus: status}
+	return nextstep.ResolveAfterShow(state, serviceName)
+}
+
+// resolvePlaygroundURL reads AZURE_AI_PROJECT_ID from the azd environment
+// and constructs the Foundry portal playground URL. Returns empty string on failure.
+func (a *ShowAction) resolvePlaygroundURL(ctx context.Context) string {
+	if a.azdClient == nil || a.envName == "" {
+		return ""
+	}
+
+	v, err := a.azdClient.Environment().GetValue(ctx, &azdext.GetEnvRequest{
+		EnvName: a.envName,
+		Key:     "AZURE_AI_PROJECT_ID",
+	})
+	if err != nil {
+		return ""
+	}
+	if v.Value == "" {
+		return ""
+	}
+
+	playgroundURL, err := projectpkg.AgentPlaygroundURL(v.Value, a.Name, a.Version)
+	if err != nil {
+		return ""
+	}
+
+	return playgroundURL
+}
+
+// resolveEndpointURLs reads per-protocol endpoint env vars
+// (e.g. AGENT_{KEY}_RESPONSES_ENDPOINT) from the azd environment.
+// Falls back to the legacy single-endpoint var (AGENT_{KEY}_ENDPOINT)
+// for environments deployed before per-protocol vars were introduced.
+// Returns a map of protocol label to URL for endpoints that are set.
+func (a *ShowAction) resolveEndpointURLs(ctx context.Context) map[string]string {
+	if a.azdClient == nil || a.envName == "" || a.serviceKey == "" {
+		return nil
+	}
+
+	// Use the canonical protocol list from the project package
+	protocolSuffixes := projectpkg.DisplayableProtocolEnvSuffixes()
+
+	endpoints := make(map[string]string)
+	for _, ps := range protocolSuffixes {
+		key := fmt.Sprintf("AGENT_%s_%s_ENDPOINT", a.serviceKey, ps.Suffix)
+		v, err := a.azdClient.Environment().GetValue(ctx, &azdext.GetEnvRequest{
+			EnvName: a.envName,
+			Key:     key,
+		})
+		if err != nil || v.Value == "" {
+			continue
+		}
+		endpoints[ps.Label] = v.Value
+	}
+
+	// Fall back to single-endpoint var for older deployments
+	if len(endpoints) == 0 {
+		singleEndpointKey := fmt.Sprintf("AGENT_%s_ENDPOINT", a.serviceKey)
+		v, err := a.azdClient.Environment().GetValue(ctx, &azdext.GetEnvRequest{
+			EnvName: a.envName,
+			Key:     singleEndpointKey,
+		})
+		if err == nil && v.Value != "" {
+			endpoints["Agent"] = v.Value
+		}
+	}
+
+	if len(endpoints) == 0 {
+		return nil
+	}
+	return endpoints
+}
+
+func printShowResultJSON(result *showResult) error {
+	jsonBytes, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal show result to JSON: %w", err)
+	}
+	fmt.Println(string(jsonBytes))
+	return nil
+}
+
+func printShowResultTable(result *showResult, suggestions []nextstep.Suggestion) error {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "FIELD\tVALUE")
+	fmt.Fprintln(w, "-----\t-----")
+
+	version := result.AgentVersionObject
+
+	fmt.Fprintf(w, "ID\t%s\n", version.ID)
+	fmt.Fprintf(w, "Name\t%s\n", version.Name)
+	fmt.Fprintf(w, "Version\t%s\n", version.Version)
+	if version.Status != "" {
+		fmt.Fprintf(w, "Status\t%s\n", version.Status)
+	}
+	if version.Description != nil {
+		fmt.Fprintf(w, "Description\t%s\n", *version.Description)
+	}
+	if version.CreatedAt != 0 {
+		ts := time.Unix(version.CreatedAt, 0).UTC().Format(time.RFC3339)
+		fmt.Fprintf(w, "Created At\t%s\n", ts)
+	}
+	if version.AgentGUID != "" {
+		fmt.Fprintf(w, "Agent GUID\t%s\n", version.AgentGUID)
+	}
+	if version.InstanceIdentity != nil {
+		fmt.Fprintf(w, "Instance Identity Principal ID\t%s\n", version.InstanceIdentity.PrincipalID)
+		fmt.Fprintf(w, "Instance Identity Client ID\t%s\n", version.InstanceIdentity.ClientID)
+	}
+	if version.Blueprint != nil {
+		fmt.Fprintf(w, "Blueprint Principal ID\t%s\n", version.Blueprint.PrincipalID)
+		fmt.Fprintf(w, "Blueprint Client ID\t%s\n", version.Blueprint.ClientID)
+	}
+	if version.BlueprintReference != nil {
+		fmt.Fprintf(w, "Blueprint Reference Type\t%s\n", version.BlueprintReference.Type)
+		fmt.Fprintf(w, "Blueprint Reference ID\t%s\n", version.BlueprintReference.BlueprintID)
+	}
+	for k, v := range version.Metadata {
+		fmt.Fprintf(w, "Metadata[%s]\t%s\n", k, v)
+	}
+
+	// Display playground and endpoint links
+	if result.PlaygroundURL != "" {
+		fmt.Fprintf(w, "Playground URL\t%s\n", result.PlaygroundURL)
+	}
+	for _, label := range slices.Sorted(maps.Keys(result.Endpoints)) {
+		fmt.Fprintf(w, "Endpoint (%s)\t%s\n", label, result.Endpoints[label])
+	}
+
+	if err := w.Flush(); err != nil {
+		return err
+	}
+
+	// Next: guidance is human-only on the table path; the JSON envelope
+	// carries the same data for machines. Suppress on non-TTY (pipes,
+	// file redirection) so scripted consumers of the table output don't
+	// see surprise trailing lines. PrintNext owns the leading blank-line
+	// separator (see nextstep/format.go renderBlock), so we don't
+	// pre-emit one here.
+	_ = printNextIfTerminal(os.Stdout, suggestions)
+
+	return nil
+}

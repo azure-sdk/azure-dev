@@ -8,34 +8,36 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
+	"slices"
 	"strings"
 
 	"github.com/AlecAivazis/survey/v2"
-	"github.com/mattn/go-isatty"
+	"github.com/fatih/color"
 )
 
-type Asker func(p survey.Prompt, response interface{}) error
+type Asker func(p survey.Prompt, response any) error
 
-func NewAsker(noPrompt bool) Asker {
+func NewAsker(noPrompt bool, isTerminal bool, w io.Writer, r io.Reader) Asker {
 	if noPrompt {
 		return askOneNoPrompt
 	}
 
-	return askOnePrompt
+	return func(p survey.Prompt, response any) error {
+		return askOnePrompt(p, response, isTerminal, w, r)
+	}
 }
 
-func askOneNoPrompt(p survey.Prompt, response interface{}) error {
+func askOneNoPrompt(p survey.Prompt, response any) error {
 	switch v := p.(type) {
 	case *survey.Input:
 		if v.Default == "" {
-			return fmt.Errorf("no default response for prompt '%s'", v.Message)
+			return promptRequiredForPrompt(v.Message)
 		}
 
 		*(response.(*string)) = v.Default
 	case *survey.Select:
 		if v.Default == nil {
-			return fmt.Errorf("no default response for prompt '%s'", v.Message)
+			return promptRequiredForPrompt(v.Message)
 		}
 
 		switch ptr := response.(type) {
@@ -58,6 +60,17 @@ func askOneNoPrompt(p survey.Prompt, response interface{}) error {
 		}
 	case *survey.Confirm:
 		*(response.(*bool)) = v.Default
+	case *survey.Password:
+		return promptRequiredForPrompt(v.Message)
+	case *survey.MultiSelect:
+		if v.Default == nil {
+			return promptRequiredForPrompt(v.Message)
+		}
+		defValue, err := v.Default.([]string)
+		if !err {
+			return fmt.Errorf("default response type is not a string list '%s'", v.Message)
+		}
+		*(response.(*[]string)) = defValue
 	default:
 		panic(fmt.Sprintf("don't know how to prompt for type %T", p))
 	}
@@ -65,24 +78,34 @@ func askOneNoPrompt(p survey.Prompt, response interface{}) error {
 	return nil
 }
 
+func promptRequiredForPrompt(promptMessage string) error {
+	return &PromptRequiredError{
+		PromptMessage: promptMessage,
+	}
+}
+
 func withShowCursor(o *survey.AskOptions) error {
 	o.PromptConfig.ShowCursor = true
 	return nil
 }
 
-func askOnePrompt(p survey.Prompt, response interface{}) error {
+func askOnePrompt(p survey.Prompt, response any, isTerminal bool, stdout io.Writer, stdin io.Reader) error {
 	// Like (*bufio.Reader).ReadString(byte) except that it does not buffer input from the input stream.
-	// instead, it reads a byte at a time until a delimiter is found, without consuming any extra characters.
+	// Instead, it reads a byte at a time until a delimiter is found or EOF is encountered,
+	// returning bytes read with no extra characters consumed.
 	readStringNoBuffer := func(r io.Reader, delim byte) (string, error) {
 		strBuf := bytes.Buffer{}
 		readBuf := make([]byte, 1)
 		for {
-			if _, err := r.Read(readBuf); err != nil {
-				return strBuf.String(), err
+			bytesRead, err := r.Read(readBuf)
+			if bytesRead > 0 {
+				// discard err, per documentation, WriteByte always succeeds.
+				_ = strBuf.WriteByte(readBuf[0])
 			}
 
-			// discard err, per documentation, WriteByte always succeeds.
-			_ = strBuf.WriteByte(readBuf[0])
+			if err != nil {
+				return strBuf.String(), err
+			}
 
 			if readBuf[0] == delim {
 				return strBuf.String(), nil
@@ -90,7 +113,7 @@ func askOnePrompt(p survey.Prompt, response interface{}) error {
 		}
 	}
 
-	if isatty.IsTerminal(os.Stdin.Fd()) && isatty.IsTerminal(os.Stdout.Fd()) && os.Getenv("AZD_DEBUG_FORCE_NO_TTY") != "1" {
+	if isTerminal {
 		opts := []survey.AskOpt{}
 
 		// When asking a question which requires a text response, show the cursor, it helps
@@ -99,18 +122,35 @@ func askOnePrompt(p survey.Prompt, response interface{}) error {
 			opts = append(opts, withShowCursor)
 		}
 
+		// Keep the filter text after toggling selections in multi-select prompts.
+		if _, ok := p.(*survey.MultiSelect); ok {
+			opts = append(opts, survey.WithKeepFilter(true))
+		}
+
+		opts = append(opts, survey.WithIcons(func(icons *survey.IconSet) {
+			// use bright, bold, blue question mark for all questions
+			icons.Question.Format = "blue+hb"
+			icons.SelectFocus.Format = "blue+hb"
+
+			icons.Help.Format = "black+h"
+			icons.Help.Text = "Hint:"
+
+			icons.MarkedOption.Text = "[" + color.GreenString("✓") + "]"
+			icons.MarkedOption.Format = ""
+		}))
+
 		return survey.AskOne(p, response, opts...)
 	}
 
 	switch v := p.(type) {
 	case *survey.Input:
 		var pResponse = response.(*string)
-		fmt.Printf("%s", v.Message[0:len(v.Message)-1])
+		fmt.Fprintf(stdout, "%s", v.Message[0:len(v.Message)-1])
 		if v.Default != "" {
-			fmt.Printf(" (or hit enter to use the default %s)", v.Default)
+			fmt.Fprintf(stdout, " (or hit enter to use the default %s)", v.Default)
 		}
-		fmt.Printf("%s ", v.Message[len(v.Message)-1:])
-		result, err := readStringNoBuffer(os.Stdin, '\n')
+		fmt.Fprintf(stdout, "%s ", v.Message[len(v.Message)-1:])
+		result, err := readStringNoBuffer(stdin, '\n')
 		if err != nil && !errors.Is(err, io.EOF) {
 			return fmt.Errorf("reading response: %w", err)
 		}
@@ -120,48 +160,91 @@ func askOnePrompt(p survey.Prompt, response interface{}) error {
 		}
 		*pResponse = result
 		return nil
-	case *survey.Select:
-		for {
-			fmt.Printf("%s", v.Message[0:len(v.Message)-1])
-			if v.Default != nil {
-				fmt.Printf(" (or hit enter to use the default %v)", v.Default)
-			}
-			fmt.Printf("%s ", v.Message[len(v.Message)-1:])
-			result, err := readStringNoBuffer(os.Stdin, '\n')
-			if err != nil && !errors.Is(err, io.EOF) {
-				return fmt.Errorf("reading response: %w", err)
-			}
-			result = strings.TrimSpace(result)
-			if result == "" && v.Default != nil {
-				result = v.Default.(string)
-			}
-			for idx, val := range v.Options {
-				if val == result {
-					switch ptr := response.(type) {
-					case *string:
-						*ptr = val
-					case *int:
-						*ptr = idx
-					default:
-						return fmt.Errorf("bad type %T for result, should be (*int or *string)", response)
-					}
-
-					return nil
-				}
-			}
-			fmt.Printf("error: %s is not an allowed choice\n", result)
+	case *survey.Password:
+		var pResponse = response.(*string)
+		fmt.Fprintf(stdout, "%s", v.Message)
+		result, err := readStringNoBuffer(stdin, '\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("reading response: %w", err)
 		}
+		result = strings.TrimSpace(result)
+		*pResponse = result
+		return nil
+	case *survey.MultiSelect:
+		// For multi-selection, azd will do a Select for each item, using the default to control the Y or N
+		defValue, ok := v.Default.([]string)
+		if !ok {
+			return fmt.Errorf("default response type is not a string list '%s'", v.Message)
+		}
+		fmt.Fprintf(stdout, "%s:", v.Message)
+		selection := make([]string, 0, len(v.Options))
+		for _, item := range v.Options {
+			itemResponse := slices.Contains(defValue, item)
+			// Pass the per-item default so that, when stdin is exhausted, each item falls back to
+			// its default selection state (consistent with how Input/Select fall back to defaults).
+			err := askOnePrompt(&survey.Confirm{
+				Message: fmt.Sprintf("\n  select %s?", item),
+				Default: itemResponse,
+			}, &itemResponse, isTerminal, stdout, stdin)
+			if err != nil {
+				return err
+			}
+			confirmation := "N"
+			if itemResponse {
+				confirmation = "Y"
+				selection = append(selection, item)
+			}
+			fmt.Fprintf(stdout, "  %s", confirmation)
+		}
+		// assign the selection to the response
+		*(response.(*[]string)) = selection
+
+		return nil
+	case *survey.Select:
+		fmt.Fprintf(stdout, "%s", v.Message[0:len(v.Message)-1])
+		if v.Default != nil {
+			fmt.Fprintf(stdout, " (or hit enter to use the default %v)", v.Default)
+		}
+		fmt.Fprintf(stdout, "%s ", v.Message[len(v.Message)-1:])
+		result, err := readStringNoBuffer(stdin, '\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("reading response: %w", err)
+		}
+		result = strings.TrimSpace(result)
+		if result == "" && v.Default != nil {
+			result = v.Default.(string)
+		}
+		for idx, val := range v.Options {
+			if val == result {
+				switch ptr := response.(type) {
+				case *string:
+					*ptr = val
+				case *int:
+					*ptr = idx
+				default:
+					return fmt.Errorf("bad type %T for result, should be (*int or *string)", response)
+				}
+
+				return nil
+			}
+		}
+		return fmt.Errorf(
+			"'%s' is not an allowed choice. allowed choices: %v",
+			result,
+			strings.Join(v.Options, ","))
 	case *survey.Confirm:
 		var pResponse = response.(*bool)
+		// Use the prompt's Default (callers pass a zero-initialized *pResponse with survey.Confirm.Default).
+		defaultValue := v.Default
 
 		for {
-			fmt.Print(v.Message)
-			if *pResponse {
-				fmt.Print(" (Y/n)")
+			fmt.Fprint(stdout, v.Message)
+			if defaultValue {
+				fmt.Fprint(stdout, " (Y/n)")
 			} else {
-				fmt.Printf(" (y/N)")
+				fmt.Fprintf(stdout, " (y/N)")
 			}
-			result, err := readStringNoBuffer(os.Stdin, '\n')
+			result, err := readStringNoBuffer(stdin, '\n')
 			if err != nil && !errors.Is(err, io.EOF) {
 				return fmt.Errorf("reading response: %w", err)
 			}
@@ -173,10 +256,62 @@ func askOnePrompt(p survey.Prompt, response interface{}) error {
 				*pResponse = false
 				return nil
 			case "":
+				// An empty line (the user pressed Enter) or EOF (piped stdin exhausted) accepts
+				// the prompt's default value, consistent with how Input and Select fall back to
+				// their defaults. Real CI/agent runs auto-enable no-prompt mode (askOneNoPrompt),
+				// so this interactive path is only reached when input is piped in.
+				*pResponse = defaultValue
+				return nil
+			}
+
+			// A final invalid token immediately followed by EOF has no further input to reprocess;
+			// fall back to the default rather than looping forever.
+			if errors.Is(err, io.EOF) {
+				*pResponse = defaultValue
 				return nil
 			}
 		}
 	default:
 		panic(fmt.Sprintf("don't know how to prompt for type %T", p))
+	}
+}
+
+func init() {
+	// bright blue for everything
+
+	// Customize the input question template:
+	//   - Use bright blue instead of cyan for answers: {{- color "blue+h"}}{{.Answer}}
+	//   - Use gray instead of cyan for default value: {{color "black+h"}}({{.Default}})
+	//nolint:lll
+	survey.InputQuestionTemplate = `
+	{{- if .ShowHelp }}{{- color .Config.Icons.Help.Format }}{{ .Config.Icons.Help.Text }} {{ .Help }}{{color "reset"}}{{"\n"}}{{end}}
+	{{- color .Config.Icons.Question.Format }}{{ .Config.Icons.Question.Text }} {{color "reset"}}
+	{{- color "default+hb"}}{{ .Message }} {{color "reset"}}
+	{{- if .ShowAnswer}}
+	  {{- color "blue+h"}}{{.Answer}}{{color "reset"}}{{"\n"}}
+	{{- else if .PageEntries -}}
+	  {{- .Answer}} [Use arrows to move, enter to select, type to continue]
+	  {{- "\n"}}
+	  {{- range $ix, $choice := .PageEntries}}
+		{{- if eq $ix $.SelectedIndex }}{{color $.Config.Icons.SelectFocus.Format }}{{ $.Config.Icons.SelectFocus.Text }} {{else}}{{color "default"}}  {{end}}
+		{{- $choice.Value}}
+		{{- color "reset"}}{{"\n"}}
+	  {{- end}}
+	{{- else }}
+	  {{- if or (and .Help (not .ShowHelp)) .Suggest }}{{color "blue+h"}}[
+		{{- if and .Help (not .ShowHelp)}}{{ print .Config.HelpInput }} for help {{- if and .Suggest}}, {{end}}{{end -}}
+		{{- if and .Suggest }}{{color "blue+h"}}{{ print .Config.SuggestInput }} for suggestions{{end -}}
+	  ]{{color "reset"}} {{end}}
+	  {{- if .Default}}{{color "black+h"}}({{.Default}}) {{color "reset"}}{{end}}
+	{{- end}}`
+
+	// Replace cyan with blue in other other templates
+	otherTemplates := []*string{
+		&survey.ConfirmQuestionTemplate,
+		&survey.SelectQuestionTemplate,
+		&survey.MultiSelectQuestionTemplate,
+	}
+	for _, template := range otherTemplates {
+		*template = strings.ReplaceAll(*template, `"cyan"`, `"blue+h"`)
 	}
 }

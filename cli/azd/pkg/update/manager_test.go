@@ -1,0 +1,1127 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package update
+
+import (
+	"archive/tar"
+	"archive/zip"
+	"bytes"
+	"compress/gzip"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+
+	"github.com/azure/azure-dev/cli/azd/pkg/exec"
+	"github.com/azure/azure-dev/cli/azd/pkg/installer"
+	"github.com/azure/azure-dev/cli/azd/test/mocks/mockexec"
+	"github.com/stretchr/testify/require"
+)
+
+func TestParseDailyBuildNumber(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string
+		want    int
+		wantErr bool
+	}{
+		{"standard daily", "1.24.0-beta.1-daily.5935787", 5935787, false},
+		{"simple daily", "1.0.0-daily.100", 100, false},
+		{"large build number", "2.0.0-beta.2-daily.9999999", 9999999, false},
+		{"with commit suffix",
+			"1.4.9-beta.1-daily.5000000 (commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)", 5000000, false},
+		{"no daily suffix", "1.23.6", 0, true},
+		{"dev version", "0.0.0-dev.0", 0, true},
+		{"empty string", "", 0, true},
+		{"daily but no number", "1.0.0-daily.", 0, true},
+		{"daily with non-numeric", "1.0.0-daily.abc", 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseDailyBuildNumber(tt.version)
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tt.want, got)
+			}
+		})
+	}
+}
+
+func TestBuildDownloadURL(t *testing.T) {
+	m := NewManager(nil, nil)
+
+	tests := []struct {
+		name    string
+		channel Channel
+		version string
+		wantErr bool
+		// We check that the URL contains these substrings
+		contains []string
+	}{
+		{
+			name:    "stable pinned to resolved version",
+			channel: ChannelStable,
+			version: "1.28.1",
+			contains: []string{
+				blobBaseURL + "/1.28.1/",
+				fmt.Sprintf("azd-%s-%s", runtime.GOOS, runtime.GOARCH),
+			},
+		},
+		{
+			name:    "daily",
+			channel: ChannelDaily,
+			version: "1.29.0-beta.1-daily.6614998",
+			contains: []string{
+				blobBaseURL + "/daily/",
+				fmt.Sprintf("azd-%s-%s", runtime.GOOS, runtime.GOARCH),
+			},
+		},
+		{
+			name:    "invalid channel",
+			channel: Channel("nightly"),
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := m.buildDownloadURL(&VersionInfo{Channel: tt.channel, Version: tt.version})
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			for _, s := range tt.contains {
+				require.Contains(t, got, s)
+			}
+		})
+	}
+}
+
+// The stable channel folder can hold a newer build than the version marker azd reads,
+// so a stable update must download the exact version that was reported to the user.
+// See https://github.com/Azure/azure-dev/issues/9145.
+func TestBuildDownloadURL_StableDoesNotUseRollingFolder(t *testing.T) {
+	m := NewManager(nil, nil)
+
+	got, err := m.buildDownloadURL(&VersionInfo{Channel: ChannelStable, Version: "1.27.0"})
+	require.NoError(t, err)
+	require.Contains(t, got, blobBaseURL+"/1.27.0/")
+	require.NotContains(t, got, "/stable/")
+}
+
+func TestUpdate_RequiresResolvedVersion(t *testing.T) {
+	m := NewManager(nil, nil)
+
+	require.Error(t, m.Update(t.Context(), nil, &strings.Builder{}))
+	require.Error(t, m.StageUpdate(t.Context(), nil))
+
+	// A stable target must carry the version the check resolved. Falling back to the rolling
+	// stable folder would silently reintroduce the drift pinning exists to prevent, so an
+	// unresolved stable target fails the update instead. See
+	// https://github.com/Azure/azure-dev/issues/9145.
+	unresolved := &VersionInfo{Channel: ChannelStable}
+	require.Error(t, m.Update(t.Context(), unresolved, &strings.Builder{}))
+	require.Error(t, m.StageUpdate(t.Context(), unresolved))
+
+	// Daily installs from the rolling folder, so they don't require a resolved version.
+	require.NoError(t, (&VersionInfo{Channel: ChannelDaily}).validate())
+
+	// An unsupported channel has no release folder of its own, so serving it would mean
+	// falling back to another channel's folder — the unpinned install this prevents.
+	unsupported := &VersionInfo{Channel: Channel("nightly"), Version: "1.28.1"}
+	require.Error(t, m.Update(t.Context(), unsupported, &strings.Builder{}))
+	require.Error(t, m.StageUpdate(t.Context(), unsupported))
+}
+
+func TestInstallVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		channel Channel
+		version string
+		want    string
+	}{
+		{"stable pins the resolved version", ChannelStable, "1.28.1", "1.28.1"},
+		{"daily uses the rolling channel", ChannelDaily, "1.29.0-beta.1-daily.6614998", "daily"},
+		{"daily without version", ChannelDaily, "", "daily"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target := &VersionInfo{Channel: tt.channel, Version: tt.version}
+			require.Equal(t, tt.want, target.installVersion())
+		})
+	}
+}
+
+func TestArchiveExtension(t *testing.T) {
+	ext := archiveExtension()
+	if runtime.GOOS == "linux" {
+		require.Equal(t, ".tar.gz", ext)
+	} else {
+		require.Equal(t, ".zip", ext)
+	}
+}
+
+func TestPackageManagerUninstallCmd(t *testing.T) {
+	tests := []struct {
+		name        string
+		installedBy installer.InstallType
+		want        string
+	}{
+		{"brew", installer.InstallTypeBrew, "brew trust azure/azd && brew uninstall azd"},
+		{"winget", installer.InstallTypeWinget, "winget uninstall Microsoft.Azd"},
+		{"choco", installer.InstallTypeChoco, "choco uninstall azd"},
+		{"unknown", installer.InstallTypeUnknown, "your package manager"},
+		{"script", installer.InstallTypeSh, "your package manager"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, PackageManagerUninstallCmd(tt.installedBy))
+		})
+	}
+}
+
+func TestBuildVersionInfoFromCache_Stable(t *testing.T) {
+	m := NewManager(nil, nil)
+
+	tests := []struct {
+		name      string
+		version   string
+		hasUpdate bool
+	}{
+		// Dev build (0.0.0-dev.0) is always less than any release
+		{"newer version available", "999.0.0", true},
+		// In semver, 0.0.0 > 0.0.0-dev.0 (pre-release has lower precedence)
+		// so even 0.0.0 is considered an update from a dev build
+		{"release beats pre-release", "0.0.0", true},
+		// A pre-release that equals the current version is not an update
+		{"same pre-release version", "0.0.0-dev.0", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cache := &CacheFile{
+				Channel: "stable",
+				Version: tt.version,
+			}
+			info, err := m.buildVersionInfoFromCache(cache, ChannelStable)
+			require.NoError(t, err)
+			require.Equal(t, tt.hasUpdate, info.HasUpdate)
+			require.Equal(t, tt.version, info.Version)
+			require.Equal(t, ChannelStable, info.Channel)
+		})
+	}
+}
+
+func TestBuildVersionInfoFromCache_Daily(t *testing.T) {
+	m := NewManager(nil, nil)
+
+	// Dev build (0.0.0-dev.0) can't parse a daily build number,
+	// so it always assumes update available
+	cache := &CacheFile{
+		Channel:     "daily",
+		Version:     "1.24.0-beta.1-daily.5935787",
+		BuildNumber: 5935787,
+	}
+
+	info, err := m.buildVersionInfoFromCache(cache, ChannelDaily)
+	require.NoError(t, err)
+	require.True(t, info.HasUpdate, "dev build should always see daily update available")
+	require.Equal(t, ChannelDaily, info.Channel)
+	require.Equal(t, 5935787, info.BuildNumber)
+}
+
+func TestBuildVersionInfoFromCache_InvalidVersion(t *testing.T) {
+	m := NewManager(nil, nil)
+	cache := &CacheFile{
+		Channel: "stable",
+		Version: "not-a-version",
+	}
+
+	_, err := m.buildVersionInfoFromCache(cache, ChannelStable)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "parse")
+}
+
+// testClientWithRewrite creates an HTTP client that redirects all requests to the given test server URL.
+func testClientWithRewrite(targetURL string) *http.Client {
+	return &http.Client{
+		Transport: &urlRewriteTransport{
+			base:      http.DefaultTransport,
+			targetURL: targetURL,
+		},
+	}
+}
+
+func TestCheckForUpdate_StableHTTP(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "999.0.0")
+	}))
+	defer server.Close()
+
+	tempDir := t.TempDir()
+	t.Setenv("AZD_CONFIG_DIR", tempDir)
+
+	m := NewManager(nil, testClientWithRewrite(server.URL))
+	cfg := &UpdateConfig{Channel: ChannelStable}
+
+	info, err := m.CheckForUpdate(t.Context(), cfg, true)
+	require.NoError(t, err)
+	require.Equal(t, "999.0.0", info.Version)
+	require.Equal(t, ChannelStable, info.Channel)
+	require.True(t, info.HasUpdate)
+}
+
+func TestCheckForUpdate_DailyHTTP(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "1.24.0-beta.1-daily.9999999")
+	}))
+	defer server.Close()
+
+	tempDir := t.TempDir()
+	t.Setenv("AZD_CONFIG_DIR", tempDir)
+
+	m := NewManager(nil, testClientWithRewrite(server.URL))
+	cfg := &UpdateConfig{Channel: ChannelDaily}
+
+	info, err := m.CheckForUpdate(t.Context(), cfg, true)
+	require.NoError(t, err)
+	require.Equal(t, "1.24.0-beta.1-daily.9999999", info.Version)
+	require.Equal(t, 9999999, info.BuildNumber)
+	require.Equal(t, ChannelDaily, info.Channel)
+	require.True(t, info.HasUpdate)
+}
+
+func TestCheckForUpdate_HTTPError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	tempDir := t.TempDir()
+	t.Setenv("AZD_CONFIG_DIR", tempDir)
+
+	m := NewManager(nil, testClientWithRewrite(server.URL))
+	cfg := &UpdateConfig{Channel: ChannelStable}
+
+	_, err := m.CheckForUpdate(t.Context(), cfg, true)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "500")
+}
+
+func TestCheckForUpdate_UsesCache(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("AZD_CONFIG_DIR", tempDir)
+
+	// Pre-populate cache with a future expiry
+	cache := &CacheFile{
+		Channel:   "stable",
+		Version:   "888.0.0",
+		ExpiresOn: "2099-01-01T00:00:00Z",
+	}
+	require.NoError(t, SaveCache(cache))
+
+	m := NewManager(nil, nil)
+	cfg := &UpdateConfig{Channel: ChannelStable}
+
+	// ignoreCache=false should use the cache (no HTTP call needed)
+	info, err := m.CheckForUpdate(t.Context(), cfg, false)
+	require.NoError(t, err)
+	require.Equal(t, "888.0.0", info.Version)
+	require.True(t, info.HasUpdate)
+}
+
+func TestCheckForUpdate_InvalidChannel(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("AZD_CONFIG_DIR", tempDir)
+
+	m := NewManager(nil, nil)
+	cfg := &UpdateConfig{Channel: Channel("nightly")}
+
+	_, err := m.CheckForUpdate(t.Context(), cfg, true)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unsupported channel")
+}
+
+func TestUpdateViaPackageManager_Success(t *testing.T) {
+	mockRunner := mockexec.NewMockCommandRunner()
+	mockRunner.When(func(args exec.RunArgs, command string) bool {
+		return strings.Contains(command, "brew upgrade azure/azd/azd")
+	}).Respond(exec.NewRunResult(0, "Updated azd", ""))
+
+	m := NewManager(mockRunner, nil)
+	var buf bytes.Buffer
+
+	err := m.updateViaPackageManager(t.Context(), "brew", []string{"upgrade", "azure/azd/azd"}, &buf)
+	require.NoError(t, err)
+	require.Contains(t, buf.String(), "Updating azd via brew")
+}
+
+func TestUpdateViaPackageManager_Failure(t *testing.T) {
+	mockRunner := mockexec.NewMockCommandRunner()
+	mockRunner.When(func(args exec.RunArgs, command string) bool {
+		return strings.Contains(command, "brew upgrade azure/azd/azd")
+	}).Respond(exec.NewRunResult(1, "", "Error: no such formula"))
+
+	m := NewManager(mockRunner, nil)
+	var buf bytes.Buffer
+
+	err := m.updateViaPackageManager(t.Context(), "brew", []string{"upgrade", "azure/azd/azd"}, &buf)
+	require.Error(t, err)
+
+	var updateErr *UpdateError
+	require.ErrorAs(t, err, &updateErr)
+	require.Equal(t, CodePackageManagerFailed, updateErr.Code)
+}
+
+func TestUpdateViaPackageManager_CommandError(t *testing.T) {
+	mockRunner := mockexec.NewMockCommandRunner()
+	mockRunner.When(func(args exec.RunArgs, command string) bool {
+		return true
+	}).SetError(fmt.Errorf("command not found: brew"))
+
+	m := NewManager(mockRunner, nil)
+	var buf bytes.Buffer
+
+	err := m.updateViaPackageManager(t.Context(), "brew", []string{"upgrade", "azure/azd/azd"}, &buf)
+	require.Error(t, err)
+
+	var updateErr *UpdateError
+	require.ErrorAs(t, err, &updateErr)
+	require.Equal(t, CodePackageManagerFailed, updateErr.Code)
+}
+
+func TestVerifyCodeSignature_NilRunner(t *testing.T) {
+	m := NewManager(nil, nil)
+	err := m.verifyCodeSignature(t.Context(), "/some/binary", io.Discard)
+	require.NoError(t, err, "should skip when no command runner")
+}
+
+func TestExtractFromZip(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Create a zip archive containing a fake "azd" binary
+	archivePath := filepath.Join(tempDir, "test.zip")
+	binaryContent := []byte("#!/bin/sh\necho hello")
+
+	zipFile, err := os.Create(archivePath)
+	require.NoError(t, err)
+
+	zw := zip.NewWriter(zipFile)
+	fw, err := zw.Create("azd")
+	require.NoError(t, err)
+	_, err = fw.Write(binaryContent)
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+	require.NoError(t, zipFile.Close())
+
+	// Extract
+	destPath := filepath.Join(tempDir, "extracted-azd")
+	err = extractFromZip(archivePath, "azd", destPath)
+	require.NoError(t, err)
+
+	// Verify content
+	extracted, err := os.ReadFile(destPath)
+	require.NoError(t, err)
+	require.Equal(t, binaryContent, extracted)
+}
+
+func TestExtractFromZip_BinaryNotFound(t *testing.T) {
+	tempDir := t.TempDir()
+
+	archivePath := filepath.Join(tempDir, "empty.zip")
+	zipFile, err := os.Create(archivePath)
+	require.NoError(t, err)
+
+	zw := zip.NewWriter(zipFile)
+	fw, err := zw.Create("other-file.txt")
+	require.NoError(t, err)
+	_, err = fw.Write([]byte("not the binary"))
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+	require.NoError(t, zipFile.Close())
+
+	destPath := filepath.Join(tempDir, "extracted")
+	err = extractFromZip(archivePath, "azd", destPath)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not found in archive")
+}
+
+func TestExtractFromTarGz(t *testing.T) {
+	tempDir := t.TempDir()
+
+	archivePath := filepath.Join(tempDir, "test.tar.gz")
+	binaryContent := []byte("#!/bin/sh\necho hello from tar")
+
+	// Create tar.gz
+	f, err := os.Create(archivePath)
+	require.NoError(t, err)
+
+	gw := gzip.NewWriter(f)
+	tw := tar.NewWriter(gw)
+
+	hdr := &tar.Header{
+		Name: "azd",
+		Mode: 0o755,
+		Size: int64(len(binaryContent)),
+	}
+	require.NoError(t, tw.WriteHeader(hdr))
+	_, err = tw.Write(binaryContent)
+	require.NoError(t, err)
+
+	require.NoError(t, tw.Close())
+	require.NoError(t, gw.Close())
+	require.NoError(t, f.Close())
+
+	// Extract
+	destPath := filepath.Join(tempDir, "extracted-azd")
+	err = extractFromTarGz(archivePath, "azd", destPath)
+	require.NoError(t, err)
+
+	extracted, err := os.ReadFile(destPath)
+	require.NoError(t, err)
+	require.Equal(t, binaryContent, extracted)
+}
+
+func TestExtractBinary_ChoosesFormat(t *testing.T) {
+	tempDir := t.TempDir()
+	binaryContent := []byte("binary data")
+
+	// Create a zip
+	archivePath := filepath.Join(tempDir, "test.zip")
+	zipFile, err := os.Create(archivePath)
+	require.NoError(t, err)
+	zw := zip.NewWriter(zipFile)
+	fw, err := zw.Create("azd")
+	require.NoError(t, err)
+	_, err = fw.Write(binaryContent)
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+	require.NoError(t, zipFile.Close())
+
+	destPath := filepath.Join(tempDir, "out-azd")
+	err = extractBinary(archivePath, "azd", destPath)
+	require.NoError(t, err)
+
+	extracted, err := os.ReadFile(destPath)
+	require.NoError(t, err)
+	require.Equal(t, binaryContent, extracted)
+}
+
+func TestStagedBinaryPath(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("AZD_CONFIG_DIR", tempDir)
+
+	path, err := StagedBinaryPath()
+	require.NoError(t, err)
+	require.Contains(t, path, "staging")
+
+	binaryName := "azd"
+	if runtime.GOOS == "windows" {
+		binaryName = "azd.exe"
+	}
+	require.True(t, strings.HasSuffix(path, binaryName))
+}
+
+func TestHasStagedUpdate_NoFile(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("AZD_CONFIG_DIR", tempDir)
+
+	require.False(t, HasStagedUpdate())
+}
+
+func TestHasStagedUpdate_WithFile(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("AZD_CONFIG_DIR", tempDir)
+
+	path, err := StagedBinaryPath()
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte("fake binary"), 0o755)) //nolint:gosec
+
+	require.True(t, HasStagedUpdate())
+}
+
+func TestCleanStagedUpdate(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("AZD_CONFIG_DIR", tempDir)
+
+	// Stage a fake binary
+	path, err := StagedBinaryPath()
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte("fake binary"), 0o755)) //nolint:gosec
+	require.True(t, HasStagedUpdate())
+
+	// Clean it
+	CleanStagedUpdate()
+	require.False(t, HasStagedUpdate())
+}
+
+func TestAppliedMarkerLifecycle(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("AZD_CONFIG_DIR", tempDir)
+
+	// No marker initially
+	_, err := ReadAppliedMarker()
+	require.Error(t, err)
+
+	// Write marker
+	WriteAppliedMarker("1.22.0")
+
+	// Read marker
+	version, err := ReadAppliedMarker()
+	require.NoError(t, err)
+	require.Equal(t, "1.22.0", version)
+
+	// Remove marker
+	RemoveAppliedMarker()
+	_, err = ReadAppliedMarker()
+	require.Error(t, err)
+}
+
+func TestProgressReader(t *testing.T) {
+	content := bytes.Repeat([]byte("x"), 100)
+	reader := bytes.NewReader(content)
+
+	var output bytes.Buffer
+	pr := &progressReader{
+		reader: reader,
+		total:  100,
+		writer: &output,
+	}
+
+	buf := make([]byte, 10)
+	totalRead := 0
+	for {
+		n, err := pr.Read(buf)
+		totalRead += n
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+	}
+
+	require.Equal(t, 100, totalRead)
+	// Should have reported at least some progress percentages
+	require.Contains(t, output.String(), "%")
+}
+
+func TestCopyFile(t *testing.T) {
+	tempDir := t.TempDir()
+
+	src := filepath.Join(tempDir, "source")
+	dst := filepath.Join(tempDir, "dest")
+	content := []byte("hello world")
+
+	require.NoError(t, os.WriteFile(src, content, 0o600))
+	require.NoError(t, copyFile(src, dst))
+
+	copied, err := os.ReadFile(dst)
+	require.NoError(t, err)
+	require.Equal(t, content, copied)
+}
+
+func TestUpdateError(t *testing.T) {
+	inner := fmt.Errorf("connection refused")
+	ue := newUpdateError(CodeDownloadFailed, inner)
+
+	require.Equal(t, "connection refused", ue.Error())
+	require.Equal(t, CodeDownloadFailed, ue.Code)
+	require.ErrorIs(t, ue, inner)
+
+	ue2 := newUpdateErrorf(CodeDownloadFailed, "hash mismatch: expected %s", "abc123")
+	require.Contains(t, ue2.Error(), "hash mismatch")
+	require.Equal(t, CodeDownloadFailed, ue2.Code)
+}
+
+func TestErrNeedsElevation(t *testing.T) {
+	require.NotNil(t, ErrNeedsElevation)
+	require.Contains(t, ErrNeedsElevation.Error(), "elevation")
+}
+
+func TestDownloadFile(t *testing.T) {
+	content := []byte("downloaded binary content")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
+		w.WriteHeader(http.StatusOK)
+		w.Write(content)
+	}))
+	defer server.Close()
+
+	tempDir := t.TempDir()
+	destPath := filepath.Join(tempDir, "downloaded")
+
+	m := NewManager(nil, nil)
+	err := m.downloadFile(t.Context(), server.URL+"/azd.zip", destPath, io.Discard)
+	require.NoError(t, err)
+
+	got, err := os.ReadFile(destPath)
+	require.NoError(t, err)
+	require.Equal(t, content, got)
+}
+
+func TestDownloadFile_HTTPError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	tempDir := t.TempDir()
+	destPath := filepath.Join(tempDir, "downloaded")
+
+	m := NewManager(nil, nil)
+	err := m.downloadFile(t.Context(), server.URL+"/missing.zip", destPath, io.Discard)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "404")
+}
+
+// urlRewriteTransport rewrites all outgoing request URLs to point at a test server.
+type urlRewriteTransport struct {
+	base      http.RoundTripper
+	targetURL string
+}
+
+func (t *urlRewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Rewrite the request URL to the test server, preserving path
+	newURL := t.targetURL + req.URL.Path
+	//nolint:gosec // G704: URL from test server, not user input
+	newReq, err := http.NewRequestWithContext(
+		req.Context(), req.Method, newURL, req.Body,
+	)
+	if err != nil {
+		return nil, err
+	}
+	newReq.Header = req.Header
+	return t.base.RoundTrip(newReq)
+}
+
+// mockBrewTrust registers a success response for the best-effort
+// `brew trust azure/azd` step that updateViaBrew runs before any cask operation
+// so azd's Homebrew source is trusted.
+func mockBrewTrust(runner *mockexec.MockCommandRunner) {
+	runner.When(func(args exec.RunArgs, command string) bool {
+		return command == "brew trust azure/azd"
+	}).Respond(exec.NewRunResult(0, "", ""))
+}
+
+func TestUpdateViaBrew(t *testing.T) {
+	t.Run("NotCask_Stable", func(t *testing.T) {
+		mockRunner := mockexec.NewMockCommandRunner()
+		mockBrewTrust(mockRunner)
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew list --cask"
+		}).Respond(exec.NewRunResult(0, "some-other-cask\n", ""))
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew uninstall azd"
+		}).Respond(exec.NewRunResult(0, "", ""))
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew install --cask azure/azd/azd"
+		}).Respond(exec.NewRunResult(0, "Installed", ""))
+
+		m := NewManager(mockRunner, nil)
+		var buf bytes.Buffer
+		err := m.updateViaBrew(t.Context(), &VersionInfo{Channel: ChannelStable}, &buf)
+		require.NoError(t, err)
+		require.Contains(t, buf.String(), "not installed as a Homebrew cask")
+	})
+
+	t.Run("NotCask_Daily", func(t *testing.T) {
+		mockRunner := mockexec.NewMockCommandRunner()
+		mockBrewTrust(mockRunner)
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew list --cask"
+		}).Respond(exec.NewRunResult(0, "some-other-cask\n", ""))
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew uninstall azd"
+		}).Respond(exec.NewRunResult(0, "", ""))
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew install --cask azure/azd/azd@daily"
+		}).Respond(exec.NewRunResult(0, "Installed", ""))
+
+		m := NewManager(mockRunner, nil)
+		var buf bytes.Buffer
+		err := m.updateViaBrew(t.Context(), &VersionInfo{Channel: ChannelDaily}, &buf)
+		require.NoError(t, err)
+		require.Contains(t, buf.String(), "not installed as a Homebrew cask")
+	})
+
+	t.Run("NotCask_UnsupportedChannel", func(t *testing.T) {
+		mockRunner := mockexec.NewMockCommandRunner()
+		mockBrewTrust(mockRunner)
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew list --cask"
+		}).Respond(exec.NewRunResult(0, "some-other-cask\n", ""))
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew uninstall azd"
+		}).Respond(exec.NewRunResult(0, "", ""))
+
+		m := NewManager(mockRunner, nil)
+		var buf bytes.Buffer
+		err := m.updateViaBrew(t.Context(), &VersionInfo{Channel: Channel("nightly")}, &buf)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "unsupported channel")
+	})
+
+	t.Run("SwitchDailyToStable", func(t *testing.T) {
+		mockRunner := mockexec.NewMockCommandRunner()
+		mockBrewTrust(mockRunner)
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew list --cask"
+		}).Respond(exec.NewRunResult(0, "azd@daily\n", ""))
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew uninstall --cask azd@daily"
+		}).Respond(exec.NewRunResult(0, "", ""))
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew install --cask azure/azd/azd"
+		}).Respond(exec.NewRunResult(0, "Installed", ""))
+
+		m := NewManager(mockRunner, nil)
+		var buf bytes.Buffer
+		err := m.updateViaBrew(t.Context(), &VersionInfo{Channel: ChannelStable}, &buf)
+		require.NoError(t, err)
+		require.Contains(t, buf.String(), "Switching from daily to stable")
+	})
+
+	t.Run("SwitchStableToDaily", func(t *testing.T) {
+		mockRunner := mockexec.NewMockCommandRunner()
+		mockBrewTrust(mockRunner)
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew list --cask"
+		}).Respond(exec.NewRunResult(0, "azd\n", ""))
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew uninstall --cask azd"
+		}).Respond(exec.NewRunResult(0, "", ""))
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew install --cask azure/azd/azd@daily"
+		}).Respond(exec.NewRunResult(0, "Installed", ""))
+
+		m := NewManager(mockRunner, nil)
+		var buf bytes.Buffer
+		err := m.updateViaBrew(t.Context(), &VersionInfo{Channel: ChannelDaily}, &buf)
+		require.NoError(t, err)
+		require.Contains(t, buf.String(), "Switching from stable to daily")
+	})
+
+	t.Run("SwitchDailyToStable_UninstallFails", func(t *testing.T) {
+		mockRunner := mockexec.NewMockCommandRunner()
+		mockBrewTrust(mockRunner)
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew list --cask"
+		}).Respond(exec.NewRunResult(0, "azd@daily\n", ""))
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew uninstall --cask azd@daily"
+		}).Respond(exec.NewRunResult(1, "", "Error: cask not installed"))
+
+		m := NewManager(mockRunner, nil)
+		var buf bytes.Buffer
+		err := m.updateViaBrew(t.Context(), &VersionInfo{Channel: ChannelStable}, &buf)
+		require.Error(t, err)
+		var updateErr *UpdateError
+		require.ErrorAs(t, err, &updateErr)
+		require.Equal(t, CodePackageManagerFailed, updateErr.Code)
+	})
+
+	t.Run("UpgradeStable", func(t *testing.T) {
+		mockRunner := mockexec.NewMockCommandRunner()
+		mockBrewTrust(mockRunner)
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew list --cask"
+		}).Respond(exec.NewRunResult(0, "azd\n", ""))
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew upgrade --cask azure/azd/azd"
+		}).Respond(exec.NewRunResult(0, "Updated", ""))
+
+		m := NewManager(mockRunner, nil)
+		var buf bytes.Buffer
+		err := m.updateViaBrew(t.Context(), &VersionInfo{Channel: ChannelStable}, &buf)
+		require.NoError(t, err)
+		require.Contains(t, buf.String(), "Trusting azd's Homebrew source (azure/azd)")
+		require.Contains(t, buf.String(), "Updating azd (stable channel)")
+	})
+
+	t.Run("TrustFails_StillUpgrades", func(t *testing.T) {
+		// Trust is best-effort: a failure (e.g. older Homebrew without the
+		// `brew trust` command) must not abort the upgrade. See #8683.
+		mockRunner := mockexec.NewMockCommandRunner()
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew trust azure/azd"
+		}).SetError(fmt.Errorf("Unknown command: trust"))
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew list --cask"
+		}).Respond(exec.NewRunResult(0, "azd\n", ""))
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew upgrade --cask azure/azd/azd"
+		}).Respond(exec.NewRunResult(0, "Updated", ""))
+
+		m := NewManager(mockRunner, nil)
+		var buf bytes.Buffer
+		err := m.updateViaBrew(t.Context(), &VersionInfo{Channel: ChannelStable}, &buf)
+		require.NoError(t, err)
+		require.Contains(t, buf.String(), "Updating azd (stable channel)")
+	})
+
+	t.Run("UpgradeDaily", func(t *testing.T) {
+		mockRunner := mockexec.NewMockCommandRunner()
+		mockBrewTrust(mockRunner)
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew list --cask"
+		}).Respond(exec.NewRunResult(0, "azd@daily\n", ""))
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew upgrade --cask azure/azd/azd@daily"
+		}).Respond(exec.NewRunResult(0, "Updated", ""))
+
+		m := NewManager(mockRunner, nil)
+		var buf bytes.Buffer
+		err := m.updateViaBrew(t.Context(), &VersionInfo{Channel: ChannelDaily}, &buf)
+		require.NoError(t, err)
+		require.Contains(t, buf.String(), "Updating azd (daily channel)")
+	})
+
+	t.Run("UpgradeStable_Fails", func(t *testing.T) {
+		mockRunner := mockexec.NewMockCommandRunner()
+		mockBrewTrust(mockRunner)
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew list --cask"
+		}).Respond(exec.NewRunResult(0, "azd\n", ""))
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew upgrade --cask azure/azd/azd"
+		}).Respond(exec.NewRunResult(1, "", "Error: already up-to-date"))
+
+		m := NewManager(mockRunner, nil)
+		var buf bytes.Buffer
+		err := m.updateViaBrew(t.Context(), &VersionInfo{Channel: ChannelStable}, &buf)
+		require.Error(t, err)
+		var updateErr *UpdateError
+		require.ErrorAs(t, err, &updateErr)
+		require.Equal(t, CodePackageManagerFailed, updateErr.Code)
+	})
+
+	t.Run("UpgradeUnsupportedChannel", func(t *testing.T) {
+		mockRunner := mockexec.NewMockCommandRunner()
+		mockBrewTrust(mockRunner)
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew list --cask"
+		}).Respond(exec.NewRunResult(0, "azd\n", ""))
+
+		m := NewManager(mockRunner, nil)
+		var buf bytes.Buffer
+		err := m.updateViaBrew(t.Context(), &VersionInfo{Channel: Channel("nightly")}, &buf)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "unsupported channel")
+	})
+
+	t.Run("ListFails_FallsBackToInstall", func(t *testing.T) {
+		mockRunner := mockexec.NewMockCommandRunner()
+		mockBrewTrust(mockRunner)
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew list --cask"
+		}).SetError(fmt.Errorf("brew not found"))
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew uninstall azd"
+		}).Respond(exec.NewRunResult(0, "", ""))
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew install --cask azure/azd/azd"
+		}).Respond(exec.NewRunResult(0, "Installed", ""))
+
+		m := NewManager(mockRunner, nil)
+		var buf bytes.Buffer
+		err := m.updateViaBrew(t.Context(), &VersionInfo{Channel: ChannelStable}, &buf)
+		require.NoError(t, err)
+	})
+
+	t.Run("UninstallFails_StillInstallsCask", func(t *testing.T) {
+		mockRunner := mockexec.NewMockCommandRunner()
+		mockBrewTrust(mockRunner)
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew list --cask"
+		}).Respond(exec.NewRunResult(0, "other-cask\n", ""))
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew uninstall azd"
+		}).Respond(exec.NewRunResult(1, "", "No such formula: azd"))
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return command == "brew install --cask azure/azd/azd"
+		}).Respond(exec.NewRunResult(0, "Installed", ""))
+
+		m := NewManager(mockRunner, nil)
+		var buf bytes.Buffer
+		err := m.updateViaBrew(t.Context(), &VersionInfo{Channel: ChannelStable}, &buf)
+		require.NoError(t, err)
+	})
+}
+
+func TestUpdateViaInstallScript(t *testing.T) {
+	t.Run("Success_Stable", func(t *testing.T) {
+		scriptContent := []byte("#!/bin/bash\necho installing")
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(scriptContent)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(scriptContent)
+		}))
+		defer server.Close()
+
+		client := &http.Client{
+			Transport: &urlRewriteTransport{
+				base:      http.DefaultTransport,
+				targetURL: server.URL,
+			},
+		}
+
+		var capturedArgs exec.RunArgs
+		mockRunner := mockexec.NewMockCommandRunner()
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return args.Cmd == "bash"
+		}).RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+			capturedArgs = args
+			return exec.NewRunResult(0, "Installation complete", ""), nil
+		})
+
+		m := NewManager(mockRunner, client)
+		var buf bytes.Buffer
+		err := m.updateViaInstallScript(t.Context(), &VersionInfo{Channel: ChannelStable, Version: "1.28.1"}, &buf)
+		require.NoError(t, err)
+		require.Contains(t, buf.String(), "Updating azd via install script")
+		require.Contains(t, buf.String(), "Installing azd stable channel")
+
+		// Verify bash was called with correct arguments. Stable installs are pinned to the
+		// resolved version so the install can't drift from the version reported to the user.
+		require.Equal(t, "bash", capturedArgs.Cmd)
+		require.True(t, strings.HasSuffix(capturedArgs.Args[0], "install-azd.sh"))
+		require.Equal(t, "--version", capturedArgs.Args[1])
+		require.Equal(t, "1.28.1", capturedArgs.Args[2])
+		require.Equal(t, "--install-folder", capturedArgs.Args[3])
+		require.NotEmpty(t, capturedArgs.Args[4]) // install folder path
+		require.Equal(t, "--symlink-folder", capturedArgs.Args[5])
+		require.Equal(t, "", capturedArgs.Args[6])
+	})
+
+	t.Run("Success_Daily", func(t *testing.T) {
+		scriptContent := []byte("#!/bin/bash\necho installing")
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(scriptContent)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(scriptContent)
+		}))
+		defer server.Close()
+
+		client := &http.Client{
+			Transport: &urlRewriteTransport{
+				base:      http.DefaultTransport,
+				targetURL: server.URL,
+			},
+		}
+
+		var capturedArgs exec.RunArgs
+		mockRunner := mockexec.NewMockCommandRunner()
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return args.Cmd == "bash"
+		}).RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+			capturedArgs = args
+			return exec.NewRunResult(0, "Installation complete", ""), nil
+		})
+
+		m := NewManager(mockRunner, client)
+		var buf bytes.Buffer
+		err := m.updateViaInstallScript(
+			t.Context(), &VersionInfo{Channel: ChannelDaily, Version: "1.29.0-beta.1-daily.6614998"}, &buf)
+		require.NoError(t, err)
+		require.Contains(t, buf.String(), "Installing azd daily channel")
+		require.Equal(t, "daily", capturedArgs.Args[2])
+	})
+
+	t.Run("DownloadFailure", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer server.Close()
+
+		client := &http.Client{
+			Transport: &urlRewriteTransport{
+				base:      http.DefaultTransport,
+				targetURL: server.URL,
+			},
+		}
+
+		m := NewManager(nil, client)
+		var buf bytes.Buffer
+		err := m.updateViaInstallScript(t.Context(), &VersionInfo{Channel: ChannelStable, Version: "1.28.1"}, &buf)
+		require.Error(t, err)
+		var updateErr *UpdateError
+		require.ErrorAs(t, err, &updateErr)
+		require.Equal(t, CodeDownloadFailed, updateErr.Code)
+	})
+
+	t.Run("ScriptExecutionError", func(t *testing.T) {
+		scriptContent := []byte("#!/bin/bash\necho installing")
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(scriptContent)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(scriptContent)
+		}))
+		defer server.Close()
+
+		client := &http.Client{
+			Transport: &urlRewriteTransport{
+				base:      http.DefaultTransport,
+				targetURL: server.URL,
+			},
+		}
+
+		mockRunner := mockexec.NewMockCommandRunner()
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return args.Cmd == "bash"
+		}).SetError(fmt.Errorf("bash: command not found"))
+
+		m := NewManager(mockRunner, client)
+		var buf bytes.Buffer
+		err := m.updateViaInstallScript(t.Context(), &VersionInfo{Channel: ChannelStable, Version: "1.28.1"}, &buf)
+		require.Error(t, err)
+		var updateErr *UpdateError
+		require.ErrorAs(t, err, &updateErr)
+		require.Equal(t, CodeReplaceFailed, updateErr.Code)
+	})
+
+	t.Run("ScriptNonZeroExit", func(t *testing.T) {
+		scriptContent := []byte("#!/bin/bash\necho installing")
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(scriptContent)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(scriptContent)
+		}))
+		defer server.Close()
+
+		client := &http.Client{
+			Transport: &urlRewriteTransport{
+				base:      http.DefaultTransport,
+				targetURL: server.URL,
+			},
+		}
+
+		mockRunner := mockexec.NewMockCommandRunner()
+		mockRunner.When(func(args exec.RunArgs, command string) bool {
+			return args.Cmd == "bash"
+		}).Respond(exec.NewRunResult(1, "", "installation failed"))
+
+		m := NewManager(mockRunner, client)
+		var buf bytes.Buffer
+		err := m.updateViaInstallScript(t.Context(), &VersionInfo{Channel: ChannelStable, Version: "1.28.1"}, &buf)
+		require.Error(t, err)
+		var updateErr *UpdateError
+		require.ErrorAs(t, err, &updateErr)
+		require.Equal(t, CodeReplaceFailed, updateErr.Code)
+	})
+}

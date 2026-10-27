@@ -1,0 +1,556 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package cmd
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/azure/azure-dev/cli/azd/internal"
+	"github.com/azure/azure-dev/cli/azd/internal/runcontext/agentdetect"
+	"github.com/azure/azure-dev/cli/azd/pkg/ioc"
+	"github.com/azure/azure-dev/cli/azd/pkg/output"
+	"github.com/azure/azure-dev/cli/azd/pkg/project"
+	"github.com/spf13/cobra"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestNewCommandConsole_FormatsFollowUpToChildStderr(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	root := &cobra.Command{Use: "azd"}
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+
+	child := &cobra.Command{Use: "package"}
+	root.AddCommand(child)
+
+	// the child command uses JSON output, but the root does not...
+	output.AddOutputParam(child, []output.Format{output.JsonFormat, output.NoneFormat}, output.NoneFormat)
+	require.NoError(t, child.Flags().Set("output", "json"))
+
+	formatter, err := output.GetCommandFormatter(child)
+	require.NoError(t, err)
+	console := newCommandConsole(&internal.GlobalCommandOptions{NoPrompt: true}, formatter, child)
+	const followUp = "Install the required extension to continue."
+	console.Message(t.Context(), followUp)
+
+	require.Empty(t, stdout)
+	var event struct {
+		Type string `json:"type"`
+		Data struct {
+			Message string `json:"message"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(stderr.Bytes(), &event))
+	require.Equal(t, "consoleMessage", event.Type)
+	require.Equal(t, followUp+"\n", event.Data.Message)
+}
+
+func TestExecuteWithAutoInstall_FormatsHostFollowUpToChildStderr(t *testing.T) {
+	t.Chdir(t.TempDir())
+	configDir := t.TempDir()
+	t.Setenv("AZD_CONFIG_DIR", configDir)
+	t.Setenv("AZD_SKIP_UPDATE_CHECK", "true")
+	t.Setenv("AZURE_DEV_COLLECT_TELEMETRY", "no")
+	t.Setenv("AZD_FORCE_TTY", "false")
+	t.Setenv("NO_COLOR", "1")
+	t.Setenv("CI", "1")
+
+	registryPath := filepath.Join(configDir, "registry.json")
+	registry := `{"extensions":[{"id":"test.host","displayName":"Test Host","versions":[{"version":"1.0.0",
+"capabilities":["service-target-provider"],"providers":[{"name":"unsupported-host","type":"service-target"}]}]}]}`
+	require.NoError(t, os.WriteFile(registryPath, []byte(registry), 0o600))
+	config, err := json.Marshal(map[string]any{
+		"extension": map[string]any{
+			"sources": map[string]any{
+				"test": map[string]string{"name": "test", "type": "file", "location": registryPath},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(configDir, "config.json"), config, 0o600))
+
+	originalArgs := os.Args
+	t.Cleanup(func() { os.Args = originalArgs })
+	os.Args = []string{"azd", "probe-host", "--output", "json", "--no-prompt"}
+
+	rootContainer := ioc.NewNestedContainer(nil)
+	ioc.RegisterInstance(rootContainer, t.Context())
+	globalOpts := &internal.GlobalCommandOptions{NoPrompt: true}
+	ioc.RegisterInstance(rootContainer, globalOpts)
+	root := NewRootCmd(false, nil, rootContainer)
+	probe := &cobra.Command{
+		Use: "probe-host",
+		RunE: func(*cobra.Command, []string) error {
+			return &project.UnsupportedServiceHostError{Host: "unsupported-host", ServiceName: "api"}
+		},
+	}
+	output.AddOutputParam(probe, []output.Format{output.JsonFormat, output.NoneFormat}, output.NoneFormat)
+	root.AddCommand(probe)
+	root.SetArgs(os.Args[1:])
+	root.SilenceErrors = true
+	var stdout, stderr bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+
+	result := executeWithAutoInstallCommand(t.Context(), rootContainer, root, globalOpts, &ExecuteResult{})
+	require.ErrorContains(t, result.Err, "required extension installation needs manual action")
+	require.Empty(t, stdout)
+
+	const followUp = "Your project requires support for host 'unsupported-host'. " +
+		"Install the required extension to continue.\n"
+	followUpFound := false
+	for line := range bytes.SplitSeq(stderr.Bytes(), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var event struct {
+			Type string `json:"type"`
+			Data struct {
+				Message string `json:"message"`
+			} `json:"data"`
+		}
+		require.NoError(t, json.Unmarshal(line, &event), "follow-up output must be JSONL")
+		if event.Type == "consoleMessage" && event.Data.Message == followUp {
+			followUpFound = true
+		}
+	}
+	require.True(t, followUpFound, "service-host auto-install must use the child command's JSON console")
+}
+
+func TestExecuteWithAutoInstall_InvalidChildOutputReturnsFormatterError(t *testing.T) {
+	t.Chdir(t.TempDir())
+	configDir := t.TempDir()
+	t.Setenv("AZD_CONFIG_DIR", configDir)
+	t.Setenv("AZD_SKIP_UPDATE_CHECK", "true")
+	t.Setenv("AZURE_DEV_COLLECT_TELEMETRY", "no")
+	t.Setenv("NO_COLOR", "1")
+	require.NoError(t, os.WriteFile(filepath.Join(configDir, "config.json"),
+		[]byte(`{"extension":{"sources":{}}}`), 0o600))
+
+	originalArgs := os.Args
+	t.Cleanup(func() { os.Args = originalArgs })
+	os.Args = []string{"azd", "probe-host", "--output", "yaml"}
+
+	rootContainer := ioc.NewNestedContainer(nil)
+	ioc.RegisterInstance(rootContainer, t.Context())
+	globalOpts := &internal.GlobalCommandOptions{NoPrompt: true}
+	ioc.RegisterInstance(rootContainer, globalOpts)
+	root := NewRootCmd(false, nil, rootContainer)
+	probe := &cobra.Command{
+		Use: "probe-host",
+		RunE: func(*cobra.Command, []string) error {
+			return &project.UnsupportedServiceHostError{Host: "unsupported-host", ServiceName: "api"}
+		},
+	}
+	output.AddOutputParam(probe, []output.Format{output.JsonFormat, output.NoneFormat}, output.NoneFormat)
+	root.AddCommand(probe)
+	root.SetArgs(os.Args[1:])
+	root.SilenceErrors = true
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+
+	result := executeWithAutoInstallCommand(t.Context(), rootContainer, root, globalOpts, &ExecuteResult{})
+	require.ErrorContains(t, result.Err, "unsupported format 'yaml' for --output")
+	require.ErrorContains(t, result.Err, "unsupported-host")
+}
+
+func TestExecuteWithAutoInstall_InvalidProjectYamlReturnsParseError(t *testing.T) {
+	originalArgs := os.Args
+	t.Cleanup(func() {
+		os.Args = originalArgs
+	})
+
+	clearAgentEnvVarsForTest(t)
+	agentdetect.ResetDetection()
+	t.Cleanup(agentdetect.ResetDetection)
+
+	projectDir := t.TempDir()
+	t.Chdir(projectDir)
+	t.Setenv("AZD_CONFIG_DIR", t.TempDir())
+	t.Setenv("AZD_SKIP_UPDATE_CHECK", "true")
+	t.Setenv("AZURE_DEV_COLLECT_TELEMETRY", "no")
+	t.Setenv("NO_COLOR", "1")
+
+	err := os.WriteFile(
+		filepath.Join(projectDir, "azure.yaml"),
+		[]byte("name: test\nservices:\n  api:\n    project: src\n1\n"),
+		0o600,
+	)
+	require.NoError(t, err)
+	os.Args = []string{"azd", "package", "--no-prompt"}
+	rootContainer := ioc.NewNestedContainer(nil)
+	ioc.RegisterInstance(rootContainer, t.Context())
+
+	var result *ExecuteResult
+	require.NotPanics(t, func() {
+		result = ExecuteWithAutoInstall(t.Context(), rootContainer)
+	})
+
+	require.ErrorContains(t, result.Err, "unable to parse azure.yaml file")
+}
+
+// TestExecuteWithAutoInstallIntegration tests the integration between
+// extractFlagsWithValues and findFirstNonFlagArg in the context of
+// the auto-install feature.
+func TestExecuteWithAutoInstallIntegration(t *testing.T) {
+	// Save original args
+	originalArgs := os.Args
+
+	// Test cases that would have failed before the fix
+	testCases := []struct {
+		name     string
+		args     []string
+		expected string
+	}{
+		{
+			name:     "output flag with demo command",
+			args:     []string{"azd", "--output", "json", "demo"},
+			expected: "demo",
+		},
+		{
+			name:     "cwd flag with init command",
+			args:     []string{"azd", "--cwd", "/project", "init"},
+			expected: "init",
+		},
+		{
+			name:     "mixed flags",
+			args:     []string{"azd", "--debug", "--output", "table", "--no-prompt", "deploy"},
+			expected: "deploy",
+		},
+		{
+			name:     "short form flags",
+			args:     []string{"azd", "-o", "json", "-C", "/path", "up"},
+			expected: "up",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Set test args
+			os.Args = tc.args
+
+			// Create a test root command to extract flags from
+			rootCmd := &cobra.Command{Use: "azd"}
+
+			// Add the flags that azd actually uses
+			rootCmd.PersistentFlags().StringP("output", "o", "", "Output format")
+			rootCmd.PersistentFlags().StringP("cwd", "C", "", "Working directory")
+			rootCmd.PersistentFlags().Bool("debug", false, "Debug mode")
+			rootCmd.PersistentFlags().Bool("no-prompt", false, "No prompting")
+
+			// Extract flags and test our parsing
+			flagsWithValues := extractFlagsWithValues(rootCmd)
+			result, _ := findFirstNonFlagArg(os.Args[1:], flagsWithValues)
+
+			assert.Equal(t, tc.expected, result,
+				"Failed to correctly identify command in args: %v", tc.args)
+		})
+	}
+
+	// Restore original args
+	os.Args = originalArgs
+}
+
+func TestExecuteWithAutoInstall_ReturnsCommandErrorWithoutPanicForOutputFlags(t *testing.T) {
+	originalArgs := os.Args
+	defer func() {
+		os.Args = originalArgs
+	}()
+
+	clearAgentEnvVarsForTest(t)
+	agentdetect.ResetDetection()
+	defer agentdetect.ResetDetection()
+
+	os.Args = []string{
+		"azd",
+		"auth",
+		"token",
+		"--scope",
+		"https://graph.microsoft.com/.default",
+		"--tenant-id",
+		"00000000-0000-0000-0000-000000000000",
+		"--output",
+		"unknown",
+	}
+
+	rootContainer := ioc.NewNestedContainer(nil)
+	stderrReader, stderrWriter, err := os.Pipe()
+	require.NoError(t, err)
+
+	originalStderr := os.Stderr
+	os.Stderr = stderrWriter
+	defer func() {
+		os.Stderr = originalStderr
+	}()
+
+	var execResult *ExecuteResult
+	require.NotPanics(t, func() {
+		execResult = ExecuteWithAutoInstall(t.Context(), rootContainer)
+	})
+
+	require.NoError(t, stderrWriter.Close())
+
+	stderrBytes, err := io.ReadAll(stderrReader)
+	require.NoError(t, err)
+
+	require.ErrorContains(t, execResult.Err, "unsupported format 'unknown'")
+	require.NotContains(t, string(stderrBytes), "panic:")
+	require.Contains(t, string(stderrBytes), "Error: unsupported format 'unknown'")
+
+	// auth token is a lightspeed command — verify the flag is set even when the command fails
+	require.True(t, execResult.IsLightspeed, "auth token should be detected as a lightspeed command")
+}
+
+func TestExecuteWithAutoInstall_LightspeedDetection(t *testing.T) {
+	originalArgs := os.Args
+	defer func() {
+		os.Args = originalArgs
+	}()
+
+	clearAgentEnvVarsForTest(t)
+	agentdetect.ResetDetection()
+	defer agentdetect.ResetDetection()
+
+	tests := []struct {
+		name             string
+		args             []string
+		expectLightspeed bool
+	}{
+		{
+			name: "auth_token_is_lightspeed",
+			// Use --output unknown to fail before touching the credential stack.
+			// We only care about IsLightspeed detection, not actual token acquisition.
+			args:             []string{"azd", "auth", "token", "--output", "unknown"},
+			expectLightspeed: true,
+		},
+		{
+			name:             "version_is_not_lightspeed",
+			args:             []string{"azd", "version"},
+			expectLightspeed: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Prevent non-lightspeed commands from making real HTTP update check calls.
+			t.Setenv("AZD_SKIP_UPDATE_CHECK", "true")
+			os.Args = tt.args
+			rootContainer := ioc.NewNestedContainer(nil)
+			result := ExecuteWithAutoInstall(t.Context(), rootContainer)
+			require.Equal(t, tt.expectLightspeed, result.IsLightspeed)
+
+			if tt.expectLightspeed {
+				// Lightspeed commands must NOT start the update check goroutine.
+				require.Nil(t, result.LatestVersion,
+					"lightspeed commands should not start the update check")
+			} else {
+				// Non-lightspeed commands should always start the update check
+				// (even when AZD_SKIP_UPDATE_CHECK short-circuits it).
+				require.NotNil(t, result.LatestVersion,
+					"non-lightspeed commands should start the update check")
+			}
+		})
+	}
+}
+
+// TestAgentDetectionIntegration tests the full agent detection integration flow.
+func TestAgentDetectionIntegration(t *testing.T) {
+	tests := []struct {
+		name             string
+		args             []string
+		envVars          map[string]string
+		terminal         bool
+		expectedNoPrompt bool
+		description      string
+	}{
+		{
+			name:             "Claude Code agent enables no-prompt automatically",
+			args:             []string{"version"},
+			envVars:          map[string]string{"CLAUDECODE": "1"},
+			expectedNoPrompt: true,
+			description:      "When running under Claude Code, --no-prompt should be auto-enabled",
+		},
+		{
+			name: "Inherited Claude Code marker remains interactive in a terminal",
+			args: []string{"version"},
+			envVars: map[string]string{
+				"CLAUDECODE":             "1",
+				"CLAUDE_CODE_ENTRYPOINT": "claude-desktop",
+			},
+			terminal:         true,
+			expectedNoPrompt: false,
+			description:      "An inherited Claude Code marker should not disable prompts in a terminal",
+		},
+		{
+			name:             "Antigravity detached invocation enables no-prompt",
+			args:             []string{"version"},
+			envVars:          map[string]string{"ANTIGRAVITY_AGENT": "1"},
+			expectedNoPrompt: true,
+			description:      "A detached Antigravity invocation should automatically enable no-prompt",
+		},
+		{
+			name:             "Antigravity attached invocation remains interactive",
+			args:             []string{"version"},
+			envVars:          map[string]string{"ANTIGRAVITY_AGENT": "1"},
+			terminal:         true,
+			expectedNoPrompt: false,
+			description:      "An attached Antigravity invocation should preserve prompting",
+		},
+		{
+			name:             "Codex enables no-prompt automatically",
+			args:             []string{"deploy"},
+			envVars:          map[string]string{"CODEX_THREAD_ID": "thread-id"},
+			expectedNoPrompt: true,
+			description:      "When running under Codex, --no-prompt should be auto-enabled",
+		},
+		{
+			name:             "Cursor enables no-prompt automatically",
+			args:             []string{"deploy"},
+			envVars:          map[string]string{"CURSOR_AGENT": "1"},
+			expectedNoPrompt: true,
+			description:      "When running under Cursor, --no-prompt should be auto-enabled",
+		},
+		{
+			name:             "GitHub Copilot CLI via COPILOT_CLI enables no-prompt automatically",
+			args:             []string{"deploy"},
+			envVars:          map[string]string{"COPILOT_CLI": "true"},
+			expectedNoPrompt: true,
+			description:      "When running under GitHub Copilot CLI (COPILOT_CLI), --no-prompt should be auto-enabled",
+		},
+		{
+			name:             "GitHub Copilot VSCode enables no-prompt automatically",
+			args:             []string{"deploy"},
+			envVars:          map[string]string{"AI_AGENT": "github_copilot_vscode_agent"},
+			expectedNoPrompt: true,
+			description:      "When running under GitHub Copilot VSCode, --no-prompt should be auto-enabled",
+		},
+		{
+			name:             "Gemini agent enables no-prompt automatically",
+			args:             []string{"init"},
+			envVars:          map[string]string{"GEMINI_CLI": "1"},
+			expectedNoPrompt: true,
+			description:      "When running under Gemini, --no-prompt should be auto-enabled",
+		},
+		{
+			name:             "OpenCode agent enables no-prompt automatically",
+			args:             []string{"provision"},
+			envVars:          map[string]string{"OPENCODE": "1"},
+			expectedNoPrompt: true,
+			description:      "When running under OpenCode, --no-prompt should be auto-enabled",
+		},
+		{
+			name:             "User can override agent detection with --no-prompt=false",
+			args:             []string{"--no-prompt=false", "up"},
+			envVars:          map[string]string{"CLAUDECODE": "1"},
+			expectedNoPrompt: false,
+			description:      "Explicit --no-prompt=false should override agent detection",
+		},
+		{
+			name:             "Normal execution without agent detection",
+			args:             []string{"version"},
+			envVars:          map[string]string{},
+			expectedNoPrompt: false,
+			description:      "Without agent detection, prompting should remain enabled by default",
+		},
+		{
+			name: "User agent string triggers detection",
+			args: []string{"up"},
+			envVars: map[string]string{
+				internal.AzdUserAgentEnvVar: "claude-code/1.0.0",
+			},
+			expectedNoPrompt: true,
+			description:      "AZURE_DEV_USER_AGENT containing agent identifier should trigger detection",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Clear any ambient agent env vars to ensure test isolation
+			clearAgentEnvVarsForTest(t)
+
+			// Reset agent detection cache for each test
+			agentdetect.ResetDetection()
+
+			// If the test expects no agent but we're inside an agent process, skip it.
+			if !tt.expectedNoPrompt && len(tt.envVars) == 0 {
+				if agentdetect.GetCallingAgent().Detected {
+					t.Skip("skipping: parent process detection found an agent")
+				}
+				agentdetect.ResetDetection()
+			}
+
+			// Set environment variables
+			for k, v := range tt.envVars {
+				t.Setenv(k, v)
+			}
+
+			// Parse global flags as would happen in real execution
+			opts := &internal.GlobalCommandOptions{}
+			err := parseGlobalFlags(tt.args, opts, func(uintptr, uintptr) bool {
+				return tt.terminal
+			})
+			require.NoError(t, err, "ParseGlobalFlags should not error: %s", tt.description)
+
+			assert.Equal(t, tt.expectedNoPrompt, opts.NoPrompt,
+				"NoPrompt mismatch: %s", tt.description)
+
+			// Verify agent detection status matches expectation
+			agent := agentdetect.GetCallingAgent()
+			if len(tt.envVars) > 0 {
+				assert.True(t, agent.Detected,
+					"Agent should be detected when agent env vars are set: %s", tt.description)
+			}
+
+			// Clean up
+			agentdetect.ResetDetection()
+		})
+	}
+}
+
+// clearAgentEnvVarsForTest clears all environment variables that could trigger agent detection
+// or CI detection. This ensures ParseGlobalFlags tests get a deterministic interactive baseline
+// (NoPrompt=false) regardless of the ambient environment, including when the test suite itself
+// runs inside a CI/CD provider.
+func clearAgentEnvVarsForTest(t *testing.T) {
+	envVarsToUnset := []string{
+		// Antigravity CLI
+		"ANTIGRAVITY_AGENT", "ANTIGRAVITY_CONVERSATION_ID",
+		// GitHub Copilot hosts
+		"AI_AGENT",
+		// Claude Code
+		"CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT",
+		// Codex
+		"CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "CODEX_CI", "CODEX_THREAD_ID", "CODEX_SESSION_ID",
+		// Cursor
+		"CURSOR_AGENT", "CURSOR_CONVERSATION_ID",
+		// GitHub Copilot CLI
+		"COPILOT_CLI",
+		// Gemini CLI
+		"GEMINI_CLI", "GEMINI_CLI_NO_RELAUNCH",
+		// OpenCode
+		"OPENCODE",
+		// Terminal and non-interactive overrides
+		"AZD_FORCE_TTY", "AZD_NON_INTERACTIVE",
+		// User agent
+		internal.AzdUserAgentEnvVar,
+		// CI/CD providers (see internal/tracing/resource/ci.go). Cleared so that a suite running
+		// inside CI does not ambiently flip NoPrompt to true via auto-detection.
+		"TF_BUILD", "GITHUB_ACTIONS", "APPVEYOR", "TRAVIS", "CIRCLECI", "GITLAB_CI",
+		"CODEBUILD_BUILD_ID", "JENKINS_URL", "TEAMCITY_VERSION", "JB_SPACE_API_URL",
+		"bamboo.buildKey", "BITBUCKET_BUILD_NUMBER", "CI", "BUILD_ID",
+	}
+
+	for _, envVar := range envVarsToUnset {
+		if _, exists := os.LookupEnv(envVar); exists {
+			t.Setenv(envVar, "")
+			os.Unsetenv(envVar)
+		}
+	}
+}

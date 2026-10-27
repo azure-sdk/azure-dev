@@ -1,0 +1,23 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package cmd
+
+import (
+	"github.com/azure/azure-dev/cli/azd/pkg/azdext"
+	"github.com/spf13/cobra"
+)
+
+var (
+	// Populated at build time
+	Version   = "dev" // Default value for development builds
+	Commit    = "none"
+	BuildDate = "unknown"
+)
+
+func newVersionCommand(outputFormat *string) *cobra.Command {
+	cmd := azdext.NewVersionCommand("azure.ai.toolboxes", Version, outputFormat)
+	cmd.Example = `  # Display the installed toolbox extension version
+  azd ai toolbox version`
+	return cmd
+}

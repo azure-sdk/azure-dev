@@ -32,7 +32,6 @@ export class AsyncLazy<T> {
     private val: T | undefined;
     private valuePromise: Promise<T> | undefined;
 
-    // eslint-disable-next-line @typescript-eslint/naming-convention
     public constructor(private readonly valueFactory: () => Promise<T>, private valueLifetime?: number) {
     }
 
@@ -71,7 +70,7 @@ export class AsyncLazy<T> {
                 }, this.valueLifetime);
 
                 // Do not hold the process waiting for the lifetime of the value to expire.
-                timer.unref(); 
+                timer.unref();
             }
         }
 

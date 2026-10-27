@@ -6,59 +6,34 @@ package cmd
 import (
 	"testing"
 
-	"github.com/azure/azure-dev/cli/azd/internal"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/azure/azure-dev/cli/azd/internal"
+	"github.com/azure/azure-dev/cli/azd/test/mocks/mockinput"
 )
 
-func TestPipelineCmd(t *testing.T) {
-	globalOpt := &internal.GlobalCommandOptions{}
-	command := pipelineCmd(globalOpt)
-	assert.EqualValues(t, "pipeline", command.Use)
-	assert.EqualValues(t, "Manage GitHub Actions pipelines.", command.Short)
-
-	childCommands := command.Commands()
-	assert.EqualValues(t, 1, len(childCommands))
+func Test_NewPipelineConfigAction_Constructor(t *testing.T) {
+	t.Parallel()
+	flags := &pipelineConfigFlags{}
+	console := mockinput.NewMockConsole()
+	a := newPipelineConfigAction(nil, console, flags, nil, nil, nil, nil, nil, nil)
+	pa := a.(*pipelineConfigAction)
+	require.Same(t, flags, pa.flags)
 }
 
-func TestPipelineConfigCmd(t *testing.T) {
-	globalOpt := &internal.GlobalCommandOptions{}
-	command := pipelineConfigCmd(globalOpt)
-	assert.EqualValues(t, "config", command.Use)
-	assert.EqualValues(t, "Create and configure your deployment pipeline by using GitHub Actions.", command.Short)
-
-	childCommands := command.Commands()
-	assert.EqualValues(t, 0, len(childCommands))
+func Test_NewPipelineConfigCmd(t *testing.T) {
+	t.Parallel()
+	cmd := newPipelineConfigCmd()
+	require.NotNil(t, cmd)
+	assert.Equal(t, "config", cmd.Use)
 }
 
-func TestSetupFlags(t *testing.T) {
-	globalOpt := &internal.GlobalCommandOptions{}
-	pipelineAction := NewConfigAction(globalOpt)
-	command := cobra.Command{}
-	pipelineAction.SetupFlags(command.PersistentFlags(), command.Flags())
-
-	flagName := "principal-name"
-	principalNameFlag := command.LocalFlags().Lookup(flagName)
-	assert.NotEqual(t, (*pflag.Flag)(nil), principalNameFlag)
-	assert.Equal(t, "", principalNameFlag.Value.String())
-	assert.Equal(t, "The name of the service principal to use to grant access to Azure resources as part of the pipeline.", principalNameFlag.Usage)
-	principalNameFlag = command.PersistentFlags().Lookup(flagName)
-	assert.Equal(t, (*pflag.Flag)(nil), principalNameFlag)
-
-	flagName = "remote-name"
-	remoteNameFlag := command.LocalFlags().Lookup(flagName)
-	assert.NotEqual(t, (*pflag.Flag)(nil), remoteNameFlag)
-	assert.Equal(t, "origin", remoteNameFlag.Value.String())
-	assert.Equal(t, "The name of the git remote to configure the pipeline to run on.", remoteNameFlag.Usage)
-	remoteNameFlag = command.PersistentFlags().Lookup(flagName)
-	assert.Equal(t, (*pflag.Flag)(nil), remoteNameFlag)
-
-	flagName = "principal-role"
-	principalRoleNameFlag := command.LocalFlags().Lookup(flagName)
-	assert.NotEqual(t, (*pflag.Flag)(nil), principalRoleNameFlag)
-	assert.Equal(t, "Contributor", principalRoleNameFlag.Value.String())
-	assert.Equal(t, "The role to assign to the service principal.", principalRoleNameFlag.Usage)
-	principalRoleNameFlag = command.PersistentFlags().Lookup(flagName)
-	assert.Equal(t, (*pflag.Flag)(nil), principalRoleNameFlag)
+func Test_NewPipelineConfigFlags(t *testing.T) {
+	t.Parallel()
+	cmd := &cobra.Command{Use: "test"}
+	global := &internal.GlobalCommandOptions{}
+	flags := newPipelineConfigFlags(cmd, global)
+	require.NotNil(t, flags)
 }

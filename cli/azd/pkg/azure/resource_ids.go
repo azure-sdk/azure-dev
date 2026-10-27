@@ -3,7 +3,24 @@
 
 package azure
 
-import "fmt"
+import (
+	"fmt"
+	"regexp"
+	"strings"
+)
+
+// SubscriptionFromRID returns the subscription id component of a resource or panics if the resource id does not
+// contain a subscription.
+func SubscriptionFromRID(rid string) string {
+	parts := strings.Split(rid, "/")
+	for idx, part := range parts {
+		if part == "subscriptions" && idx+1 < len(parts) {
+			return parts[idx+1]
+		}
+	}
+
+	panic(fmt.Sprintf("no subscription id component in in %s", rid))
+}
 
 // Creates Azure subscription resource ID
 func SubscriptionRID(subscriptionId string) string {
@@ -13,13 +30,21 @@ func SubscriptionRID(subscriptionId string) string {
 
 // Creates subscription-level deployment resource ID
 func SubscriptionDeploymentRID(subscriptionId, deploymentId string) string {
-	returnValue := fmt.Sprintf("%s/providers/Microsoft.Resources/deployments/%s", SubscriptionRID(subscriptionId), deploymentId)
+	returnValue := fmt.Sprintf(
+		"%s/providers/Microsoft.Resources/deployments/%s",
+		SubscriptionRID(subscriptionId),
+		deploymentId,
+	)
 	return returnValue
 }
 
 // Creates resource group level deployment resource ID
 func ResourceGroupDeploymentRID(subscriptionId string, resourceGroupName string, deploymentId string) string {
-	returnValue := fmt.Sprintf("%s/providers/Microsoft.Resources/deployments/%s", ResourceGroupRID(subscriptionId, resourceGroupName), deploymentId)
+	returnValue := fmt.Sprintf(
+		"%s/providers/Microsoft.Resources/deployments/%s",
+		ResourceGroupRID(subscriptionId, resourceGroupName),
+		deploymentId,
+	)
 	return returnValue
 }
 
@@ -30,16 +55,57 @@ func ResourceGroupRID(subscriptionId, resourceGroupName string) string {
 }
 
 func WebsiteRID(subscriptionId, resourceGroupName, websiteName string) string {
-	returnValue := fmt.Sprintf("%s/providers/Microsoft.Web/sites/%s", ResourceGroupRID(subscriptionId, resourceGroupName), websiteName)
+	returnValue := fmt.Sprintf(
+		"%s/providers/Microsoft.Web/sites/%s",
+		ResourceGroupRID(subscriptionId, resourceGroupName),
+		websiteName,
+	)
 	return returnValue
 }
 
 func ContainerAppRID(subscriptionId, resourceGroupName, containerAppName string) string {
-	returnValue := fmt.Sprintf("%s/providers/Microsoft.App/containerApps/%s", ResourceGroupRID(subscriptionId, resourceGroupName), containerAppName)
+	returnValue := fmt.Sprintf(
+		"%s/providers/Microsoft.App/containerApps/%s",
+		ResourceGroupRID(subscriptionId, resourceGroupName),
+		containerAppName,
+	)
 	return returnValue
 }
 
+func KubernetesServiceRID(subscriptionId, resourceGroupName, clusterName string) string {
+	return fmt.Sprintf(
+		"%s/providers/Microsoft.ContainerService/managedClusters/%s",
+		ResourceGroupRID(subscriptionId, resourceGroupName),
+		clusterName,
+	)
+}
+
 func StaticWebAppRID(subscriptionId, resourceGroupName, staticSiteName string) string {
-	returnValue := fmt.Sprintf("%s/providers/Microsoft.Web/staticSites/%s", ResourceGroupRID(subscriptionId, resourceGroupName), staticSiteName)
+	returnValue := fmt.Sprintf(
+		"%s/providers/Microsoft.Web/staticSites/%s",
+		ResourceGroupRID(subscriptionId, resourceGroupName),
+		staticSiteName,
+	)
 	return returnValue
+}
+
+func WorkspaceRID(subscriptionId, resourceGroupName, workspaceName string) string {
+	returnValue := fmt.Sprintf(
+		"%s/providers/Microsoft.MachineLearningServices/workspaces/%s",
+		ResourceGroupRID(subscriptionId, resourceGroupName),
+		workspaceName,
+	)
+	return returnValue
+}
+
+var resourceIdRegex = regexp.MustCompile("/.+/(?i)resourceGroups/(.+?)/.+")
+
+// Find the resource group name from the resource id
+func GetResourceGroupName(resourceId string) *string {
+	matches := resourceIdRegex.FindSubmatch([]byte(resourceId))
+	if len(matches) < 2 {
+		return nil
+	}
+
+	return new(string(matches[1]))
 }

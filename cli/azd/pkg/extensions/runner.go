@@ -1,0 +1,135 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package extensions
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+
+	"github.com/azure/azure-dev/cli/azd/pkg/config"
+	"github.com/azure/azure-dev/cli/azd/pkg/exec"
+)
+
+type InvokeOptions struct {
+	Args        []string
+	Env         []string
+	StdIn       io.Reader
+	StdOut      io.Writer
+	StdErr      io.Writer
+	Interactive bool
+
+	// Global AZD flags to propagate as environment variables to extension processes.
+	Debug       bool
+	NoPrompt    bool
+	Cwd         string
+	Environment string
+}
+
+type Runner struct {
+	commandRunner exec.CommandRunner
+}
+
+func NewRunner(commandRunner exec.CommandRunner) *Runner {
+	return &Runner{
+		commandRunner: commandRunner,
+	}
+}
+
+// Invoke runs the extension with the provided arguments
+func (r *Runner) Invoke(ctx context.Context, extension *Extension, options *InvokeOptions) (*exec.RunResult, error) {
+	userConfigDir, err := config.GetUserConfigDir()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user config directory: %w", err)
+	}
+
+	extension.ensureInit()
+
+	extensionPath := filepath.Join(userConfigDir, extension.Path)
+	if _, err := os.Stat(extensionPath); err != nil {
+		return nil, fmt.Errorf("extension path '%s' not found: %w", extensionPath, err)
+	}
+
+	// Propagate global AZD flags as environment variables
+	if options.Debug {
+		options.Env = append(options.Env, "AZD_DEBUG=true")
+	}
+	if options.NoPrompt {
+		options.Env = append(options.Env, "AZD_NO_PROMPT=true")
+	}
+	if options.Cwd != "" {
+		options.Env = append(options.Env, fmt.Sprintf("AZD_CWD=%s", options.Cwd))
+	}
+	if options.Environment != "" {
+		options.Env = append(options.Env, fmt.Sprintf("AZD_ENVIRONMENT=%s", options.Environment))
+	}
+
+	runArgs := exec.NewRunArgs(extensionPath, options.Args...)
+	if len(options.Env) > 0 {
+		runArgs = runArgs.WithEnv(options.Env)
+	}
+
+	if options.Interactive {
+		runArgs = runArgs.WithInteractive(true)
+	} else {
+		if options.StdIn != nil {
+			runArgs = runArgs.WithStdIn(options.StdIn)
+		}
+
+		if options.StdOut != nil {
+			runArgs = runArgs.WithStdOut(options.StdOut)
+		}
+
+		if options.StdErr != nil {
+			runArgs = runArgs.WithStdErr(options.StdErr)
+		}
+	}
+
+	runResult, err := r.commandRunner.Run(ctx, runArgs)
+	if err != nil {
+		return &runResult, &ExtensionRunError{
+			Err:              err,
+			ExtensionId:      extension.Id,
+			ExtensionVersion: extension.Version,
+		}
+	}
+	return &runResult, nil
+}
+
+// ExtensionRunError represents an error that occurred while running an extension.
+type ExtensionRunError struct {
+	ExtensionId      string
+	ExtensionVersion string
+	Err              error
+}
+
+func (e *ExtensionRunError) Error() string {
+	return fmt.Sprintf("extension '%s' run failed: %v", e.ExtensionId, e.Err)
+}
+
+func (e *ExtensionRunError) Unwrap() error {
+	return e.Err
+}
+
+func (e *ExtensionRunError) InvocationExtensionId() string {
+	if e == nil {
+		return ""
+	}
+
+	return e.ExtensionId
+}
+
+func (e *ExtensionRunError) InvocationExtensionVersion() string {
+	if e == nil {
+		return ""
+	}
+
+	return e.ExtensionVersion
+}
+
+func (e *ExtensionRunError) InvocationEvent() string {
+	return ""
+}

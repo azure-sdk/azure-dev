@@ -1,0 +1,514 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package ux
+
+import (
+	"bytes"
+	"errors"
+	"io"
+	"sync/atomic"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/fatih/color"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	outputpkg "github.com/azure/azure-dev/cli/azd/pkg/output"
+)
+
+// --- TaskList tests ---
+
+func TestNewTaskList_nil_options(t *testing.T) {
+	tl := NewTaskList(nil)
+	require.NotNil(t, tl)
+	assert.NotNil(t, tl.options)
+	assert.Equal(t, 5, tl.options.MaxConcurrentAsync)
+	assert.False(t, tl.options.ContinueOnError)
+}
+
+func TestNewTaskList_custom_options(t *testing.T) {
+	tl := NewTaskList(&TaskListOptions{
+		ContinueOnError:    true,
+		MaxConcurrentAsync: 10,
+	})
+	require.NotNil(t, tl)
+	assert.True(t, tl.options.ContinueOnError)
+	assert.Equal(t, 10, tl.options.MaxConcurrentAsync)
+}
+
+func TestTaskList_AddTask(t *testing.T) {
+	tl := NewTaskList(nil)
+
+	result := tl.AddTask(TaskOptions{
+		Title: "Task 1",
+		Action: func(sp SetProgressFunc) (TaskState, error) {
+			return Success, nil
+		},
+	})
+
+	// AddTask should return the TaskList for chaining
+	assert.Equal(t, tl, result)
+	assert.Len(t, tl.allTasks, 1)
+	assert.Equal(t, "Task 1", tl.allTasks[0].Title)
+	assert.Equal(t, Pending, tl.allTasks[0].State)
+}
+
+func TestTaskList_AddTask_chaining(t *testing.T) {
+	tl := NewTaskList(nil)
+	action := func(sp SetProgressFunc) (TaskState, error) {
+		return Success, nil
+	}
+
+	tl.AddTask(TaskOptions{Title: "A", Action: action}).
+		AddTask(TaskOptions{Title: "B", Action: action}).
+		AddTask(TaskOptions{Title: "C", Action: action})
+
+	assert.Len(t, tl.allTasks, 3)
+}
+
+func TestTaskList_Render_pending(t *testing.T) {
+	var buf bytes.Buffer
+	printer := NewPrinter(&buf)
+
+	tl := NewTaskList(nil)
+	tl.allTasks = append(tl.allTasks, &Task{
+		Title: "My pending task",
+		State: Pending,
+	})
+
+	err := tl.Render(printer)
+	require.NoError(t, err)
+
+	output := buf.String()
+	assert.Contains(t, output, "My pending task")
+}
+
+func TestTaskList_Render_success_with_elapsed(t *testing.T) {
+	var buf bytes.Buffer
+	printer := NewPrinter(&buf)
+
+	start := time.Now().Add(-5 * time.Second)
+	end := time.Now()
+
+	tl := NewTaskList(nil)
+	tl.allTasks = append(tl.allTasks, &Task{
+		Title:     "Completed task",
+		State:     Success,
+		startTime: &start,
+		endTime:   &end,
+	})
+
+	err := tl.Render(printer)
+	require.NoError(t, err)
+
+	output := buf.String()
+	assert.Contains(t, output, "Completed task")
+}
+
+func TestTaskList_Render_error_with_description(t *testing.T) {
+	var buf bytes.Buffer
+	printer := NewPrinter(&buf)
+
+	start := time.Now().Add(-2 * time.Second)
+	end := time.Now()
+
+	tl := NewTaskList(nil)
+	tl.allTasks = append(tl.allTasks, &Task{
+		Title:     "Failed task",
+		State:     Error,
+		Error:     errors.New("something broke"),
+		startTime: &start,
+		endTime:   &end,
+	})
+
+	err := tl.Render(printer)
+	require.NoError(t, err)
+
+	output := buf.String()
+	assert.Contains(t, output, "Failed task")
+	assert.Contains(t, output, "something broke")
+}
+
+func TestTaskList_Render_running_with_progress(t *testing.T) {
+	var buf bytes.Buffer
+	printer := NewPrinter(&buf)
+
+	start := time.Now().Add(-1 * time.Second)
+	tl := NewTaskList(nil)
+	tl.allTasks = append(tl.allTasks, &Task{
+		Title:     "Running task",
+		State:     Running,
+		progress:  "50%",
+		startTime: &start,
+	})
+
+	err := tl.Render(printer)
+	require.NoError(t, err)
+
+	output := buf.String()
+	assert.Contains(t, output, "Running task")
+	assert.Contains(t, output, "50%")
+}
+
+func TestTaskList_Render_skipped_with_and_without_error(t *testing.T) {
+	var buf bytes.Buffer
+	printer := NewPrinter(&buf)
+
+	tl := NewTaskList(nil)
+	tl.allTasks = append(tl.allTasks,
+		&Task{Title: "Skip no error", State: Skipped},
+		&Task{
+			Title: "Skip with error",
+			State: Skipped,
+			Error: errors.New("skipped reason"),
+		},
+	)
+
+	err := tl.Render(printer)
+	require.NoError(t, err)
+
+	output := buf.String()
+	assert.Contains(t, output, "Skip no error")
+	assert.Contains(t, output, "Skip with error")
+	assert.Contains(t, output, "skipped reason")
+}
+
+func TestTaskList_Render_warning(t *testing.T) {
+	originalNoColor := color.NoColor
+	color.NoColor = false
+	t.Cleanup(func() { color.NoColor = originalNoColor })
+
+	var buf bytes.Buffer
+	printer := NewPrinter(&buf)
+
+	start := time.Now().Add(-3 * time.Second)
+	end := time.Now()
+
+	tl := NewTaskList(nil)
+	tl.allTasks = append(tl.allTasks, &Task{
+		Title:     "Warn task",
+		State:     Warning,
+		Error:     errors.New("partial failure"),
+		startTime: &start,
+		endTime:   &end,
+	})
+
+	err := tl.Render(printer)
+	require.NoError(t, err)
+
+	output := buf.String()
+	assert.Contains(t, output, "Warn task")
+	assert.Contains(t, output, "partial failure")
+	assert.Contains(t, output, outputpkg.WithWarningFormat("(partial failure)"))
+	assert.NotContains(t, output, outputpkg.WithErrorFormat("(partial failure)"))
+}
+
+func TestTaskList_Run_warningContinues(t *testing.T) {
+	var buf bytes.Buffer
+	ranNextTask := false
+
+	tl := NewTaskList(&TaskListOptions{Writer: &buf})
+	tl.AddTask(TaskOptions{
+		Title: "Warn task",
+		Action: func(sp SetProgressFunc) (TaskState, error) {
+			return Warning, errors.New("validation warning")
+		},
+	}).AddTask(TaskOptions{
+		Title: "Next task",
+		Action: func(sp SetProgressFunc) (TaskState, error) {
+			ranNextTask = true
+			return Success, nil
+		},
+	})
+
+	err := tl.Run()
+	require.NoError(t, err)
+	assert.True(t, ranNextTask)
+	assert.Equal(t, Warning, tl.allTasks[0].State)
+	assert.Equal(t, Success, tl.allTasks[1].State)
+	assert.Empty(t, tl.errors)
+
+	output := buf.String()
+	assert.Contains(t, output, "Warn task")
+	assert.Contains(t, output, "validation warning")
+	assert.Contains(t, output, "Next task")
+}
+
+func TestTaskList_Run_waitsForRenderer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Keep the task running until the renderer has started its first update.
+		blockTask := make(chan struct{})
+
+		// Allows us to block the background rendering loop
+		blockTheRenderer := make(chan struct{})
+
+		runHasExited := make(chan error, 1)
+		var updates atomic.Int32
+
+		tl := NewTaskList(&TaskListOptions{Writer: io.Discard})
+		tl.WithCanvas(&testCanvas{update: func() error {
+			// The first Update call is the background rendering loop in Run(). We'll block
+			// here so that goroutine is stuck until we're ready.
+			if updates.Add(1) == 1 {
+				<-blockTheRenderer
+			}
+			return nil
+		}})
+
+		tl.AddTask(TaskOptions{
+			Title: "Running task",
+			Action: func(SetProgressFunc) (TaskState, error) {
+				<-blockTask
+				return Success, nil
+			},
+		})
+
+		go func() {
+			runHasExited <- tl.Run()
+		}()
+
+		synctest.Wait()
+		// okay, we've blocked two things:
+		// - the background rendering loop, via blockTheRenderer
+		// - the Run() call itself using blockTask
+		assert.Equal(t, int32(1), updates.Load(), "background update has run and is paused")
+
+		close(blockTask) // unblock Run()'s main thread
+		synctest.Wait()
+
+		// note, the task has finished, and prior to our fix, Run() would exit _now_, but now it waits
+		// until the background render goroutine exits too.
+		assert.Empty(t, runHasExited, "Run() is waiting on the background loop to stop")
+		assert.Equal(t, int32(1), updates.Load(), "the final update must wait for the renderer to exit")
+
+		// now, we unblock the renderer, so the background loop can exit...
+		close(blockTheRenderer)
+		synctest.Wait()
+
+		require.Len(t, runHasExited, 1, "Run() has finally exited")
+		require.NoError(t, <-runHasExited)
+		assert.Equal(t, int32(2), updates.Load())
+	})
+}
+
+type testCanvas struct {
+	Canvas
+	update func() error
+}
+
+func (canvas *testCanvas) Run() error {
+	return nil
+}
+
+func (canvas *testCanvas) Update() error {
+	return canvas.update()
+}
+
+func TestTaskList_RenderWhileTaskUpdates(t *testing.T) {
+	tests := []struct {
+		name  string
+		async bool
+	}{
+		{name: "sync", async: false},
+		{name: "async", async: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			started := make(chan struct{})
+			stop := make(chan struct{})
+			done := make(chan error, 1)
+
+			tl := NewTaskList(&TaskListOptions{Writer: io.Discard})
+			tl.AddTask(TaskOptions{
+				Title: "Running task",
+				Async: test.async,
+				Action: func(setProgress SetProgressFunc) (TaskState, error) {
+					close(started)
+					for {
+						select {
+						case <-stop:
+							return Success, nil
+						default:
+							setProgress("working")
+						}
+					}
+				},
+			})
+
+			go func() {
+				done <- tl.Run()
+			}()
+
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("task did not start")
+			}
+
+			printer := NewPrinter(io.Discard)
+			for range 100 {
+				require.NoError(t, tl.Render(printer))
+			}
+
+			close(stop)
+			select {
+			case err := <-done:
+				require.NoError(t, err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("task list did not finish")
+			}
+		})
+	}
+}
+
+func TestShouldCollectTaskError(t *testing.T) {
+	taskErr := errors.New("task failed")
+	tests := []struct {
+		name  string
+		state TaskState
+		err   error
+		want  bool
+	}{
+		{name: "nil error", state: Error, err: nil, want: false},
+		{name: "pending error", state: Pending, err: taskErr, want: true},
+		{name: "running error", state: Running, err: taskErr, want: true},
+		{name: "skipped error", state: Skipped, err: taskErr, want: true},
+		{name: "warning error", state: Warning, err: taskErr, want: false},
+		{name: "error error", state: Error, err: taskErr, want: true},
+		{name: "success error", state: Success, err: taskErr, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, shouldCollectTaskError(tt.err, tt.state))
+		})
+	}
+}
+
+func TestTaskList_Render_ordering(t *testing.T) {
+	var buf bytes.Buffer
+	printer := NewPrinter(&buf)
+
+	tl := NewTaskList(nil)
+	tl.allTasks = []*Task{
+		{Title: "running-task", State: Running},
+		{Title: "done-task", State: Success},
+		{Title: "pending-task", State: Pending},
+	}
+
+	err := tl.Render(printer)
+	require.NoError(t, err)
+
+	output := buf.String()
+	// Completed tasks render before running, running before pending
+	doneIdx := bytes.Index([]byte(output), []byte("done-task"))
+	runIdx := bytes.Index([]byte(output), []byte("running-task"))
+	pendIdx := bytes.Index([]byte(output), []byte("pending-task"))
+
+	assert.Less(t, doneIdx, runIdx,
+		"done should appear before running")
+	assert.Less(t, runIdx, pendIdx,
+		"running should appear before pending")
+}
+
+func TestTaskList_WithCanvas(t *testing.T) {
+	tl := NewTaskList(nil)
+	var buf bytes.Buffer
+	c := NewCanvas().WithWriter(&buf)
+	defer c.Close()
+
+	result := tl.WithCanvas(c)
+	assert.Equal(t, tl, result)
+}
+
+// --- Spinner tests ---
+
+func TestNewSpinner_defaults(t *testing.T) {
+	s := NewSpinner(&SpinnerOptions{Writer: io.Discard})
+	require.NotNil(t, s)
+	assert.Equal(t, "Loading...", s.text)
+	assert.Len(t, s.options.Animation, 4)
+	assert.Equal(
+		t, 250*time.Millisecond, s.options.Interval,
+	)
+}
+
+func TestNewSpinner_custom_text(t *testing.T) {
+	s := NewSpinner(&SpinnerOptions{Text: "Please wait", Writer: io.Discard})
+	require.NotNil(t, s)
+	assert.Equal(t, "Please wait", s.text)
+}
+
+func TestSpinner_UpdateText(t *testing.T) {
+	s := NewSpinner(&SpinnerOptions{Writer: io.Discard})
+	s.UpdateText("new text")
+	assert.Equal(t, "new text", s.text)
+}
+
+func TestSpinner_Render(t *testing.T) {
+	var buf bytes.Buffer
+	printer := NewPrinter(&buf)
+
+	s := NewSpinner(&SpinnerOptions{
+		Text:      "Working...",
+		Animation: []string{"|", "/", "-", "\\"},
+		Writer:    io.Discard,
+	})
+
+	err := s.Render(printer)
+	require.NoError(t, err)
+
+	output := buf.String()
+	assert.Contains(t, output, "Working...")
+}
+
+func TestSpinner_Render_cycles_animation(t *testing.T) {
+	s := NewSpinner(&SpinnerOptions{
+		Animation: []string{"a", "b", "c"},
+		Writer:    io.Discard,
+	})
+
+	// Render multiple times to cycle through animation
+	for range 3 {
+		var buf bytes.Buffer
+		printer := NewPrinter(&buf)
+		err := s.Render(printer)
+		require.NoError(t, err)
+	}
+
+	// After 3 renders, index should wrap back to 0
+	assert.Equal(t, 0, s.animationIndex)
+}
+
+func TestSpinner_Render_clear_returns_nil(t *testing.T) {
+	var buf bytes.Buffer
+	printer := NewPrinter(&buf)
+
+	s := NewSpinner(&SpinnerOptions{Writer: io.Discard})
+	s.clear = true
+
+	err := s.Render(printer)
+	require.NoError(t, err)
+	assert.Empty(t, buf.String())
+}
+
+func TestSpinner_WithCanvas(t *testing.T) {
+	s := NewSpinner(&SpinnerOptions{Writer: io.Discard})
+	var buf bytes.Buffer
+	c := NewCanvas().WithWriter(&buf)
+	defer c.Close()
+
+	result := s.WithCanvas(c)
+	assert.Equal(t, s, result)
+}
+
+func TestSpinner_WithCanvas_nil(t *testing.T) {
+	s := NewSpinner(&SpinnerOptions{Writer: io.Discard})
+	result := s.WithCanvas(nil)
+	assert.Equal(t, s, result)
+	assert.Nil(t, s.canvas)
+}

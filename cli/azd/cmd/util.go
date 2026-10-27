@@ -7,302 +7,172 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
-	"sort"
 	"strings"
+	"time"
 
 	"github.com/AlecAivazis/survey/v2"
-	"github.com/azure/azure-dev/cli/azd/internal/telemetry"
-	"github.com/azure/azure-dev/cli/azd/pkg/azureutil"
-	"github.com/azure/azure-dev/cli/azd/pkg/environment"
-	"github.com/azure/azure-dev/cli/azd/pkg/environment/azdcontext"
+	"github.com/azure/azure-dev/cli/azd/internal/tracing"
+	azdExec "github.com/azure/azure-dev/cli/azd/pkg/exec"
 	"github.com/azure/azure-dev/cli/azd/pkg/input"
-	"github.com/azure/azure-dev/cli/azd/pkg/tools/azcli"
+	"github.com/azure/azure-dev/cli/azd/pkg/output"
+	"github.com/azure/azure-dev/cli/azd/pkg/project"
+	"github.com/cli/browser"
 )
 
-type Asker func(p survey.Prompt, response interface{}) error
+// CmdAnnotations on a command
+type CmdAnnotations map[string]string
 
-const (
-	manualSubscriptionEntryOption = "Other (enter manually)"
-)
+// CmdCalledAs provides access to the cmd.CalledAs() value through dependency injection
+type CmdCalledAs string
 
-func invalidEnvironmentNameMsg(environmentName string) string {
-	return fmt.Sprintf("environment name '%s' is invalid (it should contain only alphanumeric characters and hyphens)\n", environmentName)
+type Asker func(p survey.Prompt, response any) error
+
+func serviceNameWarningCheck(console input.Console, serviceNameFlag string, commandName string) {
+	if serviceNameFlag == "" {
+		return
+	}
+
+	fmt.Fprintln(
+		console.Handles().Stderr,
+		output.WithWarningFormat("WARNING: The `--service` flag is deprecated and will be removed in a future release."),
+	)
+	fmt.Fprintf(console.Handles().Stderr, "Next time use `azd %s <service>`.\n\n", commandName)
 }
 
-// ensureValidEnvironmentName ensures the environment name is valid, if it is not, an error is printed
-// and the user is prompted for a new name.
-func ensureValidEnvironmentName(ctx context.Context, environmentName *string, console input.Console) error {
-	for !environment.IsValidEnvironmentName(*environmentName) {
-		userInput, err := console.Prompt(ctx, input.ConsoleOptions{
-			Message: "Please enter a new environment name:",
+func getTargetServiceName(
+	ctx context.Context,
+	projectManager project.ProjectManager,
+	importManager *project.ImportManager,
+	projectConfig *project.ProjectConfig,
+	commandName string,
+	targetServiceName string,
+	allFlagValue bool,
+) (string, error) {
+	if allFlagValue && targetServiceName != "" {
+		return "", fmt.Errorf("cannot specify both --all and <service>")
+	}
+
+	if !allFlagValue && targetServiceName == "" {
+		targetService, err := projectManager.DefaultServiceFromWd(ctx, projectConfig)
+		if errors.Is(err, project.ErrNoDefaultService) {
+			return "", fmt.Errorf(
+				"current working directory is not a project or service directory. Specify a service name to %s a service, "+
+					"or specify --all to %s all services",
+				commandName,
+				commandName,
+			)
+		} else if err != nil {
+			return "", err
+		}
+
+		if targetService != nil {
+			targetServiceName = targetService.Name
+		}
+	}
+
+	if targetServiceName != "" {
+		if has, err := importManager.HasService(ctx, projectConfig, targetServiceName); err != nil {
+			return "", err
+		} else if !has {
+			return "", fmt.Errorf("service name '%s' doesn't exist", targetServiceName)
+		}
+	}
+
+	return targetServiceName, nil
+}
+
+// Calculate the total time since t, excluding user interaction time.
+func since(t time.Time) time.Duration {
+	userInteractTime := tracing.InteractTimeMs.Load()
+	return time.Since(t) - time.Duration(userInteractTime)*time.Millisecond
+}
+
+// browseUrl defines a function signature for opening URLs in a browser.
+type browseUrl func(ctx context.Context, console input.Console, url string)
+
+// browserOverrideKey is the context key for per-request browser override functions.
+type browserOverrideKey struct{}
+
+// WithBrowserOverride returns a context carrying a custom browser-opening function.
+// Tests use this to capture URLs without launching a real browser.
+func WithBrowserOverride(ctx context.Context, fn browseUrl) context.Context {
+	return context.WithValue(ctx, browserOverrideKey{}, fn)
+}
+
+func openWithDefaultBrowser(ctx context.Context, console input.Console, url string) {
+	if fn, ok := ctx.Value(browserOverrideKey{}).(browseUrl); ok && fn != nil {
+		fn(ctx, console, url)
+		return
+	}
+
+	cmdRunner := azdExec.NewCommandRunner(nil)
+
+	// In Codespaces and devcontainers a $BROWSER environment variable is
+	// present whose value is an executable that launches the browser when
+	// called with the form:
+	// $BROWSER <url>
+	const BrowserEnvVarName = "BROWSER"
+
+	if envBrowser := os.Getenv(BrowserEnvVarName); len(envBrowser) > 0 {
+		_, err := cmdRunner.Run(ctx, azdExec.RunArgs{
+			Cmd:  envBrowser,
+			Args: []string{url},
 		})
-
-		if err != nil {
-			return fmt.Errorf("reading environment name: %w", err)
+		if err == nil {
+			return
 		}
-
-		*environmentName = userInput
-
-		if !environment.IsValidEnvironmentName(*environmentName) {
-			fmt.Print(invalidEnvironmentNameMsg(*environmentName))
-		}
+		log.Printf(
+			"warning: failed to open browser configured by $BROWSER: %s\nTrying with default browser.\n",
+			err.Error(),
+		)
 	}
 
-	return nil
+	err := browser.OpenURL(url)
+	if err == nil {
+		return
+	}
+
+	log.Printf(
+		"warning: failed to open default browser: %s\nTrying manual launch.", err.Error(),
+	)
+
+	// wsl manual launch. Trying cmd first, and pwsh second
+	_, err = cmdRunner.Run(ctx, azdExec.RunArgs{
+		Cmd: "cmd.exe",
+		// cmd notes:
+		// /c -> run command
+		// /s -> quoted string, use the text within the quotes as it is
+		// Replace `&` for `^&` -> cmd require to scape the & to avoid using it as a command concat
+		Args: []string{
+			"/s", "/c", fmt.Sprintf("start %s", strings.ReplaceAll(url, "&", "^&")),
+		},
+	})
+	if err == nil {
+		return
+	}
+	log.Printf(
+		"warning: failed to open browser with cmd: %s\nTrying powershell.", err.Error(),
+	)
+
+	_, err = cmdRunner.Run(ctx, azdExec.RunArgs{
+		Cmd: "powershell.exe",
+		Args: []string{
+			"-NoProfile", "-Command", "Start-Process", fmt.Sprintf("\"%s\"", url),
+		},
+	})
+	if err == nil {
+		return
+	}
+
+	log.Printf("warning: failed to use manual launch: %v\n", err)
+	console.Message(ctx, fmt.Sprintf("azd was unable to open the next url. Please try it manually: %s", url))
 }
 
-type environmentSpec struct {
-	environmentName string
-	subscription    string
-	location        string
-}
+type envFlagKey string
 
-// createEnvironment creates a new named environment. If an environment with this name already
-// exists, and error is return.
-func createAndInitEnvironment(ctx context.Context, envSpec *environmentSpec, azdCtx *azdcontext.AzdContext, console input.Console) (*environment.Environment, context.Context, error) {
-	if envSpec.environmentName != "" && !environment.IsValidEnvironmentName(envSpec.environmentName) {
-		errMsg := invalidEnvironmentNameMsg(envSpec.environmentName)
-		fmt.Print(errMsg)
-		return nil, nil, fmt.Errorf(errMsg)
-	}
+// envFlagCtxKey is the context key for internal.EnvFlag
+var envFlagCtxKey envFlagKey = "envFlag"
 
-	if err := ensureValidEnvironmentName(ctx, &envSpec.environmentName, console); err != nil {
-		return nil, nil, err
-	}
-
-	// Ensure the environment does not already exist:
-	env, err := environment.GetEnvironment(azdCtx, envSpec.environmentName)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-	case err != nil:
-		return nil, nil, fmt.Errorf("checking for existing environment: %w", err)
-	case err == nil:
-		return nil, nil, fmt.Errorf("environment '%s' already exists", envSpec.environmentName)
-	}
-
-	if err := ensureEnvironmentInitialized(ctx, *envSpec, env, console); err != nil {
-		return nil, nil, fmt.Errorf("initializing environment: %w", err)
-	}
-
-	return env, telemetry.ContextWithEnvironment(ctx, env), nil
-}
-
-func loadOrInitEnvironment(ctx context.Context, environmentName *string, azdCtx *azdcontext.AzdContext, console input.Console) (*environment.Environment, context.Context, error) {
-	loadOrCreateEnvironment := func() (*environment.Environment, bool, error) {
-		// If there's a default environment, use that
-		if *environmentName == "" {
-			var err error
-			*environmentName, err = azdCtx.GetDefaultEnvironmentName()
-			if err != nil {
-				return nil, false, fmt.Errorf("getting default environment: %w", err)
-			}
-		}
-
-		if *environmentName != "" {
-			env, err := environment.GetEnvironment(azdCtx, *environmentName)
-			switch {
-			case errors.Is(err, os.ErrNotExist):
-				msg := fmt.Sprintf("Environment '%s' does not exist, would you like to create it?", *environmentName)
-				shouldCreate, promptErr := console.Confirm(ctx, input.ConsoleOptions{
-					Message:      msg,
-					DefaultValue: true,
-				})
-				if promptErr != nil {
-					return nil, false, fmt.Errorf("prompting to create environment '%s': %w", *environmentName, promptErr)
-				}
-				if !shouldCreate {
-					return nil, false, fmt.Errorf("environment '%s' not found: %w", *environmentName, err)
-				}
-			case err != nil:
-				return nil, false, fmt.Errorf("loading environment '%s': %w", *environmentName, err)
-			case err == nil:
-				return env, false, nil
-			}
-		}
-
-		// Two cases if we get to here:
-		// - The user has not specified an environment name (and there was no default environment set)
-		// - The user has specified an environment name, but the named environment didn't exist and they told us they would
-		//   like us to create it.
-		if *environmentName != "" && !environment.IsValidEnvironmentName(*environmentName) {
-			fmt.Printf("environment name '%s' is invalid (it should contain only alphanumeric characters and hyphens)\n", *environmentName)
-			return nil, false, fmt.Errorf("environment name '%s' is invalid (it should contain only alphanumeric characters and hyphens)", *environmentName)
-		}
-
-		if err := ensureValidEnvironmentName(ctx, environmentName, console); err != nil {
-			return nil, false, err
-		}
-
-		return environment.EmptyWithFile(azdCtx.GetEnvironmentFilePath(*environmentName)), true, nil
-	}
-
-	env, isNew, err := loadOrCreateEnvironment()
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-		return nil, nil, fmt.Errorf("environment %s does not exist", *environmentName)
-	case err != nil:
-		return nil, nil, err
-	}
-
-	if err := ensureEnvironmentInitialized(ctx, environmentSpec{environmentName: *environmentName}, env, console); err != nil {
-		return nil, nil, fmt.Errorf("initializing environment: %w", err)
-	}
-
-	if isNew {
-		if err := azdCtx.SetDefaultEnvironmentName(*environmentName); err != nil {
-			return nil, nil, fmt.Errorf("saving default environment name: %w", err)
-		}
-	}
-
-	return env, telemetry.ContextWithEnvironment(ctx, env), nil
-}
-
-// ensureEnvironmentInitialized ensures the environment is initialized, i.e. it contains values for `AZURE_ENV_NAME`, `AZURE_LOCATION`, `AZURE_SUBSCRIPTION_ID` and `AZURE_PRINCIPAL_ID`.
-// It will use the values from the "environment spec" passed in, and prompt for any missing values as necessary.
-// Existing environment value are left unchanged, even if the "spec" has different values.
-func ensureEnvironmentInitialized(ctx context.Context, envSpec environmentSpec, env *environment.Environment, console input.Console) error {
-	if env.Values == nil {
-		env.Values = make(map[string]string)
-	}
-
-	hasValue := func(key string) bool {
-		val, has := env.Values[key]
-		return has && val != ""
-	}
-
-	hasEnvName := hasValue(environment.EnvNameEnvVarName)
-	hasLocation := hasValue(environment.LocationEnvVarName)
-	hasSubID := hasValue(environment.SubscriptionIdEnvVarName)
-	hasPrincipalID := hasValue(environment.PrincipalIdEnvVarName)
-
-	if hasEnvName && hasLocation && hasSubID && hasPrincipalID {
-		return nil
-	}
-
-	if !hasEnvName && envSpec.environmentName != "" {
-		env.SetEnvName(envSpec.environmentName)
-	}
-
-	needAzureInteraction := !hasSubID || !hasLocation || !hasPrincipalID
-	if needAzureInteraction {
-		if err := ensureLoggedIn(ctx); err != nil {
-			return fmt.Errorf("logging in: %w", err)
-		}
-	}
-
-	if !hasLocation && envSpec.location != "" {
-		env.SetLocation(envSpec.location)
-	} else {
-		location, err := azureutil.PromptLocation(ctx, "Please select an Azure location to use:")
-		if err != nil {
-			return fmt.Errorf("prompting for location: %w", err)
-		}
-		env.SetLocation(strings.TrimSpace(location))
-	}
-
-	if !hasSubID && envSpec.subscription != "" {
-		env.SetSubscriptionId(envSpec.subscription)
-	} else {
-		subscriptionOptions, defaultSubscription, err := getSubscriptionOptions(ctx)
-		if err != nil {
-			return err
-		}
-
-		var subscriptionId = ""
-		for subscriptionId == "" {
-			subscriptionSelectionIndex, err := console.Select(ctx, input.ConsoleOptions{
-				Message:      "Please select an Azure Subscription to use:",
-				Options:      subscriptionOptions,
-				DefaultValue: defaultSubscription,
-			})
-
-			if err != nil {
-				return fmt.Errorf("reading subscription id: %w", err)
-			}
-
-			subscriptionSelection := subscriptionOptions[subscriptionSelectionIndex]
-
-			if subscriptionSelection == manualSubscriptionEntryOption {
-				subscriptionId, err = console.Prompt(ctx, input.ConsoleOptions{
-					Message: "Enter an Azure Subscription to use:",
-				})
-
-				if err != nil {
-					return fmt.Errorf("reading subscription id: %w", err)
-				}
-			} else {
-				subscriptionId = subscriptionSelection[len(subscriptionSelection)-len("(00000000-0000-0000-0000-000000000000)")+1 : len(subscriptionSelection)-1]
-			}
-		}
-
-		env.SetSubscriptionId(strings.TrimSpace(subscriptionId))
-	}
-
-	if !hasPrincipalID {
-		principalID, err := azureutil.GetCurrentPrincipalId(ctx)
-		if err != nil {
-			return fmt.Errorf("fetching current user information: %w", err)
-		}
-		env.SetPrincipalId(principalID)
-	}
-
-	if err := env.Save(); err != nil {
-		return fmt.Errorf("saving environment: %w", err)
-	}
-
-	return nil
-}
-
-func getSubscriptionOptions(ctx context.Context) ([]string, string, error) {
-	azCli := azcli.GetAzCli(ctx)
-	subscriptionInfos, err := azCli.ListAccounts(ctx)
-	if err != nil {
-		return nil, "", fmt.Errorf("listing accounts: %w", err)
-	}
-
-	sort.Sort(azureutil.Subs(subscriptionInfos))
-
-	// If `AZURE_SUBSCRIPTION_ID` is set in the environment, use it to influence
-	// the default option in our prompt. Fall back to the what the `az` CLI is
-	// configured to use if the environment variable is unset.
-	defaultSubscriptionId := os.Getenv(environment.SubscriptionIdEnvVarName)
-	if defaultSubscriptionId == "" {
-		for _, info := range subscriptionInfos {
-			if info.IsDefault {
-				defaultSubscriptionId = info.Id
-			}
-		}
-	}
-
-	var subscriptionOptions = make([]string, len(subscriptionInfos)+1)
-	var defaultSubscription string = ""
-
-	for index, info := range subscriptionInfos {
-		subscriptionOptions[index] = fmt.Sprintf("%2d. %s (%s)", index+1, info.Name, info.Id)
-
-		if info.Id == defaultSubscriptionId {
-			defaultSubscription = subscriptionOptions[index]
-		}
-	}
-
-	subscriptionOptions[len(subscriptionOptions)-1] = manualSubscriptionEntryOption
-	return subscriptionOptions, defaultSubscription, nil
-}
-
-var (
-	errNoProject = errors.New("no project exists; to create a new project, run `azd init`.")
-)
-
-// ensureProject ensures that a project file exists, using the given
-// context. If a project is missing, errNoProject is returned.
-func ensureProject(path string) error {
-	_, err := os.Stat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return errNoProject
-	} else if err != nil {
-		return fmt.Errorf("checking for project: %w", err)
-	}
-
-	return nil
-}
+const referenceDocumentationUrl = "https://learn.microsoft.com/azure/developer/azure-developer-cli/reference#"

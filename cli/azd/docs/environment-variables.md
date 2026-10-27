@@ -1,0 +1,377 @@
+# Environment Variables
+
+Comprehensive reference of environment variables used by `azd`.
+
+For environment variables that accept a boolean, the values `1, t, T, TRUE, true, True` are accepted
+as "true"; the values `0, f, F, FALSE, false, False` are all accepted as "false".
+
+## Core Azure Variables
+
+These variables are typically set by infrastructure provisioning outputs and stored in the `.env` file
+for each environment.
+
+| Variable | Description |
+| --- | --- |
+| `AZURE_ENV_NAME` | The name of the active azd environment. |
+| `AZURE_LOCATION` | The default Azure region for resource deployment. |
+| `AZURE_SUBSCRIPTION_ID` | The Azure subscription ID used for deployment. |
+| `AZURE_TENANT_ID` | The Microsoft Entra tenant ID. |
+| `AZURE_PRINCIPAL_ID` | The object ID of the signed-in principal. |
+| `AZURE_PRINCIPAL_TYPE` | The type of the signed-in principal (e.g., `User`, `ServicePrincipal`). |
+| `AZURE_RESOURCE_GROUP` | The default resource group name. |
+| `AZURE_CONTAINER_REGISTRY_ENDPOINT` | The endpoint of the Azure Container Registry. |
+| `AZURE_CONTAINER_APPS_ENVIRONMENT_DEFAULT_DOMAIN` | The default domain of the Container Apps environment. |
+| `AZURE_APP_SERVICE_DASHBOARD_URI` | The URI for the Aspire dashboard hosted on Azure App Service. |
+| `AZURE_AKS_CLUSTER_NAME` | The name of the Azure Kubernetes Service cluster. |
+
+## Dev Center Variables
+
+Variables for [Azure Dev Center](https://learn.microsoft.com/azure/dev-box/overview-what-is-microsoft-dev-box)
+integration.
+
+| Variable | Description |
+| --- | --- |
+| `AZURE_DEVCENTER_NAME` | The name of the Dev Center instance. |
+| `AZURE_DEVCENTER_PROJECT` | The Dev Center project name. |
+| `AZURE_DEVCENTER_CATALOG` | The catalog name within Dev Center. |
+| `AZURE_DEVCENTER_ENVIRONMENT_TYPE` | The environment type in Dev Center (e.g., `Dev`, `Test`, `Prod`). |
+| `AZURE_DEVCENTER_ENVIRONMENT_DEFINITION` | The environment definition name. |
+| `AZURE_DEVCENTER_ENVIRONMENT_USER` | The user identity for the Dev Center environment. |
+
+## General Configuration
+
+| Variable | Description |
+| --- | --- |
+| `AZD_CONFIG_DIR` | The file path of the user-level configuration directory. |
+| `AZD_DEMO_MODE` | If true, enables demo mode. This hides personal output, such as subscription IDs, from being displayed in output. |
+| `AZD_FORCE_TTY` | If true, forces `azd` to write terminal-style output. |
+| `AZD_NON_INTERACTIVE` | Controls no-prompt mode. Accepts a boolean (`true`, `false`, `1`, `0`); other values are ignored with a warning. Set to `true` (or `1`) to run without interactive prompts (equivalent to `--no-prompt`). `azd` also auto-enables no-prompt mode in CI/CD and for AI-agent invocations without an interactive terminal. Agent markers inherited by an interactive terminal do not disable prompts. Set `AZD_NON_INTERACTIVE=false` to opt out of automatic enablement. Note that some commands still avoid interactive prompts in CI/CD by design, independent of this variable. Explicit `--no-prompt`/`--non-interactive` flags take precedence over this variable. |
+| `AZD_IN_CLOUDSHELL` | If true, `azd` runs with Azure Cloud Shell specific behavior. |
+| `AZD_SKIP_UPDATE_CHECK` | If true, skips the out-of-date update check output that is typically printed at the end of the command. |
+| `AZD_SKIP_FIRST_RUN` | Reserved for the dormant first-run tool setup and background update experience. This variable has no effect while those middleware components are not registered. |
+| `AZD_CONTAINER_RUNTIME` | Selects `docker` or `podman`. If unset or empty, azd prefers Docker on PATH, then Podman. Selection is cached on first use for each container CLI instance; version and daemon readiness checks are repeated when needed. Other values fail the runtime installation check. |
+| `AZD_ALLOW_NON_EMPTY_FOLDER` | If set, allows `azd init` to run in a non-empty directory without prompting. |
+| `AZD_BUILDER_IMAGE` | The builder docker image used to perform Dockerfile-less builds. |
+| `AZD_CONCURRENCY_MAX` | Hard maximum number of graph steps that can run at once during `azd up`, `azd deploy`, or `azd provision`. Values saved in the active azd environment take precedence over process environment values. When unset, the command-specific concurrency variable is the hard maximum: `AZD_UP_CONCURRENCY` (then `AZD_DEPLOY_CONCURRENCY`) for `azd up`, `AZD_DEPLOY_CONCURRENCY` for `azd deploy`, or `AZD_PROVISION_CONCURRENCY` for `azd provision`. When all are unset, the scheduler uses `min(stepCount, GOMAXPROCS*2)`. Set to `1` to serialize all graph steps, including package and publish operations for .NET projects that share custom build-output paths. |
+| `AZD_PACKAGE_CONCURRENCY` | Maximum number of service package steps that can run at once during `azd up` or `azd deploy`. Falls back to `AZD_UP_CONCURRENCY` for `azd up` and `AZD_DEPLOY_CONCURRENCY` for `azd deploy`. Standalone `azd package` remains sequential. |
+| `AZD_PROVISION_CONCURRENCY` | Maximum number of infrastructure layer provision steps that can run at once during `azd provision` or `azd up`. Falls back to `AZD_UP_CONCURRENCY` during `azd up`. During `azd provision`, it is also the hard maximum when `AZD_CONCURRENCY_MAX` is unset. |
+| `AZD_DEPLOY_CONCURRENCY` | Maximum combined number of service publish and deploy steps that can run at once during `azd deploy` or `azd up`. It is also the package-step fallback and hard maximum for `azd deploy` when `AZD_CONCURRENCY_MAX` is unset. During `azd up`, it falls back to `AZD_UP_CONCURRENCY` for the group limit, and it remains the last hard-maximum fallback when `AZD_CONCURRENCY_MAX` and `AZD_UP_CONCURRENCY` are both unset. Without service `uses:` edges, deploy steps remain sequential in alphabetical order, but publish steps can still run in parallel (see [concurrency model](concurrency-model.md)). |
+| `AZD_UP_CONCURRENCY` | Fallback maximum for each package, provision, and combined publish/deploy phase during `azd up`. It is also the hard maximum for the full `azd up` graph when `AZD_CONCURRENCY_MAX` is unset. |
+| `AZD_DEPLOY_TIMEOUT` | Timeout for deployment operations, parsed as an integer number of seconds (for example, `1200`). Defaults to `1200` seconds (20 minutes). |
+| `AZD_DEPLOYMENT_ID_FILE` | Absolute path of a file where `azd` writes ARM deployment IDs in NDJSON format (one JSON line per layer) during `azd provision` or `azd up`. The file is truncated at the start of each provisioning run, and each infrastructure layer appends one line as its ARM deployment starts. Each line has the shape `{"deploymentId":"/subscriptions/.../deployments/<name>","layer":"<layer-name>"}` — the `layer` field is empty for non-layered (single-module) provisioning. Consumers should tail/watch the file and parse each line independently; unknown fields must be ignored for forward compatibility. The path must be absolute (relative paths are ignored); the containing directory must already exist and be writable. Lines are only appended when an ARM deployment is actually started — runs short-circuited by the deployment-state cache or canceled by provision validation do not produce output. A process-wide mutex serializes writes so each line is always complete. If the file cannot be written (for example, the parent directory does not exist, the path is not writable, or the path points to a directory rather than a file), provisioning continues and the failure is recorded via the standard log; that output is only visible when `--debug` or `AZD_DEBUG_LOG` is enabled. On Windows, consumers should use a file-watcher pattern that does not keep a read handle open, otherwise new appends may fail. Only Bicep deployments are supported. |
+| `AZD_DEPLOY_{SERVICE}_SLOT_NAME` | Sets the App Service deployment slot target for a service. Replace `{SERVICE}` with the uppercase service name (hyphens become underscores). Set to `production` to deploy to the main app, or a slot name (e.g., `staging`). When slots exist and this is not set, `--no-prompt` mode fails with an error listing available targets. Applies to `host: appservice` only; Function Apps always deploy to the main site. |
+| `AZD_DEPLOY_{SERVICE}_SKIP_STATUS_CHECK` | If `true`, skips deployment status tracking for the named Linux App Service after the zip deployment request is accepted. By default, azd waits up to five minutes without a deployment status change. Each new status resets the five-minute wait. If the status remains unchanged, azd completes deployment with a warning. Useful when the target web app is intentionally stopped. Parsed as a boolean (`true`/`false`/`1`/`0`). `{SERVICE}` follows the same naming rules as `AZD_DEPLOY_{SERVICE}_SLOT_NAME`. |
+
+All concurrency variables are parsed as positive integers and clamped to `64`. If a variable is explicitly set to an invalid or non-positive value, its limit is disabled and azd does not consult that variable's fallback. Fallback occurs only when the higher-precedence variable is unset.
+
+## AI Agent Detection
+
+`azd` detects when it is launched by a known AI coding agent and records the agent for telemetry. Unless explicitly overridden, agent detection automatically enables no-prompt mode when stdin and stdout are not attached to an interactive terminal. An inherited agent marker does not disable prompts in an interactive terminal. Detection checks the environment-variable markers below first, followed by known substrings in [`AZURE_DEV_USER_AGENT`](#telemetry--tracing), and then parent-process names.
+
+These markers are normally set by the agents; `azd` only reads them. When several markers are set,
+the first matching row wins. Exact-value markers must match the documented string and do not use the
+general boolean parsing convention. All other markers must contain a non-empty value.
+
+Claude Code sets `CLAUDECODE=1` in all spawned subprocesses and in IDE-integrated terminals. `azd` uses it for agent attribution, while actual terminal capabilities determine whether prompting is available. When `CLAUDE_CODE_ENTRYPOINT` is exactly `claude-desktop` or `claude-vscode`, `azd` records the corresponding fixed Claude host value. Other entrypoint values fall back to `Claude Code` and are never emitted directly. This host refinement is best-effort because Anthropic does not document the environment variable as a compatibility contract.
+
+When the detected agent determines `execution.environment`, `azd` records only the fixed base value
+in the last column; fixed environment modifiers may be appended. Marker values are not added to
+telemetry by the agent-detection path.
+
+| Variable | Match | Detected agent (`execution.environment`) |
+| --- | --- | --- |
+| `AI_AGENT` | Exactly `github_copilot_app_agent` | GitHub Copilot App |
+| `AI_AGENT` | Exactly `github_copilot_vscode_agent` | GitHub Copilot VSCode |
+| `AI_AGENT` | Exactly `github_copilot_cloud_agent` | GitHub Copilot Cloud Agent |
+| `AI_AGENT` | Exactly `pi` | Pi |
+| `CODEX_INTERNAL_ORIGINATOR_OVERRIDE` | Exactly `Codex Desktop` | Codex Desktop |
+| `CODEX_CI` | Exactly `1` | Codex |
+| `CODEX_THREAD_ID` | Non-empty | Codex |
+| `CODEX_SESSION_ID` | Non-empty | Codex |
+| `CURSOR_AGENT` | Exactly `1` | Cursor |
+| `CURSOR_CONVERSATION_ID` | Non-empty | Cursor |
+| `ANTIGRAVITY_AGENT` | Exactly `1` | Antigravity |
+| `ANTIGRAVITY_CONVERSATION_ID` | Non-empty | Antigravity |
+| `CLAUDECODE` | Exactly `1` | Claude Code |
+| `CLAUDE_CODE_ENTRYPOINT` | Exactly `claude-desktop` or `claude-vscode`, with `CLAUDECODE=1` | Claude Code Desktop or Claude Code VSCode |
+| `COPILOT_CLI` | Non-empty | GitHub Copilot CLI |
+| `GEMINI_CLI` | Non-empty | Gemini |
+| `GEMINI_CLI_NO_RELAUNCH` | Non-empty | Gemini |
+| `OPENCODE` | Non-empty | OpenCode |
+
+Antigravity's shell tool was validated with PTY-backed stdin and stdout by running local-only
+`azd env new`, `azd env select`, and `azd env remove` prompts. Text input, list selection, and
+confirmation all completed without EOF, hangs, duplicated rendering, or lost responses.
+
+As a last resort, parent-process detection recognizes the exact Antigravity executable name `agy`,
+along with the `codex`, `claude`, `gemini`, `opencode`, and GitHub Copilot CLI executable names.
+It intentionally does not recognize `Cursor.exe`, because that name also identifies the regular
+Cursor desktop application.
+
+## azd exec
+
+The `azd exec` command runs commands and scripts with the active azd environment loaded into the child
+process. All environment variables from the `.env` file (including provisioning outputs) are injected
+automatically. Key Vault secret references (`akvs://` and `@Microsoft.KeyVault(SecretUri=...)`) are
+resolved transparently before injection.
+
+### Execution Modes
+
+`azd exec` selects an execution mode based on the arguments provided:
+
+| Mode | Trigger | Example |
+| --- | --- | --- |
+| **Script file** | First argument is an existing file | `azd exec ./setup.sh` |
+| **Direct exec** | Multiple arguments, no `--shell` flag | `azd exec python script.py` |
+| **Shell inline** | Single argument, or `--shell` specified | `azd exec 'echo $AZURE_ENV_NAME'` |
+
+**Direct exec** passes the exact argument vector to the child process without shell wrapping, which
+avoids quoting and escaping issues. **Shell inline** wraps the argument with the detected (or
+specified) shell's `-c` flag. **Script file** detects the shell from the file extension (`.sh` →
+bash, `.ps1` → pwsh, `.cmd`/`.bat` → cmd).
+
+### Flags
+
+| Flag | Description |
+| --- | --- |
+| `--shell`, `-s` | Shell to use (`bash`, `sh`, `zsh`, `pwsh`, `powershell`, `cmd`). Auto-detected if not specified. |
+| `--interactive`, `-i` | Run in interactive mode (connects stdin to the child process). |
+| `--environment`, `-e` | The azd environment to load. |
+
+## Extension Variables
+
+These variables are set and consumed by azd extension hosts (for example, IDE/editor integrations)
+and the azd extension framework. They are not intended to be configured as general CLI settings.
+
+| Variable | Description |
+| --- | --- |
+| `AZD_NO_PROMPT` | If true, disables interactive prompts. Typically set by extension hosts for non-interactive behavior. |
+| `AZD_ENVIRONMENT` | The azd environment name provided by the extension host when invoking azd. |
+| `AZD_CWD` | The working directory path used by the extension host when invoking azd. |
+| `AZD_SERVER` | The address (e.g., `localhost:12345`) of the azd extension server for gRPC communication. Injected and consumed by the extension framework; not typically set by users directly. |
+| `AZD_ACCESS_TOKEN` | A JWT used to authenticate gRPC calls to the azd extension server. Injected and consumed by the extension framework; not typically set by users directly. |
+
+## Alpha Features
+
+| Variable | Description |
+| --- | --- |
+| `AZD_ALPHA_ENABLE_ALL` | Enables all alpha features at once. |
+| `AZD_ALPHA_ENABLE_<name>` | Enables or disables an alpha feature. `<name>` is the upper-cased name of the feature, with dot `.` characters replaced by underscore `_` characters. |
+
+## External Authentication
+
+Variables for [External Authentication](./external-authentication.md) integration.
+
+| Variable | Description |
+| --- | --- |
+| `AZD_AUTH_ENDPOINT` | The [External Authentication](./external-authentication.md) endpoint. Accepts `https://host:port` (loopback HTTPS), `unix:/absolute/path/to/socket` (Linux/macOS Unix domain socket; `AZD_AUTH_CERT` must not be set), or `npipe:<pipe-name>` / `npipe://./pipe/<pipe-name>` / `npipe:////./pipe/<pipe-name>` (Windows-only named pipe; `AZD_AUTH_CERT` must not be set). Named-pipe owners and ACLs are validated; the Windows default read-only Everyone/Anonymous ACEs are accepted, but broader access is refused. |
+| `AZD_AUTH_KEY` | The [External Authentication](./external-authentication.md) shared key. Required for all schemes (`https:`, `unix:`, `npipe:`); sent as `Authorization: Bearer`. |
+| `AZD_AUTH_CERT` | The optional [External Authentication](./external-authentication.md) server certificate, provided as a base64-encoded DER certificate string. When set, `AZD_AUTH_ENDPOINT` must use `https:` and `azd` pins the connection to this certificate. MUST NOT be set when `AZD_AUTH_ENDPOINT` uses `unix:` or `npipe:`. |
+
+## Tool Configuration
+
+For tools that are auto-acquired by `azd`, the following environment variables configure the path to a
+specific version of the tool installed on the machine.
+
+| Variable | Description |
+| --- | --- |
+| `AZD_BICEP_TOOL_PATH` | The Bicep tool override path. The direct path to `bicep` or `bicep.exe`. |
+| `AZD_GH_TOOL_PATH` | The `gh` tool override path. The direct path to `gh` or `gh.exe`. |
+| `AZD_PACK_TOOL_PATH` | The `pack` tool override path. The direct path to `pack` or `pack.exe`. |
+| `AZD_COPILOT_CLI_PATH` | The Copilot CLI tool override path. When set, skips automatic download and uses the specified path. |
+
+### GitHub Repository Access
+
+These GitHub-compatible variables are used when `azd init --template` checks repository metadata before cloning.
+Metadata requests are unauthenticated when no matching token is set.
+
+| Variable | Description |
+| --- | --- |
+| `GH_TOKEN` | Token used to request repository metadata from `github.com` and GitHub Enterprise Cloud `*.ghe.com` hosts. Takes precedence over `GITHUB_TOKEN`. |
+| `GITHUB_TOKEN` | Token used to request repository metadata from `github.com` and `*.ghe.com` when `GH_TOKEN` is not set. |
+| `GH_HOST` | GitHub Enterprise host recognized for repository metadata checks. |
+| `GITHUB_SERVER_URL` | GitHub server URL recognized for repository metadata checks when `GH_HOST` is not set. |
+| `GH_ENTERPRISE_TOKEN` | Token used to request repository metadata from a recognized GitHub Enterprise Server host. Takes precedence over `GITHUB_ENTERPRISE_TOKEN`. |
+| `GITHUB_ENTERPRISE_TOKEN` | Token used for a recognized GitHub Enterprise Server host when `GH_ENTERPRISE_TOKEN` is not set. |
+
+## Extension Configuration
+
+| Variable | Description |
+| --- | --- |
+| `AZD_EXT_TIMEOUT` | Timeout for extension operations, parsed as an integer number of seconds (for example, `10`). Defaults to `5` seconds; this is not a duration string, so values like `10m` are not valid. |
+| `AZD_EXT_DEBUG` | If true, enables debug output for extensions: azd drops the extension startup timeout so a paused process is not cancelled, and the extension host logs gRPC broker traffic to stderr, falling back to `AZD_DEBUG` when this is unset. Extensions served by `azdext.ExtensionHost`, or that call `azdext.WaitForDebugger` themselves, additionally prompt to attach a debugger before running. |
+| `AZD_EXTENSION_CACHE_TTL` | Time-to-live for extension cache entries, parsed with Go's `time.ParseDuration` format (for example, `30m`, `4h`). Defaults to `4h`. |
+
+## Extension-Specific Variables
+
+> **Note**: These variables are defined and consumed by individual azd extensions. As the extension
+> ecosystem grows, extension-specific variables may move to each extension's own documentation.
+
+### azure.ai.agents
+
+| Variable | Description |
+| --- | --- |
+| `AZURE_AI_PROJECT_ID` | The Microsoft Foundry project resource ID used by the `azure.ai.agents` extension. |
+| `FOUNDRY_PROJECT_ENDPOINT` | The Microsoft Foundry project endpoint used by the `azure.ai.agents` extension. Read first from the active azd environment and, if not present, from the host shell environment as an endpoint-resolution fallback. |
+| `AZURE_AI_PROJECT_PRINCIPAL_ID` | The principal ID associated with the Microsoft Foundry project identity. |
+| `AZURE_AI_ACCOUNT_NAME` | The Microsoft Foundry account name associated with the project. |
+| `AZURE_AI_PROJECT_NAME` | The Microsoft Foundry project name. |
+| `AZURE_AI_MODEL_DEPLOYMENT_NAME` | The default model deployment name used for generated agent code and templates. |
+| `AZURE_AI_PROJECT_ACR_CONNECTION_NAME` | The Azure Container Registry connection name used by the extension for hosted agents. |
+| `AI_PROJECT_DEPLOYMENTS` | JSON-encoded deployment metadata populated by the extension for agent workflows. |
+| `AI_PROJECT_DEPENDENT_RESOURCES` | JSON-encoded dependent resource metadata populated by the extension for agent workflows. |
+| `AZD_AGENT_SKIP_ACR` | If `true`, signals the Bicep template to skip Azure Container Registry creation during provisioning. Automatically set by `azd ai agent init` for code-deploy, pre-built image, and managed voice scenarios. |
+| `ENABLE_HOSTED_AGENTS` | If set, indicates that hosted agents are enabled for the current azd environment. |
+| `ENABLE_CONTAINER_AGENTS` | If set, indicates that container agents are enabled for the current azd environment. |
+| `AGENT_DEFINITION_PATH` | Unsupported for AI agent runtime workflows. Non-empty values are rejected; put the definition on the `azure.ai.agent` service in `azure.yaml` or use its explicit root `$ref`. |
+
+### azure.ai.routines
+
+| Variable | Description |
+| --- | --- |
+| `AZURE_AI_ROUTINES_HTTP_TIMEOUT` | Overrides the `azure.ai.routines` HTTP request timeout when no `--timeout` flag is provided. Parsed with Go's `time.ParseDuration` format (for example, `90s`, `2m`, or `1m30s`) and must be a positive duration. |
+
+## UI Prompt Integration
+
+| Variable | Description |
+| --- | --- |
+| `AZD_UI_PROMPT_ENDPOINT` | The endpoint for external UI prompt service integration. |
+| `AZD_UI_PROMPT_KEY` | The authentication key for the external UI prompt service. |
+| `AZD_UI_NO_PROMPT_DIALOG` | Set to any non-empty value to disable prompt dialog UI. |
+
+## Telemetry & Tracing
+
+| Variable | Description |
+| --- | --- |
+| `AZURE_DEV_COLLECT_TELEMETRY` | If false, disables telemetry collection. Telemetry is enabled by default. |
+| `AZURE_DEV_USER_AGENT` | Appends a custom string to the `User-Agent` header sent with Azure requests. It is also inspected for [AI agent detection](#ai-agent-detection) using case-insensitive substring matching. |
+| `AGENCY_SESSION_ID` | Set by Agency when launching subprocesses. Any non-empty value appends the fixed `agency` modifier to telemetry's `execution.environment`, preserving the primary environment (for example, `GitHub Copilot CLI;agency`). Unset or empty values have no effect. The session ID itself is not emitted. This does not affect agent detection or prompting and is independent of `AZD_DISABLE_AGENT_DETECT`. |
+| `OTEL_RESOURCE_ATTRIBUTES` | Read by the embedded OpenTelemetry SDK, but not supported for customizing azd telemetry. Its attributes are not included in resources exported by azd. |
+| `OTEL_SERVICE_NAME` | Read by the embedded OpenTelemetry SDK, but does not override azd's exported `service.name`, which is always `azd`. |
+| `TRACEPARENT` | The W3C Trace Context `traceparent` header for distributed tracing. Automatically set by `azd` on extension processes for trace propagation. Not typically set by users. |
+| `TRACESTATE` | The W3C Trace Context `tracestate` header for vendor-specific trace data. Automatically set by `azd` alongside `TRACEPARENT`. Not typically set by users. |
+
+Output from OpenTelemetry resource detector settings, including `OTEL_GO_X_RESOURCE`, is not included in resources
+exported to the telemetry queue, `--trace-log-file`, or `--trace-log-url`. This restriction applies to resource
+attributes; declared span attributes are unchanged.
+
+## CI/CD Variables
+
+These variables are read by `azd` to detect and integrate with CI/CD systems.
+
+### Azure Pipelines
+
+| Variable | Description |
+| --- | --- |
+| `TF_BUILD` | Set to `True` when running in Azure Pipelines. |
+| `BUILD_BUILDID` | The build ID in Azure Pipelines. |
+| `BUILD_BUILDNUMBER` | The build number in Azure Pipelines. |
+| `SYSTEM_ACCESSTOKEN` | The access token for Azure Pipelines service connections. |
+| `SYSTEM_TEAMPROJECTID` | The Team Project ID in Azure DevOps. |
+| `SYSTEM_OIDCREQUESTURI` | The OIDC request URI for federated identity in Azure Pipelines. |
+| `AZURESUBSCRIPTION_CLIENT_ID` | The client ID from the Azure service connection. |
+| `AZURESUBSCRIPTION_TENANT_ID` | The tenant ID from the Azure service connection. |
+| `AZURESUBSCRIPTION_SERVICE_CONNECTION_ID` | The service connection ID in Azure DevOps. |
+| `AZURESUBSCRIPTION_SUBSCRIPTION_ID` | The subscription ID from the Azure service connection. |
+
+### GitHub Actions
+
+| Variable | Description |
+| --- | --- |
+| `GITHUB_ACTIONS` | Set to `true` when running in GitHub Actions. |
+| `GITHUB_RUN_ID` | The unique ID of the current GitHub Actions workflow run. |
+| `AZURE_OIDC_TOKEN` | An OIDC token for Azure federated credential authentication. |
+| `AZURE_OIDC_REQUEST_TOKEN` | The request token for Azure OIDC in GitHub Actions. |
+| `AZURE_OIDC_REQUEST_URL` | The request URL for Azure OIDC in GitHub Actions. |
+| `ACTIONS_ID_TOKEN_REQUEST_TOKEN` | The GitHub Actions OIDC request token. |
+| `ACTIONS_ID_TOKEN_REQUEST_URL` | The GitHub Actions OIDC request URL. |
+
+### GitHub Codespaces
+
+| Variable | Description |
+| --- | --- |
+| `CODESPACES` | Set to `true` when running in GitHub Codespaces. Used by `azd` for environment detection and tracing. |
+
+### General CI
+
+| Variable | Description |
+| --- | --- |
+| `CI` | Set to `true` when running in a generic CI environment. |
+
+## Terraform Provider Variables
+
+These variables are used by the Terraform provider integration to authenticate with Azure.
+
+| Variable | Description |
+| --- | --- |
+| `ARM_TENANT_ID` | The Azure tenant ID for Terraform Azure provider. |
+| `ARM_CLIENT_ID` | The Azure client ID for Terraform Azure provider. |
+| `ARM_CLIENT_SECRET` | The Azure client secret for Terraform Azure provider. |
+| `ARM_SUBSCRIPTION_ID` | The Azure subscription ID for Terraform Azure provider. |
+
+## Console & Terminal
+
+| Variable | Description |
+| --- | --- |
+| `NO_COLOR` | If set, disables color output. See [no-color.org](https://no-color.org). |
+| `FORCE_COLOR` | Set to `1` to force color output regardless of terminal detection. Only the exact value `1` is recognized. |
+| `COLUMNS` | Overrides the detected terminal width (in columns). |
+| `TERM` | The terminal type. Used to detect terminal capabilities. |
+| `BROWSER` | The browser command to use for opening URLs (e.g., during `azd auth login`). |
+
+## Debug Variables
+
+> **Warning**: Debug variables are unsupported and may change or be removed without notice.
+
+| Variable | Description |
+| --- | --- |
+| `AZD_DEBUG` | If true, enables debug mode. |
+| `AZD_DEBUG_LOG` | If true, enables debug-level logging. |
+| `AZD_DEBUG_TELEMETRY` | If true, enables debug-level telemetry output. |
+| `AZD_DEBUG_MSAL_CACHE` | If true, logs MSAL cache metadata before and after login and around the first silent token acquisitions, including account identifiers and usernames, while hashing cache keys and token secrets. |
+| `AZD_DEBUG_LOGIN_FORCE_SUBSCRIPTION_REFRESH` | If true, forces a refresh of the subscription list on login. |
+| `AZD_DEBUG_SYNTHETIC_SUBSCRIPTION` | If set, provides a synthetic subscription for testing. |
+| `AZD_DEBUG_NO_ALPHA_WARNINGS` | If true, suppresses alpha feature warnings. |
+| `AZD_DEBUG_PROVISION_PROGRESS_DISABLE` | If true, disables provision progress display. Read by both the Bicep provider and the Dev Center provisioner. |
+| `AZD_DEBUG_DOTNET_APPHOST_USE_FIXED_MANIFEST` | If true, uses a fixed manifest for Aspire app host. |
+| `AZD_DEBUG_DOTNET_APPHOST_IGNORE_UNSUPPORTED_RESOURCES` | If true, ignores unsupported resources in Aspire app host. |
+| `AZD_DEBUG_SERVER_DEBUG_ENDPOINTS` | If true, enables debug endpoints in server mode. |
+| `AZD_DEBUG_EXPERIMENTATION_TAS_ENDPOINT` | Overrides the experimentation TAS endpoint URL. |
+| `AZD_DISABLE_AGENT_DETECT` | If set to any non-empty value, disables AI agent detection. Used by tests and tooling that need interactive behavior. |
+| `AZD_SUBSCRIPTIONS_FETCH_MAX_CONCURRENCY` | Limits the maximum concurrency when fetching subscriptions. |
+| `DEPLOYMENT_STACKS_BYPASS_STACK_OUT_OF_SYNC_ERROR` | If true, bypasses Deployment Stacks out-of-sync errors. |
+
+## Test Variables
+
+> **Warning**: Test variables are used by the `azd` test suite only and are not intended for end users.
+>
+> **Tip**: Instead of setting environment variables for every session, you can persist test defaults
+> in your user-level `azd` config. These config keys act as fallbacks when the corresponding
+> environment variable is not set:
+>
+> ```bash
+> azd config set defaults.test.subscription <SUBSCRIPTION_ID>
+> azd config set defaults.test.tenant <TENANT_ID>
+> azd config set defaults.test.location <LOCATION>
+> ```
+>
+> Resolution order: environment variable → `defaults.test.*` → `defaults.*` (global default).
+> Note: `AZD_TEST_TENANT_ID` only falls back to `defaults.test.tenant` (no
+> `defaults.tenant` global fallback). Config fallbacks are only consulted when
+> the `CI` environment variable is unset.
+
+| Variable | Description | Config Fallback |
+| --- | --- | --- |
+| `AZD_TEST_CLIENT_ID` | The client ID for test authentication. | — |
+| `AZD_TEST_TENANT_ID` | The tenant ID for test authentication. | `defaults.test.tenant` |
+| `AZD_TEST_AZURE_SUBSCRIPTION_ID` | The Azure subscription ID for tests. | `defaults.test.subscription` |
+| `AZD_TEST_AZURE_LOCATION` | The Azure location for tests. | `defaults.test.location` |
+| `AZD_TEST_CLI_VERSION` | Overrides the CLI version reported during tests. |
+| `AZD_TEST_FIXED_CLOCK_UNIX_TIME` | Sets a fixed clock time (Unix epoch) for deterministic tests. |
+| `AZD_TEST_HTTPS_PROXY` | The HTTPS proxy URL for tests. |
+| `AZD_TEST_DOCKER_E2E` | If true, enables Docker-based end-to-end tests. |
+| `AZD_FUNC_TEST` | If true, indicates functional test mode. |
+| `UPDATE_SNAPSHOTS` | If set, updates test snapshots when running snapshot-based tests. |
+| `AZURE_RECORD_MODE` | Sets the record mode for Azure SDK test recordings. Valid values: `live`, `playback`, `record`. |
+| `CLI_TEST_AZD_PATH` | Overrides the `azd` binary path used in CLI tests. |
+| `CLI_TEST_SKIP_BUILD` | If true, skips building `azd` before running tests. |

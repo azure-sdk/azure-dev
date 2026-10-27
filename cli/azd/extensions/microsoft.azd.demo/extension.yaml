@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=../extension.schema.json
+id: microsoft.azd.demo
+namespace: demo
+displayName: Demo Extension
+description: This extension provides examples of the azd extension framework.
+usage: azd demo <command> [options]
+version: 0.8.0
+requiredAzdVersion: ">=1.33.0"
+language: go
+capabilities:
+  - custom-commands
+  - lifecycle-events
+  - mcp-server
+  - service-target-provider
+  - framework-service-provider
+  - provisioning-provider
+  - validation-provider
+  - metadata
+providers:
+  - name: demo
+    type: service-target
+    description: Deploys application components to demo
+  - name: demo
+    type: provisioning-provider
+    description: Provisions infrastructure using the demo provider
+examples:
+  - name: context
+    description: Displays the current `azd` project & environment context.
+    usage: azd demo context
+  - name: prompt
+    description: Display prompt capabilities.
+    usage: azd demo prompt
+  - name: ai models
+    description: Browse available AI models interactively.
+    usage: azd demo ai models
+  - name: ai deployment
+    description: Select model/version/SKU/capacity and resolve a deployment configuration.
+    usage: azd demo ai deployment
+  - name: ai quota
+    description: View usage meters and limits for a selected location.
+    usage: azd demo ai quota
+  - name: mcp
+    description: Start MCP server with demo tools.
+    usage: azd demo mcp start
+  - name: copilot
+    description: Interactive Copilot chat loop demonstrating CopilotService gRPC API.
+    usage: azd demo copilot [--model <model>] [--resume]
+  - name: telemetry
+    description: Report a sample usage event through the telemetry service.
+    usage: azd demo telemetry

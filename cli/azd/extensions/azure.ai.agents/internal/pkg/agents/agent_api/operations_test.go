@@ -1,0 +1,1217 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package agent_api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"maps"
+	"mime"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
+	"github.com/stretchr/testify/require"
+
+	"azureaiagent/internal/pkg/recordproxy"
+)
+
+// fakeTransport is a test HTTP transport that returns a canned response.
+type fakeTransport struct {
+	statusCode int
+}
+
+func (f *fakeTransport) Do(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: f.statusCode,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       http.NoBody,
+		Request:    req,
+	}, nil
+}
+
+type captureTransport struct {
+	statusCode int
+	body       string
+	requests   []*http.Request
+}
+
+func (f *captureTransport) Do(req *http.Request) (*http.Response, error) {
+	f.requests = append(f.requests, req)
+
+	body := f.body
+	if body == "" {
+		body = "{}"
+	}
+
+	return &http.Response{
+		StatusCode: f.statusCode,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    req,
+	}, nil
+}
+
+type fakeCredential struct{}
+
+func (fakeCredential) GetToken(context.Context, policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	return azcore.AccessToken{
+		Token:     "test-token",
+		ExpiresOn: time.Now().Add(time.Hour),
+	}, nil
+}
+
+type captureRoundTripper struct {
+	request *http.Request
+}
+
+func (t *captureRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.request = req
+	return &http.Response{
+		StatusCode: http.StatusNotFound,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       http.NoBody,
+		Request:    req,
+	}, nil
+}
+
+// newTestClient creates an AgentClient backed by fakeTransport (no auth).
+func newTestClient(endpoint string, transport policy.Transporter) *AgentClient {
+	pipeline := runtime.NewPipeline(
+		"test", "v0.0.0-test",
+		runtime.PipelineOptions{},
+		&policy.ClientOptions{Transport: transport},
+	)
+	return &AgentClient{
+		endpoint: endpoint,
+		pipeline: pipeline,
+	}
+}
+
+func TestNewAgentClientUsesRecordProxyTransport(t *testing.T) {
+	transport := &captureRoundTripper{}
+	originalTransport := recordproxy.Transport
+	recordproxy.Transport = transport
+	t.Cleanup(func() {
+		recordproxy.Transport = originalTransport
+	})
+
+	client := NewAgentClient("https://test.example.com/api/projects/proj", fakeCredential{})
+	_, err := client.GetAgent(t.Context(), "test-agent", AgentEndpointAPIVersion, false)
+
+	require.Error(t, err)
+	require.NotNil(t, transport.request)
+	require.Equal(t,
+		"https://test.example.com/api/projects/proj/agents/test-agent?api-version=v1",
+		transport.request.URL.String(),
+	)
+}
+
+func newCaptureClient(statusCode int, body string) (*AgentClient, *captureTransport) {
+	transport := &captureTransport{statusCode: statusCode, body: body}
+	return newTestClient(
+		"https://test.example.com/api/projects/proj",
+		transport,
+	), transport
+}
+
+func requireUserIdentityHeader(
+	t *testing.T,
+	req *http.Request,
+	wantUser string,
+) {
+	t.Helper()
+
+	if wantUser == "" {
+		require.Empty(t, req.Header.Values(UserIdentityHeader))
+	} else {
+		require.Equal(t, wantUser, req.Header.Get(UserIdentityHeader))
+	}
+}
+
+func TestSessionRequestOptions_ApplyHeaders(t *testing.T) {
+	tests := []struct {
+		name     string
+		options  *SessionRequestOptions
+		wantUser string
+	}{
+		{
+			name:     "user identity set",
+			options:  &SessionRequestOptions{UserIdentity: "user-1"},
+			wantUser: "user-1",
+		},
+		{
+			name:    "empty user identity",
+			options: &SessionRequestOptions{},
+		},
+		{
+			name:    "nil options is a no-op",
+			options: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			headers := http.Header{}
+			headers.Set("Authorization", "Bearer unchanged")
+
+			tt.options.ApplyHeaders(headers)
+
+			require.Equal(t, "Bearer unchanged", headers.Get("Authorization"))
+			require.Equal(t, tt.wantUser, headers.Get(UserIdentityHeader))
+		})
+	}
+}
+
+func TestDeleteSession_Accepts200(t *testing.T) {
+	client := newTestClient(
+		"https://test.example.com/api/projects/proj",
+		&fakeTransport{statusCode: http.StatusOK},
+	)
+
+	err := client.DeleteSession(
+		t.Context(), "my-agent", "sess-1", AgentEndpointAPIVersion, nil,
+	)
+	require.NoError(t, err, "200 OK should be treated as success")
+}
+
+func TestDeleteSession_Accepts204(t *testing.T) {
+	client := newTestClient(
+		"https://test.example.com/api/projects/proj",
+		&fakeTransport{statusCode: http.StatusNoContent},
+	)
+
+	err := client.DeleteSession(
+		t.Context(), "my-agent", "sess-1", AgentEndpointAPIVersion, nil,
+	)
+	require.NoError(t, err, "204 No Content should be treated as success")
+}
+
+func TestDeleteSession_Rejects500(t *testing.T) {
+	client := newTestClient(
+		"https://test.example.com/api/projects/proj",
+		&fakeTransport{statusCode: http.StatusInternalServerError},
+	)
+
+	err := client.DeleteSession(
+		t.Context(), "my-agent", "sess-1", AgentEndpointAPIVersion, nil,
+	)
+	require.Error(t, err, "500 should be an error")
+}
+
+func TestGetSession_404ReturnsError(t *testing.T) {
+	client := newTestClient(
+		"https://test.example.com/api/projects/proj",
+		&fakeTransport{statusCode: http.StatusNotFound},
+	)
+
+	_, err := client.GetSession(
+		t.Context(), "my-agent", "sess-1", AgentEndpointAPIVersion, nil,
+	)
+	require.Error(t, err, "404 should be an error from GetSession")
+}
+
+func TestStopSession_Accepts204(t *testing.T) {
+	client := newTestClient(
+		"https://test.example.com/api/projects/proj",
+		&fakeTransport{statusCode: http.StatusNoContent},
+	)
+
+	err := client.StopSession(
+		t.Context(), "my-agent", "sess-1", AgentEndpointAPIVersion, nil,
+	)
+	require.NoError(t, err, "204 No Content should be treated as success")
+}
+
+func TestStopSession_Rejects500(t *testing.T) {
+	client := newTestClient(
+		"https://test.example.com/api/projects/proj",
+		&fakeTransport{statusCode: http.StatusInternalServerError},
+	)
+
+	err := client.StopSession(
+		t.Context(), "my-agent", "sess-1", AgentEndpointAPIVersion, nil,
+	)
+	require.Error(t, err, "500 should be an error")
+}
+
+func TestStopSession_PostsToStopPath(t *testing.T) {
+	client, transport := newCaptureClient(http.StatusNoContent, "")
+
+	err := client.StopSession(
+		t.Context(), "my-agent", "sess-1", AgentEndpointAPIVersion, nil,
+	)
+	require.NoError(t, err)
+	require.Len(t, transport.requests, 1)
+
+	req := transport.requests[0]
+	require.Equal(t, http.MethodPost, req.Method)
+	require.Contains(
+		t, req.URL.Path,
+		"/agents/my-agent/endpoint/sessions/sess-1:stop",
+	)
+}
+
+// fakeBodyTransport returns a canned status code and JSON body.
+type fakeBodyTransport struct {
+	statusCode int
+	body       string
+}
+
+func (f *fakeBodyTransport) Do(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: f.statusCode,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(f.body)),
+		Request:    req,
+	}, nil
+}
+
+func TestCreateSession_Returns201WithBody(t *testing.T) {
+	body := `{
+		"agent_session_id": "sess-new",
+		"version_indicator": {"type": "version_ref", "agent_version": "3"},
+		"status": "running",
+		"created_at": 1700000000,
+		"last_accessed_at": 1700000100,
+		"expires_at": 1700086400
+	}`
+
+	client := newTestClient(
+		"https://test.example.com/api/projects/proj",
+		&fakeBodyTransport{
+			statusCode: http.StatusCreated,
+			body:       body,
+		},
+	)
+
+	session, err := client.CreateSession(
+		t.Context(), "my-agent",
+		&CreateAgentSessionRequest{
+			VersionIndicator: &VersionIndicator{
+				Type:         "version_ref",
+				AgentVersion: "3",
+			},
+		},
+		AgentEndpointAPIVersion,
+		nil,
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, "sess-new", session.AgentSessionID)
+	require.Equal(t, "3", session.VersionIndicator.AgentVersion)
+	require.Equal(t, AgentSessionStatus("running"), session.Status)
+}
+
+func TestListSessions_Returns200WithPagination(t *testing.T) {
+	body := `{
+		"data": [
+			{
+				"agent_session_id": "sess-1",
+				"version_indicator": {"type": "version_ref", "agent_version": "2"},
+				"status": "running",
+				"created_at": 1700000000,
+				"last_accessed_at": 1700000100,
+				"expires_at": 1700086400
+			}
+		],
+		"pagination_token": "next-page-abc"
+	}`
+
+	client := newTestClient(
+		"https://test.example.com/api/projects/proj",
+		&fakeBodyTransport{
+			statusCode: http.StatusOK,
+			body:       body,
+		},
+	)
+
+	result, err := client.ListSessions(
+		t.Context(), "my-agent", nil, nil, AgentEndpointAPIVersion, nil,
+	)
+
+	require.NoError(t, err)
+	require.Len(t, result.Data, 1)
+	require.Equal(t, "sess-1", result.Data[0].AgentSessionID)
+	require.NotNil(t, result.PaginationToken)
+	require.Equal(t, "next-page-abc", *result.PaginationToken)
+}
+
+func TestSessionLifecycleOperations_ApplyUserIdentityHeader(t *testing.T) {
+	sessionBody := `{
+		"agent_session_id": "sess-1",
+		"version_indicator": {"type": "version_ref", "agent_version": "3"},
+		"status": "running",
+		"created_at": 1700000000,
+		"last_accessed_at": 1700000100,
+		"expires_at": 1700086400
+	}`
+
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		call       func(*AgentClient, *SessionRequestOptions) error
+	}{
+		{
+			name:       "create",
+			statusCode: http.StatusCreated,
+			body:       sessionBody,
+			call: func(client *AgentClient, options *SessionRequestOptions) error {
+				_, err := client.CreateSession(
+					t.Context(),
+					"my-agent",
+					&CreateAgentSessionRequest{},
+					AgentEndpointAPIVersion,
+					options,
+				)
+				return err
+			},
+		},
+		{
+			name:       "get",
+			statusCode: http.StatusOK,
+			body:       sessionBody,
+			call: func(client *AgentClient, options *SessionRequestOptions) error {
+				_, err := client.GetSession(
+					t.Context(),
+					"my-agent",
+					"sess-1",
+					AgentEndpointAPIVersion,
+					options,
+				)
+				return err
+			},
+		},
+		{
+			name:       "delete",
+			statusCode: http.StatusNoContent,
+			call: func(client *AgentClient, options *SessionRequestOptions) error {
+				return client.DeleteSession(
+					t.Context(),
+					"my-agent",
+					"sess-1",
+					AgentEndpointAPIVersion,
+					options,
+				)
+			},
+		},
+		{
+			name:       "list",
+			statusCode: http.StatusOK,
+			body:       `{"data":[]}`,
+			call: func(client *AgentClient, options *SessionRequestOptions) error {
+				_, err := client.ListSessions(
+					t.Context(),
+					"my-agent",
+					nil,
+					nil,
+					AgentEndpointAPIVersion,
+					options,
+				)
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, transport := newCaptureClient(tt.statusCode, tt.body)
+			options := &SessionRequestOptions{
+				UserIdentity: "user-1",
+			}
+
+			require.NoError(t, tt.call(client, options))
+			require.Len(t, transport.requests, 1)
+			requireUserIdentityHeader(t, transport.requests[0], "user-1")
+		})
+	}
+}
+
+func TestSessionFileOperations_ApplyUserIdentityHeader(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		call       func(*AgentClient, *SessionRequestOptions) error
+	}{
+		{
+			name:       "upload",
+			statusCode: http.StatusOK,
+			call: func(client *AgentClient, options *SessionRequestOptions) error {
+				return client.UploadSessionFile(
+					t.Context(),
+					"my-agent",
+					"sess-1",
+					"/data/input.txt",
+					"v1",
+					bytes.NewReader([]byte("hello")),
+					options,
+				)
+			},
+		},
+		{
+			name:       "download",
+			statusCode: http.StatusOK,
+			body:       "hello",
+			call: func(client *AgentClient, options *SessionRequestOptions) error {
+				body, err := client.DownloadSessionFile(
+					t.Context(),
+					"my-agent",
+					"sess-1",
+					"/data/input.txt",
+					"v1",
+					options,
+				)
+				if err != nil {
+					return err
+				}
+				return body.Close()
+			},
+		},
+		{
+			name:       "list",
+			statusCode: http.StatusOK,
+			body:       `{"path":"/","entries":[]}`,
+			call: func(client *AgentClient, options *SessionRequestOptions) error {
+				_, err := client.ListSessionFiles(
+					t.Context(),
+					"my-agent",
+					"sess-1",
+					"",
+					"v1",
+					options,
+				)
+				return err
+			},
+		},
+		{
+			name:       "remove",
+			statusCode: http.StatusNoContent,
+			call: func(client *AgentClient, options *SessionRequestOptions) error {
+				return client.RemoveSessionFile(
+					t.Context(),
+					"my-agent",
+					"sess-1",
+					"/data/input.txt",
+					false,
+					"v1",
+					options,
+				)
+			},
+		},
+		{
+			name:       "mkdir",
+			statusCode: http.StatusNoContent,
+			call: func(client *AgentClient, options *SessionRequestOptions) error {
+				return client.MkdirSessionFile(
+					t.Context(),
+					"my-agent",
+					"sess-1",
+					"/data",
+					"v1",
+					options,
+				)
+			},
+		},
+		{
+			name:       "stat",
+			statusCode: http.StatusOK,
+			body:       `{"name":"input.txt","path":"/data/input.txt","is_dir":false}`,
+			call: func(client *AgentClient, options *SessionRequestOptions) error {
+				_, err := client.StatSessionFile(
+					t.Context(),
+					"my-agent",
+					"sess-1",
+					"/data/input.txt",
+					"v1",
+					options,
+				)
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, transport := newCaptureClient(tt.statusCode, tt.body)
+			options := &SessionRequestOptions{
+				UserIdentity: "user-1",
+			}
+
+			require.NoError(t, tt.call(client, options))
+			require.Len(t, transport.requests, 1)
+			requireUserIdentityHeader(t, transport.requests[0], "user-1")
+		})
+	}
+}
+
+func TestGetAgentSessionLogStream_ApplyUserIdentityHeader(t *testing.T) {
+	reqCh := make(chan *http.Request, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case reqCh <- r:
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("event: log\n\n"))
+	}))
+	defer server.Close()
+
+	client := &AgentClient{
+		endpoint:   server.URL,
+		credential: fakeCredential{},
+	}
+
+	body, err := client.GetAgentSessionLogStream(
+		t.Context(),
+		"my-agent",
+		"sess-1",
+		"v1",
+		"console",
+		50,
+		false,
+		&SessionRequestOptions{
+			UserIdentity: "user-1",
+		},
+	)
+	require.NoError(t, err)
+	defer body.Close()
+
+	var request *http.Request
+	select {
+	case request = <-reqCh:
+	default:
+	}
+	require.NotNil(t, request)
+	require.Equal(t, "Bearer test-token", request.Header.Get("Authorization"))
+	requireUserIdentityHeader(t, request, "user-1")
+}
+
+func TestDeleteAgent_ForceTrue(t *testing.T) {
+	body := `{"object": "agent", "name": "my-agent", "deleted": true}`
+	client, transport := newCaptureClient(http.StatusOK, body)
+
+	result, err := client.DeleteAgent(t.Context(), "my-agent", "v1", true)
+	require.NoError(t, err)
+	require.True(t, result.Deleted)
+	require.Equal(t, "my-agent", result.Name)
+
+	require.Len(t, transport.requests, 1)
+	req := transport.requests[0]
+	require.Equal(t, http.MethodDelete, req.Method)
+	require.Contains(t, req.URL.String(), "/agents/my-agent")
+	require.Contains(t, req.URL.RawQuery, "force=true")
+}
+
+func TestDeleteAgent_ForceFalse(t *testing.T) {
+	body := `{"object": "agent", "name": "my-agent", "deleted": true}`
+	client, transport := newCaptureClient(http.StatusOK, body)
+
+	result, err := client.DeleteAgent(t.Context(), "my-agent", "v1", false)
+	require.NoError(t, err)
+	require.True(t, result.Deleted)
+
+	require.Len(t, transport.requests, 1)
+	req := transport.requests[0]
+	require.Contains(t, req.URL.RawQuery, "force=false")
+}
+
+func TestDeleteAgent_NotFound(t *testing.T) {
+	client := newTestClient(
+		"https://test.example.com/api/projects/proj",
+		&fakeBodyTransport{statusCode: http.StatusNotFound, body: `{"error": "not found"}`},
+	)
+
+	_, err := client.DeleteAgent(t.Context(), "no-agent", "v1", true)
+	require.Error(t, err)
+}
+
+func TestPatchAgent_Success(t *testing.T) {
+	body := `{
+		"object": "agent",
+		"id": "my-agent",
+		"name": "my-agent",
+		"versions": {
+			"latest": {
+				"object": "agent_version",
+				"id": "my-agent:1",
+				"name": "my-agent",
+				"version": "1",
+				"created_at": 1700000000
+			}
+		}
+	}`
+	client := newTestClient(
+		"https://test.example.com/api/projects/proj",
+		&fakeBodyTransport{
+			statusCode: http.StatusOK,
+			body:       body,
+		},
+	)
+
+	req := &PatchAgentRequest{
+		AgentEndpoint: &AgentEndpoint{
+			Protocols: []AgentEndpointProtocol{
+				AgentEndpointProtocolResponses, AgentEndpointProtocolA2A,
+			},
+		},
+		AgentCard: &AgentCard{
+			Description: "test agent",
+			Skills: []AgentCardSkill{
+				{
+					ID:          "s1",
+					Name:        "greet",
+					Description: "greets user",
+				},
+			},
+		},
+	}
+
+	result, err := client.PatchAgent(
+		t.Context(), "my-agent", req, "v1",
+	)
+	require.NoError(t, err)
+	require.Equal(t, "my-agent", result.Name)
+}
+
+func TestPatchAgent_400ReturnsError(t *testing.T) {
+	client := newTestClient(
+		"https://test.example.com/api/projects/proj",
+		&fakeTransport{statusCode: http.StatusBadRequest},
+	)
+
+	req := &PatchAgentRequest{
+		AgentEndpoint: &AgentEndpoint{
+			Protocols: []AgentEndpointProtocol{AgentEndpointProtocolA2A},
+		},
+	}
+
+	_, err := client.PatchAgent(
+		t.Context(), "my-agent", req, "v1",
+	)
+	require.Error(t, err, "400 should be an error")
+}
+
+func TestPatchAgent_404ReturnsError(t *testing.T) {
+	client := newTestClient(
+		"https://test.example.com/api/projects/proj",
+		&fakeTransport{statusCode: http.StatusNotFound},
+	)
+
+	req := &PatchAgentRequest{}
+
+	_, err := client.PatchAgent(
+		t.Context(), "no-such-agent", req, "v1",
+	)
+	require.Error(t, err, "404 should be an error")
+}
+
+func TestPatchAgent_500ReturnsError(t *testing.T) {
+	client := newTestClient(
+		"https://test.example.com/api/projects/proj",
+		&fakeTransport{
+			statusCode: http.StatusInternalServerError,
+		},
+	)
+
+	req := &PatchAgentRequest{}
+
+	_, err := client.PatchAgent(
+		t.Context(), "my-agent", req, "v1",
+	)
+	require.Error(t, err, "500 should be an error")
+}
+
+func TestPatchAgent_OmitsNilFields(t *testing.T) {
+	// Verify that a PatchAgentRequest with only AgentEndpoint
+	// does not serialize agent_card in the JSON body.
+	req := &PatchAgentRequest{
+		AgentEndpoint: &AgentEndpoint{
+			Protocols: []AgentEndpointProtocol{AgentEndpointProtocolResponses},
+		},
+	}
+
+	data, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	s := string(data)
+	require.Contains(t, s, `"agent_endpoint"`)
+	require.NotContains(t, s, `"agent_card"`)
+	require.NotContains(t, s, `"definition"`)
+}
+
+// capturingTransport captures the last HTTP request and returns a canned JSON response.
+type capturingTransport struct {
+	lastReq    *http.Request
+	lastBody   []byte
+	statusCode int
+	respBody   string
+}
+
+func (c *capturingTransport) Do(req *http.Request) (*http.Response, error) {
+	c.lastReq = req
+	if req.Body != nil {
+		body, _ := io.ReadAll(req.Body)
+		c.lastBody = body
+		_ = req.Body.Close()
+	}
+	return &http.Response{
+		StatusCode: c.statusCode,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(c.respBody)),
+		Request:    req,
+	}, nil
+}
+
+func TestZipDeployRequest_MultipartFormat(t *testing.T) {
+	agentResp := `{"name":"test-agent","versions":{"latest":{"version":"1","status":"active"}}}`
+	transport := &capturingTransport{statusCode: http.StatusCreated, respBody: agentResp}
+	client := newTestClient("https://test.example.com/api/projects/proj", transport)
+
+	desc := "test desc"
+	metadata := &CreateAgentVersionRequest{
+		Description:       &desc,
+		DigitalWorkerType: DigitalWorkerTypeM365,
+	}
+	zipData := []byte("PK\x03\x04fake-zip-content")
+	sha256Hex := "abcdef1234567890"
+
+	_, err := client.zipDeployRequest(
+		context.Background(),
+		"https://test.example.com/api/projects/proj/agents",
+		"test-agent",
+		metadata,
+		zipData,
+		sha256Hex,
+	)
+	require.NoError(t, err)
+
+	// Verify required headers
+	require.Equal(t, sha256Hex, transport.lastReq.Header.Get("x-ms-code-zip-sha256"))
+	require.Equal(t, "test-agent", transport.lastReq.Header.Get("x-ms-agent-name"))
+	require.Equal(t, DigitalWorkerPreviewFeature, transport.lastReq.Header.Get("Foundry-Features"))
+
+	// Verify multipart content type with boundary
+	contentType := transport.lastReq.Header.Get("Content-Type")
+	mediaType, params, err := mime.ParseMediaType(contentType)
+	require.NoError(t, err)
+	require.Equal(t, "multipart/form-data", mediaType)
+	require.NotEmpty(t, params["boundary"])
+
+	// Parse multipart body and verify parts
+	reader := multipart.NewReader(bytes.NewReader(transport.lastBody), params["boundary"])
+
+	// Part 1: metadata
+	part1, err := reader.NextPart()
+	require.NoError(t, err)
+	require.Equal(t, "metadata", part1.FormName())
+	require.Equal(t, "application/json", part1.Header.Get("Content-Type"))
+	part1Data, _ := io.ReadAll(part1)
+	var parsedMeta map[string]any
+	require.NoError(t, json.Unmarshal(part1Data, &parsedMeta))
+	require.Equal(t, "test desc", parsedMeta["description"])
+	require.Equal(t, "m365", parsedMeta["digital_worker_type"])
+
+	// Part 2: code ZIP
+	part2, err := reader.NextPart()
+	require.NoError(t, err)
+	require.Equal(t, "code", part2.FormName())
+	require.Equal(t, "agent.zip", part2.FileName())
+	part2Data, _ := io.ReadAll(part2)
+	require.Equal(t, zipData, part2Data)
+}
+
+func TestCreateAgentVersion_DigitalWorkerContract(t *testing.T) {
+	transport := &capturingTransport{
+		statusCode: http.StatusCreated,
+		respBody:   `{"name":"worker","version":"1","digital_worker_type":"m365"}`,
+	}
+	client := newTestClient("https://test.example.com/api/projects/proj", transport)
+
+	got, err := client.CreateAgentVersion(
+		t.Context(),
+		"worker",
+		&CreateAgentVersionRequest{
+			Definition:        map[string]any{"kind": "hosted"},
+			DigitalWorkerType: DigitalWorkerTypeM365,
+		},
+		"v1",
+	)
+	require.NoError(t, err)
+	require.Equal(t, DigitalWorkerTypeM365, got.DigitalWorkerType)
+	require.Equal(t, DigitalWorkerPreviewFeature, transport.lastReq.Header.Get("Foundry-Features"))
+	require.Contains(t, string(transport.lastBody), `"digital_worker_type":"m365"`)
+}
+
+func TestCreateAgentVersion_SimpleContractOmitsDigitalWorkerPreview(t *testing.T) {
+	transport := &capturingTransport{
+		statusCode: http.StatusCreated,
+		respBody:   `{"name":"simple-agent","version":"1"}`,
+	}
+	client := newTestClient("https://test.example.com/api/projects/proj", transport)
+
+	_, err := client.CreateAgentVersion(
+		t.Context(),
+		"simple-agent",
+		&CreateAgentVersionRequest{Definition: map[string]any{"kind": "hosted"}},
+		"v1",
+	)
+	require.NoError(t, err)
+	require.Empty(t, transport.lastReq.Header.Get("Foundry-Features"))
+	require.NotContains(t, string(transport.lastBody), "digital_worker_type")
+}
+
+func TestGetAgent_StandardContractOmitsDigitalWorkerPreview(t *testing.T) {
+	transport := &capturingTransport{
+		statusCode: http.StatusOK,
+		respBody:   `{"name":"simple-agent","versions":{"latest":{"version":"1"}}}`,
+	}
+	client := newTestClient("https://test.example.com/api/projects/proj", transport)
+
+	_, err := client.GetAgent(t.Context(), "simple-agent", "v1", false)
+	require.NoError(t, err)
+	require.Empty(t, transport.lastReq.Header.Get("Foundry-Features"))
+}
+
+func TestGetAgent_DigitalWorkerContract(t *testing.T) {
+	transport := &capturingTransport{
+		statusCode: http.StatusOK,
+		respBody:   `{"name":"worker","digital_worker_type":"m365","versions":{"latest":{"version":"1"}}}`,
+	}
+	client := newTestClient("https://test.example.com/api/projects/proj", transport)
+
+	got, err := client.GetAgent(t.Context(), "worker", "v1", true)
+	require.NoError(t, err)
+	require.Equal(t, DigitalWorkerTypeM365, got.DigitalWorkerType)
+	require.Equal(t, DigitalWorkerPreviewFeature, transport.lastReq.Header.Get("Foundry-Features"))
+}
+
+func TestUpdateAgent_OmitsDigitalWorkerPreview(t *testing.T) {
+	transport := &capturingTransport{
+		statusCode: http.StatusOK,
+		respBody:   `{"name":"simple-agent","versions":{"latest":{"version":"2"}}}`,
+	}
+	client := newTestClient("https://test.example.com/api/projects/proj", transport)
+
+	_, err := client.UpdateAgent(
+		t.Context(),
+		"simple-agent",
+		&UpdateAgentRequest{Definition: map[string]any{"kind": "hosted"}},
+		"v1",
+	)
+	require.NoError(t, err)
+	require.Empty(t, transport.lastReq.Header.Get("Foundry-Features"))
+}
+
+func TestGetAgentVersion_DigitalWorkerContract(t *testing.T) {
+	transport := &capturingTransport{
+		statusCode: http.StatusOK,
+		respBody:   `{"name":"worker","version":"1","digital_worker_type":"m365"}`,
+	}
+	client := newTestClient("https://test.example.com/api/projects/proj", transport)
+
+	got, err := client.GetAgentVersion(t.Context(), "worker", "1", "v1", true)
+	require.NoError(t, err)
+	require.Equal(t, DigitalWorkerTypeM365, got.DigitalWorkerType)
+	require.Equal(t, DigitalWorkerPreviewFeature, transport.lastReq.Header.Get("Foundry-Features"))
+}
+
+func TestGetAgentVersion_StandardContractOmitsDigitalWorkerPreview(t *testing.T) {
+	transport := &capturingTransport{
+		statusCode: http.StatusOK,
+		respBody:   `{"name":"simple-agent","version":"1"}`,
+	}
+	client := newTestClient("https://test.example.com/api/projects/proj", transport)
+
+	_, err := client.GetAgentVersion(t.Context(), "simple-agent", "1", "v1", false)
+	require.NoError(t, err)
+	require.Empty(t, transport.lastReq.Header.Get("Foundry-Features"))
+}
+
+func TestGetVoiceAgentVersionContract(t *testing.T) {
+	t.Parallel()
+	client, transport := newCaptureClient(http.StatusOK, `{"name":"voice","version":"7","status":"active"}`)
+	version, err := client.GetVoiceAgentVersion(t.Context(), "voice", "7", AgentEndpointAPIVersion)
+	require.NoError(t, err)
+	require.Equal(t, "active", version.Status)
+	require.Equal(t, "7", version.Version)
+	require.Len(t, transport.requests, 1)
+	req := transport.requests[0]
+	require.Equal(t, http.MethodGet, req.Method)
+	require.Equal(t, "/api/projects/proj/agents/voice/versions/7", req.URL.Path)
+	require.Equal(t, AgentEndpointAPIVersion, req.URL.Query().Get("api-version"))
+	require.Equal(t, voiceAgentsPreviewFeature, req.Header.Get("Foundry-Features"))
+	// Reusing the client for another type must not retain the voice header.
+	_, err = client.GetAgentVersion(t.Context(), "hosted", "7", AgentEndpointAPIVersion, false)
+	require.NoError(t, err)
+	require.Empty(t, transport.requests[1].Header.Get("Foundry-Features"))
+	_, err = client.GetAgentVersion(t.Context(), "worker", "7", AgentEndpointAPIVersion, true)
+	require.NoError(t, err)
+	require.Equal(t, DigitalWorkerPreviewFeature, transport.requests[2].Header.Get("Foundry-Features"))
+}
+
+func TestGetVoiceAgentVersionErrors(t *testing.T) {
+	t.Parallel()
+	client, _ := newCaptureClient(http.StatusNotFound, `{"error":{"code":"NotFound","message":"missing"}}`)
+	_, err := client.GetVoiceAgentVersion(t.Context(), "voice", "1", AgentEndpointAPIVersion)
+	responseErr, ok := errors.AsType[*azcore.ResponseError](err)
+	require.True(t, ok)
+	require.Equal(t, http.StatusNotFound, responseErr.StatusCode)
+	client, _ = newCaptureClient(http.StatusOK, `{`)
+	_, err = client.GetVoiceAgentVersion(t.Context(), "voice", "1", AgentEndpointAPIVersion)
+	require.ErrorContains(t, err, "failed to parse response")
+}
+
+func TestZipDeployRequest_NoAgentNameHeader_OnUpdate(t *testing.T) {
+	agentResp := `{"name":"test-agent","versions":{"latest":{"version":"2","status":"active"}}}`
+	transport := &capturingTransport{statusCode: http.StatusOK, respBody: agentResp}
+	client := newTestClient("https://test.example.com/api/projects/proj", transport)
+
+	_, err := client.zipDeployRequest(
+		context.Background(),
+		"https://test.example.com/api/projects/proj/agents/test-agent",
+		"", // empty = update, no x-ms-agent-name header
+		&CreateAgentVersionRequest{},
+		[]byte("zip"),
+		"sha",
+	)
+	require.NoError(t, err)
+
+	// x-ms-agent-name should NOT be set for updates
+	require.Empty(t, transport.lastReq.Header.Get("x-ms-agent-name"))
+	// But other required headers should still be present
+	require.Equal(t, "sha", transport.lastReq.Header.Get("x-ms-code-zip-sha256"))
+	require.Empty(t, transport.lastReq.Header.Get("Foundry-Features"))
+}
+
+// ---------------------------------------------------------------------------
+// DownloadAgentCode tests
+// ---------------------------------------------------------------------------
+
+// downloadTransport captures the request and returns a response with custom headers.
+type downloadTransport struct {
+	lastReq    *http.Request
+	statusCode int
+	respBody   string
+	respHeader http.Header
+}
+
+func (d *downloadTransport) Do(req *http.Request) (*http.Response, error) {
+	d.lastReq = req
+	header := http.Header{}
+	maps.Copy(header, d.respHeader)
+	if header.Get("Content-Type") == "" {
+		header.Set("Content-Type", "application/zip")
+	}
+	return &http.Response{
+		StatusCode: d.statusCode,
+		Header:     header,
+		Body:       io.NopCloser(strings.NewReader(d.respBody)),
+		Request:    req,
+	}, nil
+}
+
+func TestDownloadAgentCode_BuildsCorrectURL(t *testing.T) {
+	transport := &downloadTransport{
+		statusCode: http.StatusOK,
+		respBody:   "fake-zip-bytes",
+		respHeader: http.Header{
+			"X-Ms-Code-Zip-Sha256": {"abc123"},
+			"X-Ms-Agent-Version":   {"5"},
+		},
+	}
+	client := newTestClient("https://test.example.com/api/projects/proj", transport)
+
+	result, err := client.DownloadAgentCode(context.Background(), "my-agent", "v1", "")
+	require.NoError(t, err)
+	defer result.Body.Close()
+
+	require.NotNil(t, transport.lastReq)
+	require.Equal(t, http.MethodGet, transport.lastReq.Method)
+	require.Equal(
+		t,
+		"https://test.example.com/api/projects/proj/agents/my-agent/code:download",
+		transport.lastReq.URL.Scheme+"://"+transport.lastReq.URL.Host+transport.lastReq.URL.Path,
+	)
+	require.Equal(t, "v1", transport.lastReq.URL.Query().Get("api-version"))
+	require.Empty(t, transport.lastReq.URL.Query().Get("agent_version"), "agent_version should not be set when empty")
+}
+
+func TestDownloadAgentCode_IncludesVersionParam(t *testing.T) {
+	transport := &downloadTransport{
+		statusCode: http.StatusOK,
+		respBody:   "fake-zip-bytes",
+		respHeader: http.Header{},
+	}
+	client := newTestClient("https://test.example.com/api/projects/proj", transport)
+
+	result, err := client.DownloadAgentCode(context.Background(), "my-agent", "v1", "3")
+	require.NoError(t, err)
+	defer result.Body.Close()
+
+	require.Equal(t, "3", transport.lastReq.URL.Query().Get("agent_version"))
+}
+
+func TestDownloadAgentCode_ReturnsResponseHeaders(t *testing.T) {
+	transport := &downloadTransport{
+		statusCode: http.StatusOK,
+		respBody:   "zip-content",
+		respHeader: http.Header{
+			"X-Ms-Code-Zip-Sha256": {"deadbeef"},
+			"X-Ms-Agent-Version":   {"7"},
+		},
+	}
+	client := newTestClient("https://test.example.com/api/projects/proj", transport)
+
+	result, err := client.DownloadAgentCode(context.Background(), "my-agent", "v1", "")
+	require.NoError(t, err)
+	defer result.Body.Close()
+
+	require.Equal(t, "deadbeef", result.ContentHash)
+	require.Equal(t, "7", result.AgentVersion)
+
+	body, err := io.ReadAll(result.Body)
+	require.NoError(t, err)
+	require.Equal(t, "zip-content", string(body))
+}
+
+func TestDownloadAgentCode_ReturnsErrorOnNon200(t *testing.T) {
+	transport := &downloadTransport{
+		statusCode: http.StatusNotFound,
+		respBody:   `{"error":{"code":"not_found","message":"agent not found"}}`,
+		respHeader: http.Header{"Content-Type": {"application/json"}},
+	}
+	client := newTestClient("https://test.example.com/api/projects/proj", transport)
+
+	_, err := client.DownloadAgentCode(context.Background(), "no-such-agent", "v1", "")
+	require.Error(t, err)
+}
+
+func TestCreateVoiceAgent_PostsToAgentsWithPreviewHeader(t *testing.T) {
+	body := `{"object":"agent","id":"va-1","name":"my-voice","versions":{"latest":{}}}`
+	client, transport := newCaptureClient(http.StatusOK, body)
+
+	agent, err := client.CreateVoiceAgent(
+		t.Context(),
+		&CreateAgentRequest{Name: "my-voice"},
+		AgentEndpointAPIVersion,
+		"",
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, "my-voice", agent.Name)
+	require.Len(t, transport.requests, 1)
+	req := transport.requests[0]
+	require.Equal(t, http.MethodPost, req.Method)
+	require.Equal(t, "/api/projects/proj/agents", req.URL.Path)
+	require.Equal(t, AgentEndpointAPIVersion, req.URL.Query().Get("api-version"))
+	require.Equal(t, voiceAgentsPreviewFeature, req.Header.Get("Foundry-Features"))
+}
+
+func TestGetVoiceAgent_GetsNamedAgentWithPreviewHeader(t *testing.T) {
+	body := `{"object":"agent","id":"va-1","name":"my-voice","versions":{"latest":{"version":"3"}}}`
+	client, transport := newCaptureClient(http.StatusOK, body)
+
+	agent, err := client.GetVoiceAgent(
+		t.Context(),
+		"my-voice",
+		AgentEndpointAPIVersion,
+		"regional.hyena.example.com",
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, "my-voice", agent.Name)
+	require.Equal(t, "3", agent.Versions.Latest.Version)
+	require.Len(t, transport.requests, 1)
+	req := transport.requests[0]
+	require.Equal(t, http.MethodGet, req.Method)
+	require.Equal(t, "/api/projects/proj/agents/my-voice", req.URL.Path)
+	require.Equal(t, AgentEndpointAPIVersion, req.URL.Query().Get("api-version"))
+	require.Equal(t, voiceAgentsPreviewFeature, req.Header.Get("Foundry-Features"))
+	require.Equal(t, "regional.hyena.example.com", req.Header.Get("x-ms-overridden-host"))
+}
+
+func TestUpdateVoiceAgent_PostsToNamedAgentWithPreviewHeader(t *testing.T) {
+	body := `{"object":"agent","id":"va-1","name":"my-voice","versions":{"latest":{"version":"2"}}}`
+	client, transport := newCaptureClient(http.StatusOK, body)
+
+	agent, err := client.UpdateVoiceAgent(
+		t.Context(),
+		"my-voice",
+		&UpdateAgentRequest{},
+		AgentEndpointAPIVersion,
+		"regional.hyena.example.com",
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, "my-voice", agent.Name)
+	require.Len(t, transport.requests, 1)
+	req := transport.requests[0]
+	require.Equal(t, http.MethodPost, req.Method)
+	require.Equal(t, "/api/projects/proj/agents/my-voice", req.URL.Path)
+	require.Equal(t, AgentEndpointAPIVersion, req.URL.Query().Get("api-version"))
+	require.Equal(t, voiceAgentsPreviewFeature, req.Header.Get("Foundry-Features"))
+	require.Equal(t, "regional.hyena.example.com", req.Header.Get("x-ms-overridden-host"))
+}
+
+func TestGetTelephonyBinding_GetsAgentScopedBinding(t *testing.T) {
+	body := `{"id":"twilio:%2B14255550123","provider":"twilio","identifier":"+14255550123"}`
+	client, transport := newCaptureClient(http.StatusOK, body)
+
+	binding, err := client.GetTelephonyBinding(
+		t.Context(), "my-voice", "twilio:+14255550123", TelephonyBindingAPIVersion, "regional.hyena.example.com",
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, "twilio", binding.Provider)
+	require.Len(t, transport.requests, 1)
+	req := transport.requests[0]
+	require.Equal(t, http.MethodGet, req.Method)
+	require.Equal(t, "/api/projects/proj/agents/my-voice/telephony/twilio:%2B14255550123", req.URL.EscapedPath())
+	require.Equal(t, TelephonyBindingAPIVersion, req.URL.Query().Get("api-version"))
+	require.Equal(t, voiceAgentsPreviewFeature, req.Header.Get("Foundry-Features"))
+	require.Equal(t, "regional.hyena.example.com", req.Header.Get("x-ms-overridden-host"))
+}
+
+func TestCreateTelephonyBinding_PostsAgentScopedBinding(t *testing.T) {
+	body := `{"id":"twilio:+14255550123","provider":"twilio","identifier":"+14255550123"}`
+	client, transport := newCaptureClient(http.StatusCreated, body)
+
+	_, err := client.CreateTelephonyBinding(
+		t.Context(),
+		"my-voice",
+		&TelephonyBindingRequest{
+			Provider:       "twilio",
+			Identifier:     "+14255550123",
+			ConnectionName: "telephony-twilio",
+		},
+		TelephonyBindingAPIVersion,
+		"regional.hyena.example.com",
+	)
+
+	require.NoError(t, err)
+	require.Len(t, transport.requests, 1)
+	req := transport.requests[0]
+	require.Equal(t, http.MethodPost, req.Method)
+	require.Equal(t, "/api/projects/proj/agents/my-voice/telephony", req.URL.Path)
+	require.Equal(t, TelephonyBindingAPIVersion, req.URL.Query().Get("api-version"))
+	require.Equal(t, voiceAgentsPreviewFeature, req.Header.Get("Foundry-Features"))
+	require.Equal(t, "regional.hyena.example.com", req.Header.Get("x-ms-overridden-host"))
+	reqBody, err := io.ReadAll(req.Body)
+	require.NoError(t, err)
+	require.Contains(t, string(reqBody), `"connection_name":"telephony-twilio"`)
+	require.NotContains(t, string(reqBody), `"agent_ref"`)
+}

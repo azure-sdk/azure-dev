@@ -1,0 +1,182 @@
+# Feature-Telemetry Inventory Matrix
+
+This document provides a comprehensive inventory of every `azd` command and its telemetry coverage.
+It identifies gaps where commands rely solely on the global middleware span and recommends
+specific telemetry additions.
+
+## Telemetry Coverage Legend
+
+| Symbol | Meaning |
+|--------|---------|
+| ✅ | Covered — command-specific attributes or events are emitted |
+| ⚠️ | Global span only — no command-specific telemetry |
+| ❌ | Gap identified — needs instrumentation |
+| 🚫 | Telemetry intentionally disabled |
+
+## Commands with Telemetry Disabled
+
+These commands have `DisableTelemetry: true` set on their `ActionDescriptor`.
+
+| Command | Reason |
+|---------|--------|
+| `version` | Trivial local-only command; no value in tracking |
+| `telemetry upload` | Disabled to prevent recursive telemetry-about-telemetry |
+
+## Commands with Command-Specific Telemetry
+
+These commands emit attributes or events beyond the global middleware span.
+
+| Command | Attributes / Events | Notes |
+|---------|---------------------|-------|
+| `init` | `init.method` (template / app / project / environment / copilot), `appinit.detected.databases`, `appinit.detected.services`, `appinit.confirmed.databases`, `appinit.confirmed.services`, `appinit.modify_add.count`, `appinit.modify_remove.count`, `appinit.lastStep` | Comprehensive coverage via `SetUsageAttributes` and `repository/app_init.go` |
+| `update` | `update.installMethod`, `update.channel`, `update.fromVersion`, `update.toVersion`, `update.result` | Result codes cover success, failure, and skip reasons |
+| Extensions (dynamic) | `extension.id`, `extension.version`, `extension.event`, `extension.version.from`, `extension.version.to`, `extension.source.category`, `extension.source.kind`, `extension.source.category.from`, `extension.source.category.to`, `extension.installed.source.category`, `extension.dependency_of`, `extension.dependency_update_count`, `extension.update.outcome`, `extension.update.duration_ms`, `extension.grpc.legacy_call_count`, `error.chain.types`, `error.extension.cause_types`, `error.mapper.source.type`, `error.mapper.destination.type` + trace-context propagation to child process | Covers `ext.run`, `ext.install`, `ext.update`, `ext.uninstall`, `ext.promote`, source registration, installed inventory, failed-invocation attribution, and temporary legacy gRPC bridge use without emitting source names or locations |
+| `mcp start` | Per-tool spans via `tracing.Start` with `mcp.client.name`, `mcp.client.version` | MCP event prefix `mcp.*` |
+| `tool install` / `tool update` / `tool uninstall` / `tool check` / `tool list` / `tool show` | `tool.id`, `tool.ids`, `tool.dry_run`, `tool.install.strategy`, `tool.install.success`, `tool.install.success_count`, `tool.install.failure_count`, `tool.install.failed_ids`, `tool.install.duration_ms`, `tool.update.from_version`, `tool.update.to_version`, `tool.check.updates_available` | Comprehensive coverage in `cli/azd/cmd/tool.go`; install/update emit `tools.pack.build` spans for pack-based tools |
+| `copilot` (agent) | `copilot.initialize` event (model + reasoning config), `copilot.session` event (session create/resume), `copilot.message.aiCredits` | Emitted from `internal/agent/copilot_agent.go`; covers the experimental copilot agent surface and cumulative AI-credit usage |
+| `provision` | `validation.provision` event (provision validation outcome + 6 fields), 8 `arm.*` events (subscription / resource-group deploy / stack-deploy / what-if / validate), `aks.postprovision.skip`, per-layer `provision.layer.*` counts (`count`, `max_parallel`, `safe_fallback_count`, `explicit_dependson_count`) when multi-layer infra is used | Telemetry added across `internal/cmd/provision_*.go` and the ARM deployment client |
+| `deploy` / `publish` / `package` | `deploy.appservice.zip` event (zip-deploy outcome), `container.credentials` / `container.publish` / `container.remotebuild` events for container-based services | Per-service-target instrumentation; container events emitted from container-app and ACR push paths |
+| `hooks run` (and all hook-running commands) | `hooks.exec` event with `hooks.name` (hashed unless built-in lifecycle name), `hooks.type` (project / service / **layer**), `hooks.kind` (script runtime — `sh` / `pwsh` / `js` / `ts` / `python` / `dotnet`) | `hooks.type=layer` was added with multi-layer provision; pre/post is encoded in `hooks.name` (e.g., `prebuild` / `postbuild`); emitted from the hooks runner on every lifecycle command |
+
+## Full Inventory Matrix
+
+| Command | Subcommands | Global Span | Command-Specific Attrs | Feature Events | Notes |
+|---------|-------------|:-----------:|:----------------------:|:--------------:|-------|
+| **Auth** | | | | | |
+| `auth login` | — | ✅ | ✅ | ❌ | `auth.method` (browser, device-code, service-principal-secret, etc.); `auth.cache_clear_failed` (which credential cache failed to clear during pre-login cleanup) |
+| `auth logout` | — | ✅ | ❌ | ❌ | Global telemetry sufficient — no command-specific attributes emitted |
+| `auth status` | — | ✅ | ❌ | ❌ | Global telemetry sufficient — simple pass/fail check |
+| `auth token` | — | ✅ | ❌ | ❌ | Global telemetry sufficient |
+| **Config** | | | | | |
+| `config` | `show`, `list`, `get`, `set`, `unset`, `reset`, `list-alpha`, `options` | ✅ | ❌ | ❌ | Redundant — command name in global span captures operation |
+| **Environment** | | | | | |
+| `env` | `set`, `set-secret`, `select`, `new`, `remove`, `refresh`, `get-values`, `get-value` | ✅ | ❌ | ❌ | Redundant — command name in global span captures operation |
+| `env list` | — | ✅ | ✅ | ❌ | `env.count` (measurement — number of environments) |
+| `env config` | `get`, `set`, `unset` | ✅ | ❌ | ❌ | Thin wrappers — global telemetry sufficient |
+| **Hooks** | | | | | |
+| `hooks run` | — | ✅ | ✅ | ✅ | `hooks.name` (hashed unless built-in lifecycle name), `hooks.type` (project/service/**layer**), `hooks.kind` (script runtime — `sh`/`pwsh`/`js`/`ts`/`python`/`dotnet`); `hooks.exec` event emitted by the hooks runner on every lifecycle command |
+| **Templates** | | | | | |
+| `template` | `list`, `show` | ✅ | ❌ | ❌ | Redundant — command name in global span captures operation |
+| `template source` | `list`, `add`, `remove` | ✅ | ❌ | ❌ | Redundant — command name in global span captures operation |
+| **Pipeline** | | | | | |
+| `pipeline config` | — | ✅ | ✅ | ❌ | `pipeline.provider` (`GitHub` / `Azure DevOps` — emitted as the resolved provider display name after auto-detection), `pipeline.auth` (emitted only when `--auth-type` is set: `federated` / `client-credentials`) |
+| **Monitor** | | | | | |
+| `monitor` | — | ✅ | ❌ | ❌ | Redundant — command name in global span is sufficient |
+| **Show** | | | | | |
+| `show` | — | ✅ | ❌ | ❌ | Redundant — output format not analytically useful |
+| **Infrastructure** | | | | | |
+| `infra generate` | — | ✅ | ✅ | ❌ | `infra.provider` (from azure.yaml's `infra.provider`: `bicep`/`terraform`/`arm`/`pulumi`, `auto` when unset, or `custom` for extension providers — raw name not emitted; see cross-cutting row) |
+| `infra synth` | — | ✅ | ✅ | ❌ | `infra.provider` (from azure.yaml's `infra.provider`: `bicep`/`terraform`/`arm`/`pulumi`, `auto` when unset, or `custom` for extension providers — raw name not emitted; see cross-cutting row) |
+| `infra create` | — (hidden, deprecated) | ✅ | ❌ | ❌ | Wraps `provision`; inherits its telemetry |
+| `infra delete` | — (hidden, deprecated) | ✅ | ❌ | ❌ | Wraps `down`; inherits its telemetry |
+| **Core Lifecycle** | | | | | |
+| `restore` | — | ✅ | ❌ | ❌ | Via hooks middleware |
+| `build` | — | ✅ | ❌ | ❌ | Via hooks middleware |
+| `provision` | — | ✅ | ✅ | ✅ | Emits `validation.provision`, 8 `arm.*` events, `aks.postprovision.skip`, and per-layer `provision.layer.*` counts (`count`, `max_parallel`, `safe_fallback_count`, `explicit_dependson_count`) for multi-layer infra; sets `infra.provider` (resolved IaC provider slice) directly on the command span |
+| `package` | — | ✅ | ✅ | ✅ | Via hooks middleware; container service targets emit `container.credentials`, `container.publish`, `container.remotebuild` events |
+| `deploy` | — | ✅ | ✅ | ✅ | App Service zip-deploy emits `deploy.appservice.zip` (`deploy.appservice.linux`, `deploy.appservice.attempt`); container service targets emit `container.*` events |
+| `publish` | — | ✅ | ✅ | ✅ | Same as `deploy` (alias behavior) |
+| `up` | — | ✅ | ✅ | ✅ | Composes provision+deploy and inherits all their events; sets `infra.provider` (resolved IaC provider slice) directly on the `cmd.up` span; the up-graph runner emits `perf.provision_duration_ms`, `perf.deploy_duration_ms`, `perf.total_duration_ms` (`internal/cmd/up_graph.go`). Emits synthetic `cmd.provision`/`cmd.package`/`cmd.deploy` child spans that carry the real per-phase status + ResultCode via `cmd.MapError`; `cmd.deploy` is emitted only when the deploy phase runs (issue #9054) |
+| `down` | — | ✅ | ✅ | ❌ | Teardown flow; pre/postdown lifecycle hooks emit `hooks.exec` via the hooks middleware; sets `infra.provider` (resolved IaC provider slice) directly on the command span |
+| **Add** | | | | | |
+| `add` | — | ✅ | ❌ | ❌ | Low priority |
+| **Completion** | | | | | |
+| `completion` | `bash`, `zsh`, `fish`, `powershell`, `fig` | ✅ | ❌ | ❌ | Low priority — minimal analytical value |
+| **VS Server** | | | | | |
+| `vs-server` | — | ✅ | ❌ | ❌ | Long-running RPC; covered by `vsrpc.*` events |
+| **Copilot Consent** | | | | | |
+| `copilot consent` | `list`, `revoke`, `grant` | ✅ | ❌ | ❌ | Low priority |
+| **Extension Management** | | | | | |
+| `extension` | `list`, `show`, `install`, `uninstall`, `update` | ✅ | ✅ | ✅ | Covered by `extension.*` fields and `ext.install`, `ext.update`, `ext.uninstall`, `ext.promote` events; `extension.source.kind` tracks `--source` argument kind for list/show/install/update; one `ext.uninstall` span per attempted extension removal covers dependency-aware uninstall |
+| `extension source` | `list`, `add`, `remove`, `validate` | ✅ | ✅ | ❌ | `source add` emits the fixed `extension.source.category` on the command span; other operations rely on global command telemetry and do not emit configured values |
+| **Init** | | | | | |
+| `init` | — | ✅ | ✅ | ✅ | Comprehensive coverage via `appinit.*` fields |
+| **Update** | | | | | |
+| `update` | — | ✅ | ✅ | ✅ | Covered by `update.*` fields |
+| **MCP** | | | | | |
+| `mcp start` | — | ✅ | ✅ | ✅ | Per-tool spans via `mcp.*` |
+| **Tool Management** | | | | | |
+| `tool list` | — | ✅ | ✅ | ❌ | `tool.ids` listed for visibility into per-row outputs |
+| `tool install` | — | ✅ | ✅ | ✅ | `tool.id`, `tool.install.strategy`, `tool.install.success`, `tool.install.success_count`, `tool.install.failure_count`, `tool.install.failed_ids`, `tool.install.duration_ms`, `tool.dry_run`; `tools.pack.build` for pack-based tools |
+| `tool update` | — | ✅ | ✅ | ✅ | All `tool.install.*` plus `tool.update.from_version`, `tool.update.to_version` |
+| `tool uninstall` | — | ✅ | ✅ | ✅ | `tool.id`/`tool.ids`, `tool.dry_run`, and the `tool.install.*` aggregate/per-tool fields (no version fields) |
+| `tool check` | — | ✅ | ✅ | ❌ | `tool.check.updates_available` (count) |
+| `tool show` | — | ✅ | ✅ | ❌ | `tool.id` |
+| **Copilot (Agent)** | | | | | |
+| `copilot` | — | ✅ | ✅ | ✅ | `copilot.initialize` captures model + reasoning config; `copilot.session` tracks session create/resume; `copilot.message.aiCredits` measures cumulative usage |
+| **Disabled** | | | | | |
+| `version` | — | 🚫 | — | — | Intentionally disabled |
+| `telemetry upload` | — | 🚫 | — | — | Intentionally disabled |
+
+## Retained Fields Summary
+
+After the redundancy audit (per PR review feedback from @weikanglim), the following
+command-specific telemetry fields provide analytical value beyond the command name:
+
+| Field | OTel Key | Commands | Justification |
+|-------|----------|----------|---------------|
+| Auth method | `auth.method` | `auth login`, `auth logout` | Distinguishes authentication flow type (browser, device-code, SP, federated, etc.) |
+| Auth cache-clear failed | `auth.cache_clear_failed` | `auth login` | Identifies which credential cache failed to clear during the pre-login cleanup (`auth` / `subscriptions`) |
+| Env count | `env.count` | `env list` | Measurement — number of environments is a quantitative metric |
+| Hooks name | `hooks.name` | `hooks run` | Identifies which hook script ran (hashed — user-defined name) |
+| Hooks type | `hooks.type` | `hooks run` | Distinguishes project / service / **layer** hooks |
+| Hooks kind | `hooks.kind` | `hooks run` | Distinguishes the script runtime used to execute the hook (`sh`, `pwsh`, `js`, `ts`, `python`, `dotnet`) |
+| Pipeline provider | `pipeline.provider` | `pipeline config` | Distinguishes GitHub vs Azure DevOps |
+| Pipeline auth | `pipeline.auth` | `pipeline config` | Distinguishes federated vs client-credentials |
+| Infra provider | `infra.provider` | `infra generate`, `infra synth`, `provision`, `up`, `down` | provision/up/down: sorted, de-duplicated string slice of resolved providers — `bicep`/`terraform`/`arm`/`pulumi` verbatim, `custom` for extension providers (raw name not emitted); multi-layer projects that combine providers record each distinct value (e.g. `["bicep","terraform"]`). `infra generate`/`synth`: the value read from azure.yaml's `infra.provider` emitted directly as a single string (`bicep`/`terraform`/`arm`/`pulumi`, `auto` when unset, or `custom` for extension providers — raw name not emitted) |
+| Tool ID | `tool.id` / `tool.ids` | `tool *` | Identifies which managed tool (e.g., bicep, gh, kubectl) the command acted on |
+| Tool install metrics | `tool.install.*` | `tool install`, `tool update`, `tool uninstall` | Success count, failure count, duration, strategy — quantitative install health |
+| Tool update versions | `tool.update.from_version`, `tool.update.to_version` | `tool update` | Tracks adoption of new tool versions |
+| Provision validation outcome | `validation.provision.outcome` (+ peer fields incl. `validation.provision.check_type`) | `provision` | Distinguishes passed / warnings-accepted / canceled local validation; `check_type` separates the provider-agnostic `provision` dispatch from the Bicep `arm-provision` dispatch (both share the event) |
+| ARM deployment events | `arm.deploy.*`, `arm.stack.deploy.*`, `arm.whatif.*`, `arm.validate.*` | `provision` | Distinguishes deployment scope (subscription vs resource-group) and operation kind (deploy / stack / what-if / validate) |
+| Container events | `container.credentials`, `container.publish`, `container.remotebuild` | `package`, `deploy` | Per-stage container lifecycle for container-based services |
+| Multi-layer provision | `provision.layer.*` | `provision` | Layer-graph shape counts for multi-layer infra: `count`, `max_parallel`, `safe_fallback_count`, `explicit_dependson_count` (integer measurements; no duration or outcome) |
+| Performance durations | `perf.provision_duration_ms`, `perf.deploy_duration_ms`, `perf.total_duration_ms` | `up` | Per-phase and total wall-clock durations emitted by the up-graph runner (`internal/cmd/up_graph.go`); provision/deploy durations set only when those phases run |
+
+### Removed Fields (Redundant with Command Name)
+
+The following fields were removed because the command name in the global span already
+captures the operation type, making the attribute redundant:
+
+| Removed Field | Reason |
+|---------------|--------|
+| `auth.result` | Success/failure already captured by span status |
+| `config.operation` | Each config subcommand has its own command name |
+| `env.operation` | Each env subcommand has its own command name |
+| `template.operation` | Each template subcommand has its own command name |
+| `monitor.type` | Single command — no distinguishing value |
+| `show.output.format` | Output format not analytically useful |
+
+## Cross-Cutting Subsystems
+
+These telemetry surfaces are not tied to a single command — they emit from middleware
+or shared infrastructure invoked by many commands. They are included here so the
+privacy review covers every emission point. Dormant surfaces are retained to document
+reserved field contracts.
+
+| Subsystem | Trigger | Events | Key Attributes | Notes |
+|-----------|---------|--------|----------------|-------|
+| **Execution environment detection** | Every command with telemetry enabled | (none — resource attribute) | `execution.environment` | Detects local/hosted environments, CI providers, and AI coding agents. Antigravity is reported as its own fixed value rather than Gemini. A non-empty `AGENCY_SESSION_ID` adds the fixed `agency` modifier without replacing the primary environment or emitting the session ID. |
+| **Tool first-run middleware (dormant)** | Not registered | (none) | `tool.firstrun.outcome`, `tool.firstrun.skip_reason`, `tool.firstrun.opt_in`, `tool.firstrun.tools_detected`, `tool.firstrun.tools_offered`, `tool.firstrun.tools_selected`, `tool.firstrun.tools_selected_names`, `tool.firstrun.tools_deselected_names`, `tool.firstrun.install_success_count`, `tool.firstrun.install_failure_count`, `tool.firstrun.install_failed_ids`, `tool.firstrun.install_duration_ms` | Reserved field contract for a possible future redesign; no fields are currently emitted |
+| **Canonical telemetry resource** | Every azd invocation | All spans | `service.name`, `service.version`, `os.type`, `os.version`, `host.arch`, `process.runtime.version`, `execution.environment`, `machine.id`, `service.installer`, `machine.devdeviceid`, and standard `telemetry.sdk.*` metadata | The same fixed resource is enforced for Application Insights, trace-file, and OTLP exports. `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SERVICE_NAME`, and resource detector experiments cannot add exported fields; span attributes, including `ext.*`, are unaffected |
+| **Hooks execution middleware** | Every lifecycle command (provision/deploy/up/down/restore/build/package/publish) | `hooks.exec` | `hooks.name` (hashed unless built-in lifecycle name), `hooks.type` (project / service / layer), `hooks.kind` (script runtime — `sh` / `pwsh` / `js` / `ts` / `python` / `dotnet`) | Layer-scope hooks added with multi-layer provision; pre/post is encoded in `hooks.name` (e.g., `prebuild` / `postbuild`), not in `hooks.kind` |
+| **Provision validation** | `provision` (all providers, plus Bicep `arm-provision` prior to ARM deploy) | `validation.provision` | `validation.provision.outcome`, plus peer fields covering warnings/errors counts, cancel reason, and `check_type` (dispatch site) | Local-only validation; runs for every provider via the provider-agnostic `provision` dispatch and additionally as Bicep `arm-provision`. `check_type` distinguishes the two emissions so Bicep provisions are not double-counted |
+| **ARM deployment client** | `provision` (any Bicep flow) | `arm.deploy.subscription`, `arm.deploy.resourcegroup`, `arm.stack.deploy.subscription`, `arm.stack.deploy.resourcegroup`, `arm.whatif.subscription`, `arm.whatif.resourcegroup`, `arm.validate.subscription`, `arm.validate.resourcegroup` | ARM operation status + duration | Per-call instrumentation in the ARM client; covers regular + stack deployments at both scopes |
+| **Multi-layer provision** | `provision` (when `infra.layers[]` is configured in `azure.yaml`) | (none — enriches the `provision` span) | `provision.layer.count`, `provision.layer.max_parallel`, `provision.layer.safe_fallback_count`, `provision.layer.explicit_dependson_count` | All four are integer measurements emitted from `internal/cmd/provision_graph.go`; no per-layer duration or outcome attribute is emitted |
+| **Execution graph (scheduler)** | `up`, `provision`, `deploy`, `package`, `publish`, `down` | `exegraph.run`, `exegraph.step` | `exegraph.step.count`, `exegraph.max_concurrency`, `exegraph.package_concurrency`, `exegraph.provision_concurrency`, `exegraph.deploy_concurrency`, `exegraph.error_policy`, `exegraph.step.name` (hashed), `exegraph.step.deps` (hashed slice), `exegraph.step.tags` (raw — hardcoded literals only), `exegraph.step.timeout_s` | Step count, max concurrency, phase concurrency, and timeout are integer measurements; `up` emits all three phase limits, `deploy` emits package and deploy limits, and `provision` emits the provision limit, including `0` when no dedicated phase limit is set; step names embed user-defined service / layer names from `azure.yaml`; both `name` and `deps` use `fields.StringHashed` / `fields.StringSliceHashed` |
+| **Container lifecycle** | `package`, `deploy` (container service targets) | `container.credentials`, `container.publish`, `container.remotebuild` | `container.publish` sets a `container.remotebuild` property (bool) only; the `container.credentials` and `container.remotebuild` events set no attributes (span status carries success/failure and duration) | The hashed `pack.builder.image` / `pack.builder.tag` attributes are emitted on the separate `tools.pack.build` span, not the `container.*` spans |
+| **App Service deploy** | `deploy`, `publish` (App Service targets) | `deploy.appservice.zip` | `deploy.appservice.linux` (bool), `deploy.appservice.attempt` (retry attempt number) | Zip-deploy path only; outcome / duration are carried by the span status and span timing, not by dedicated attributes |
+| **AKS service target** | `provision` (AKS preprovision/postprovision) | `aks.postprovision.skip` | `skip.reason` (bounded enum — `cluster_not_provisioned`) | Recorded when cluster is not yet available for context setup |
+| **Agent troubleshoot middleware** | Triggered on command failure when troubleshooting is engaged | `agent.troubleshoot` | Error chain attributes, hashed error fields | Emitted from `cmd/middleware/error.go` |
+| **Extension invocation errors** | An extension command, lifecycle hook, or service-target operation returns an error | `ext.run` for commands; enclosing `cmd.*` for lifecycle operations | `extension.id`, `extension.version`, `extension.event` (lifecycle operations), `error.chain.types`, `error.extension.cause_types`, `error.mapper.source.type`, `error.mapper.destination.type`, `error.tool.name` | `MapError` attributes the failed span to the executing extension, keeps reflected host types separate from hashed extension cause labels, and preserves mapper and tool diagnostics; failed commands do not set `extension.event`, service-target values use `service_target.<operation>`, and `extension.installed` remains an inventory signal |
+| **Up-graph performance** | `up` (graph execution) | (none — enriches the `up` command span) | `perf.provision_duration_ms`, `perf.deploy_duration_ms`, `perf.total_duration_ms` | Emitted from `internal/cmd/up_graph.go` after the graph completes; provision/deploy durations set only when those phases run |
+| **VS RPC** | `vs-server` long-running session | `vsrpc.*` (event prefix) | Per-RPC attributes documented in `telemetry-schema.md` | Long-running RPC server for VS integration |
+| **Extension telemetry service** | Extension calls `ReportUsage` over the extension gRPC API | `ext.usage` | `extension.id`, `extension.version`, `extension.source`, `extension.event`, plus one declared `ext.<key>` attribute per entry in the caller's attribute map | The runtime contract requires no capability and does not enforce a field allowlist. First-party Go source must declare each field in `extensions/telemetry/fields.go`; repository validation rejects undeclared or dynamically keyed attributes before release. Recording is limited to eligible official-registry installations and 100 events per `azd` invocation. The host supplies extension identity and prefixes every caller key with `ext.` so it cannot overwrite a host field |
+| **Azure AI Agents context resolution** | An agent command or lifecycle operation resolves one or more `azure.ai.agent` services | `ext.usage` with `extension.event=agent.context.resolved` | `ext.agent.kind` (`hosted`, `prompt`, `prompt-voice`, `voice`, `workflow`, or `unknown`), `ext.agent.harness` (`none`, `github_copilot_preview`, or `other`), `ext.agent.operation` (fixed extension command path), optional `ext.agent.container.mode` for hosted agents (`build`, `code`, `passthrough`, `passthrough_auth`, or `unknown`) | Emits once per distinct kind/harness/container-mode classification in an invocation. `build` does not distinguish ACR ownership; `passthrough` does not establish image publicity; `passthrough_auth` indicates a configured registry connection, not deployment success. Excludes agent names, connection IDs, images, paths, URLs, prompts, and other customer content |
+| **Azure AI Agents remote invoke adoption** | `azd ai agent invoke` resolves a remote target after validation; project-backed routes must be hosted, while explicit `--agent-endpoint` routes have no project kind to verify | `ext.usage` with `extension.event=agent.invoke.selected` | `ext.agent.invoke.protocol` (resolved invocable protocol, currently `responses`, `invocations`, or `a2a`), `ext.agent.invoke.long_running` and `ext.agent.invoke.no_wait` (string-encoded booleans) | Once per resolved remote route before the invoke request; later failures count, but resolution may authenticate or probe a brownfield agent, so earlier failures do not. Local and non-hosted project routes are excluded; no service outcome or customer content is recorded |
+| **Legacy extension gRPC bridge** | Extension invokes a frozen `/azdext.*` unary RPC or opens a legacy stream | (none — enriches the current command span) | `extension.grpc.legacy_call_count` | Temporary migration measurement. Incremented once per unary RPC or opened stream; remove the bridge and field after the measurement remains zero for a full stable release cycle and supported extensions have migrated to `azd.extensions.v1` |
+| **Azure AI Agents local-client routing** | `azd ai agent run` resolves the service and protocol profile | `ext.usage` with `extension.event=local_client.route.selected` | `ext.route` (`inspector`, `playground`, or `suppressed`) | Records one mutually exclusive route before client availability, agent startup, and client launch; suppression takes precedence and the event does not indicate launch success |
+| **Agent Inspector UI readiness** | Inspector SPA sends `setViewReady` after mounting | `ext.usage` with `extension.event=inspector.funnel.stage` | `ext.stage=ui_ready`, `ext.outcome=succeeded` | Emitted at most once per Inspector process; proves the SPA loaded, not that it connected to an agent |
+| **Azure AI Evaluations init** | `azd ai eval init` writes an eval scaffold | `ext.usage` with `extension.event=init.completed` | `ext.source` (`traces`, `dataset`, or `unknown`) | Reported once per successful init, from the settled source the scaffold on disk was written for rather than from the prompt sequence a confirmation can repeat; excludes eval names, dataset identifiers, paths, and trace content |
+| **Azure AI Dataset publish** | `azd ai dataset create` or `azd ai dataset update` registers a dataset version | `ext.usage` with `extension.event=dataset.published` | `ext.operation` (`create`, `update`, or `unknown`) | Reported once per successful publish, after the version is registered; records which write produced the version and excludes dataset names, versions, row content, and file paths |
+| **App detection** | `init`, `up` (fresh projects without `azure.yaml`, via `appdetect.Detect`) | `aspire.apphost.unsupported` | `aspire.apphost.language` (fixed enum — `typescript` / `python` / `go` / `java` / `rust`; not hashed) | Emitted from `internal/appdetect/dotnet_apphost.go` when an Aspire polyglot (non-C#) AppHost is detected; azd surfaces an actionable error referencing [#7138](https://github.com/Azure/azure-dev/issues/7138) instead of falling through to a generic source build |

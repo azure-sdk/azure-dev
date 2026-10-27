@@ -1,0 +1,420 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package middleware
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/azure/azure-dev/cli/azd/cmd/actions"
+	"github.com/azure/azure-dev/cli/azd/internal/tracing/events"
+	"github.com/azure/azure-dev/cli/azd/pkg/config"
+	"github.com/azure/azure-dev/cli/azd/pkg/extensions"
+	"github.com/azure/azure-dev/cli/azd/pkg/lazy"
+	"github.com/azure/azure-dev/cli/azd/pkg/platform"
+	"github.com/azure/azure-dev/cli/azd/test/mocks"
+	"github.com/azure/azure-dev/cli/azd/test/mocks/mocktracing"
+)
+
+func Test_Telemetry_Run(t *testing.T) {
+	t.Parallel()
+	lazyPlatformConfig := lazy.NewLazy(func() (*platform.Config, error) {
+		return &platform.Config{
+			Type: "devcenter",
+		}, nil
+	})
+
+	t.Run("WithRootAction", func(t *testing.T) {
+		t.Parallel()
+		mockContext := mocks.NewMockContext(t.Context())
+
+		options := &Options{
+			CommandPath: "azd provision",
+			Name:        "provision",
+		}
+		middleware := NewTelemetryMiddleware(options, lazyPlatformConfig, nil)
+
+		ran := false
+		var actualContext context.Context
+
+		nextFn := func(ctx context.Context) (*actions.ActionResult, error) {
+			ran = true
+			actualContext = ctx
+			return nil, nil
+		}
+
+		_, _ = middleware.Run(*mockContext.Context, nextFn)
+
+		require.True(t, ran)
+		require.NotEqual(
+			t,
+			*mockContext.Context,
+			actualContext,
+			"Context should be a different instance since telemetry creates a new context",
+		)
+	})
+
+	t.Run("WithChildAction", func(t *testing.T) {
+		t.Parallel()
+		mockContext := mocks.NewMockContext(t.Context())
+
+		options := &Options{
+			CommandPath: "azd provision",
+			Name:        "provision",
+		}
+		middleware := NewTelemetryMiddleware(options, lazyPlatformConfig, nil)
+
+		ran := false
+		var actualContext context.Context
+
+		nextFn := func(ctx context.Context) (*actions.ActionResult, error) {
+			ran = true
+			actualContext = ctx
+			return nil, nil
+		}
+
+		ctx := WithChildAction(*mockContext.Context)
+		_, _ = middleware.Run(ctx, nextFn)
+
+		require.True(t, ran)
+		require.NotEqual(
+			t,
+			*mockContext.Context,
+			actualContext,
+			"Context should be a different instance since telemetry creates a new context",
+		)
+	})
+
+	t.Run("WithInstalledExtensions", func(t *testing.T) {
+		t.Parallel()
+		mockContext := mocks.NewMockContext(t.Context())
+
+		// Set up installed extensions in config
+		userConfigManager := config.NewUserConfigManager(mockContext.ConfigManager)
+		userConfig, err := userConfigManager.Load()
+		require.NoError(t, err)
+
+		// Use extensions whose alphabetical order differs from insertion order
+		// to verify sorting behavior
+		installedExtensions := map[string]*extensions.Extension{
+			"microsoft.azd.demo": {
+				Id:             "microsoft.azd.demo",
+				Version:        "0.5.0",
+				Source:         "customer-private-registry",
+				SourceCategory: extensions.SourceCategoryOther,
+			},
+			"microsoft.azd.ai": {
+				Id:      "microsoft.azd.ai",
+				Version: "1.2.0",
+				Source:  "/private/legacy/path",
+			},
+		}
+		err = userConfig.Set("extension.installed", installedExtensions)
+		require.NoError(t, err)
+
+		lazyRunner := lazy.NewLazy(func() (*extensions.Runner, error) {
+			return nil, nil
+		})
+		manager, err := extensions.NewManager(userConfigManager, nil, lazyRunner, mockContext.HttpClient)
+		require.NoError(t, err)
+
+		options := &Options{
+			CommandPath: "azd provision",
+			Name:        "provision",
+		}
+		middleware := NewTelemetryMiddleware(options, lazyPlatformConfig, manager)
+
+		// Call the method directly with a mock span to verify attributes
+		span := &mocktracing.Span{}
+		middleware.(*TelemetryMiddleware).setInstalledExtensionsAttributes(span)
+		installedAttr := findAttribute(span.Attributes, "extension.installed")
+		require.NotNil(t, installedAttr, "extension.installed attribute should be set")
+		require.Equal(t,
+			[]string{"microsoft.azd.ai@1.2.0", "microsoft.azd.demo@0.5.0"},
+			installedAttr.Value.AsStringSlice(),
+		)
+		sourceCategoryAttr := findAttribute(span.Attributes, "extension.installed.source.category")
+		require.NotNil(t, sourceCategoryAttr)
+		require.Equal(
+			t,
+			[]string{"microsoft.azd.ai@unknown", "microsoft.azd.demo@other"},
+			sourceCategoryAttr.Value.AsStringSlice(),
+		)
+		for _, attr := range span.Attributes {
+			require.NotContains(t, attr.Value.String(), "customer-private-registry")
+			require.NotContains(t, attr.Value.String(), "/private/legacy/path")
+		}
+	})
+
+	t.Run("WithNoInstalledExtensions", func(t *testing.T) {
+		t.Parallel()
+		mockContext := mocks.NewMockContext(t.Context())
+
+		userConfigManager := config.NewUserConfigManager(mockContext.ConfigManager)
+
+		lazyRunner := lazy.NewLazy(func() (*extensions.Runner, error) {
+			return nil, nil
+		})
+		manager, err := extensions.NewManager(userConfigManager, nil, lazyRunner, mockContext.HttpClient)
+		require.NoError(t, err)
+
+		options := &Options{
+			CommandPath: "azd provision",
+			Name:        "provision",
+		}
+		middleware := NewTelemetryMiddleware(options, lazyPlatformConfig, manager)
+
+		span := &mocktracing.Span{}
+		middleware.(*TelemetryMiddleware).setInstalledExtensionsAttributes(span)
+
+		installedAttr := findAttribute(span.Attributes, "extension.installed")
+		require.NotNil(t, installedAttr, "extension.installed attribute should be set")
+		require.Empty(t, installedAttr.Value.AsStringSlice(), "should be an empty slice when no extensions are installed")
+		sourceCategoryAttr := findAttribute(span.Attributes, "extension.installed.source.category")
+		require.NotNil(t, sourceCategoryAttr)
+		require.Empty(t, sourceCategoryAttr.Value.AsStringSlice())
+	})
+
+	t.Run("WithAllNilExtensionEntries", func(t *testing.T) {
+		t.Parallel()
+		mockContext := mocks.NewMockContext(t.Context())
+
+		userConfigManager := config.NewUserConfigManager(mockContext.ConfigManager)
+		userConfig, err := userConfigManager.Load()
+		require.NoError(t, err)
+
+		// Simulate corrupted config where all extension values are nil
+		installedExtensions := map[string]*extensions.Extension{
+			"microsoft.azd.demo": nil,
+			"microsoft.azd.ai":   nil,
+		}
+		err = userConfig.Set("extension.installed", installedExtensions)
+		require.NoError(t, err)
+
+		lazyRunner := lazy.NewLazy(func() (*extensions.Runner, error) {
+			return nil, nil
+		})
+		manager, err := extensions.NewManager(userConfigManager, nil, lazyRunner, mockContext.HttpClient)
+		require.NoError(t, err)
+
+		options := &Options{
+			CommandPath: "azd provision",
+			Name:        "provision",
+		}
+		middleware := NewTelemetryMiddleware(options, lazyPlatformConfig, manager)
+
+		span := &mocktracing.Span{}
+		middleware.(*TelemetryMiddleware).setInstalledExtensionsAttributes(span)
+
+		installedAttr := findAttribute(span.Attributes, "extension.installed")
+		require.NotNil(t, installedAttr, "extension.installed attribute should be set")
+		require.Empty(t, installedAttr.Value.AsStringSlice(), "should be an empty slice when all entries are nil")
+	})
+
+	t.Run("WithNilExtensionManager", func(t *testing.T) {
+		t.Parallel()
+		options := &Options{
+			CommandPath: "azd provision",
+			Name:        "provision",
+		}
+		middleware := NewTelemetryMiddleware(options, lazyPlatformConfig, nil)
+
+		// Should not panic when extensionManager is nil
+		span := &mocktracing.Span{}
+		middleware.(*TelemetryMiddleware).setInstalledExtensionsAttributes(span)
+
+		require.Empty(t, span.Attributes, "no attributes should be set when manager is nil")
+	})
+
+	t.Run("WithListInstalledError", func(t *testing.T) {
+		t.Parallel()
+		mockContext := mocks.NewMockContext(t.Context())
+
+		userConfigManager := config.NewUserConfigManager(mockContext.ConfigManager)
+		userConfig, err := userConfigManager.Load()
+		require.NoError(t, err)
+
+		// Set a malformed value to cause ListInstalled to fail deserialization
+		err = userConfig.Set("extension.installed", "not-a-map")
+		require.NoError(t, err)
+
+		lazyRunner := lazy.NewLazy(func() (*extensions.Runner, error) {
+			return nil, nil
+		})
+		manager, err := extensions.NewManager(userConfigManager, nil, lazyRunner, mockContext.HttpClient)
+		require.NoError(t, err)
+
+		options := &Options{
+			CommandPath: "azd provision",
+			Name:        "provision",
+		}
+		middleware := NewTelemetryMiddleware(options, lazyPlatformConfig, manager)
+
+		span := &mocktracing.Span{}
+		middleware.(*TelemetryMiddleware).setInstalledExtensionsAttributes(span)
+
+		require.Empty(t, span.Attributes, "no attributes should be set when ListInstalled fails")
+	})
+}
+
+// findAttribute searches for an attribute by key and returns a pointer to it, or nil if not found.
+func findAttribute(attrs []attribute.KeyValue, key attribute.Key) *attribute.KeyValue {
+	for i := range attrs {
+		if attrs[i].Key == key {
+			return &attrs[i]
+		}
+	}
+	return nil
+}
+
+func TestTelemetryMiddleware_extensionCmdInfo_WithMetadataCapability(t *testing.T) {
+	t.Parallel()
+	// Extension has MetadataCapability but LoadMetadata will fail (no real
+	// extension binary). Verify the error branch in extensionCmdInfo.
+	installed := map[string]*extensions.Extension{
+		"test.ext": {
+			Id:          "test.ext",
+			DisplayName: "Test Extension",
+			Version:     "1.0.0",
+			Namespace:   "test.ext",
+			Capabilities: []extensions.CapabilityType{
+				extensions.MetadataCapability,
+			},
+		},
+	}
+
+	mockCtx := mocks.NewMockContext(t.Context())
+	manager := createExtensionsManager(t, mockCtx, installed)
+
+	m := &TelemetryMiddleware{
+		options:          &Options{Args: []string{"build"}},
+		extensionManager: manager,
+	}
+
+	// LoadMetadata will fail (no binary), so both return values should be empty
+	eventName, flags := m.extensionCmdInfo("test.ext")
+	require.Empty(t, eventName)
+	require.Nil(t, flags)
+}
+
+func TestTelemetryMiddleware_extensionCmdInfo_ResolvesCommandAndFlags(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("AZD_CONFIG_DIR", configDir)
+
+	installed := map[string]*extensions.Extension{
+		"test.ext": {
+			Id:          "test.ext",
+			DisplayName: "Test Extension",
+			Version:     "1.0.0",
+			Namespace:   "test.ext",
+			Capabilities: []extensions.CapabilityType{
+				extensions.MetadataCapability,
+			},
+		},
+	}
+
+	metadata := extensions.ExtensionCommandMetadata{
+		SchemaVersion: "1.0",
+		ID:            "test.ext",
+		Commands: []extensions.Command{
+			{
+				Name: []string{"build"},
+				Flags: []extensions.Flag{
+					{Name: "verbose", Shorthand: "v", Type: "bool"},
+					{Name: "output", Type: "string"},
+				},
+			},
+		},
+	}
+	metadataBytes, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	metadataDir := filepath.Join(configDir, "extensions", "test.ext")
+	require.NoError(t, os.MkdirAll(metadataDir, 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(metadataDir, "metadata.json"), metadataBytes, 0600))
+
+	mockCtx := mocks.NewMockContext(t.Context())
+	manager := createExtensionsManager(t, mockCtx, installed)
+
+	t.Run("resolves command path and flags", func(t *testing.T) {
+		m := &TelemetryMiddleware{
+			options: &Options{
+				Args: []string{"build", "--verbose", "--output", "json"},
+			},
+			extensionManager: manager,
+		}
+
+		eventName, flags := m.extensionCmdInfo("test.ext")
+		require.Equal(t, events.GetCommandEventName("azd test ext build"), eventName)
+		require.ElementsMatch(t, []string{"verbose", "output"}, flags)
+	})
+
+	t.Run("returns flags without an unknown command event", func(t *testing.T) {
+		m := &TelemetryMiddleware{
+			options: &Options{
+				Args: []string{"unknown", "--verbose"},
+			},
+			extensionManager: manager,
+		}
+
+		eventName, flags := m.extensionCmdInfo("test.ext")
+		require.Empty(t, eventName)
+		require.Nil(t, flags)
+	})
+
+	t.Run("ignores extension without metadata capability", func(t *testing.T) {
+		managerWithoutMetadata := createExtensionsManager(
+			t,
+			mocks.NewMockContext(t.Context()),
+			map[string]*extensions.Extension{
+				"test.ext": {
+					Id:        "test.ext",
+					Version:   "1.0.0",
+					Namespace: "test.ext",
+				},
+			},
+		)
+		m := &TelemetryMiddleware{
+			options:          &Options{Args: []string{"build", "--verbose"}},
+			extensionManager: managerWithoutMetadata,
+		}
+
+		eventName, flags := m.extensionCmdInfo("test.ext")
+		require.Empty(t, eventName)
+		require.Nil(t, flags)
+	})
+}
+
+func TestTelemetryMiddleware_setInstalledExtensionsAttributes_Sorted(t *testing.T) {
+	t.Parallel()
+	installed := map[string]*extensions.Extension{
+		"zzz.last":  {Id: "zzz.last", Version: "3.0.0"},
+		"aaa.first": {Id: "aaa.first", Version: "1.0.0"},
+		"mmm.mid":   {Id: "mmm.mid", Version: "2.0.0"},
+	}
+
+	mockCtx := mocks.NewMockContext(t.Context())
+	manager := createExtensionsManager(t, mockCtx, installed)
+
+	m := &TelemetryMiddleware{
+		options:          &Options{},
+		extensionManager: manager,
+	}
+
+	span := &mocktracing.Span{}
+	m.setInstalledExtensionsAttributes(span)
+
+	attr := findAttribute(span.Attributes, "extension.installed")
+	require.NotNil(t, attr)
+	// Entries should be sorted alphabetically by ID
+	require.Equal(t,
+		[]string{"aaa.first@1.0.0", "mmm.mid@2.0.0", "zzz.last@3.0.0"},
+		attr.Value.AsStringSlice(),
+	)
+}

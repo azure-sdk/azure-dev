@@ -1,0 +1,516 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package azdext
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"slices"
+	"strconv"
+	"sync"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+type serviceReceiver interface {
+	Receive(ctx context.Context) error
+	Ready(ctx context.Context) error
+}
+
+type serviceTargetRegistrar interface {
+	serviceReceiver
+	Register(ctx context.Context, factory ServiceTargetFactory, hostType string) error
+	Close() error
+}
+
+type frameworkServiceRegistrar interface {
+	serviceReceiver
+	Register(ctx context.Context, factory FrameworkServiceFactory, language string) error
+	Close() error
+}
+
+type extensionEventManager interface {
+	serviceReceiver
+	AddProjectEventHandler(ctx context.Context, eventName string, handler ProjectEventHandler) error
+	AddServiceEventHandler(
+		ctx context.Context, eventName string, handler ServiceEventHandler, options *ServiceEventOptions,
+	) error
+	Close() error
+}
+
+type provisioningRegistrar interface {
+	Register(ctx context.Context, factory ProvisioningProviderFactory, providerName string) error
+	Receive(ctx context.Context) error
+	Ready(ctx context.Context) error
+	Close() error
+}
+
+// ServiceTargetRegistration describes a service target provider to register with azd core.
+type ServiceTargetRegistration struct {
+	Host    string
+	Factory func() ServiceTargetProvider
+}
+
+// FrameworkServiceRegistration describes a framework service provider to register with azd core.
+type FrameworkServiceRegistration struct {
+	Language string
+	Factory  func() FrameworkServiceProvider
+}
+
+// ProjectEventRegistration describes a project-level event handler to register.
+type ProjectEventRegistration struct {
+	EventName string
+	Handler   ProjectEventHandler
+}
+
+// ServiceEventRegistration describes a service-level event handler to register.
+type ServiceEventRegistration struct {
+	EventName string
+	Handler   ServiceEventHandler
+	Options   *ServiceEventOptions
+}
+
+// ProvisioningProviderRegistration describes a provisioning provider to register with azd core.
+type ProvisioningProviderRegistration struct {
+	Name    string
+	Factory ProvisioningProviderFactory
+}
+
+// ProviderFactory describes a function that creates a provider instance
+type ProviderFactory[T any] func() T
+
+// ProviderFactory describes a function that creates an instance of a service target provider
+type ServiceTargetFactory ProviderFactory[ServiceTargetProvider]
+
+// FrameworkServiceFactory describes a function that creates an instance of a framework service provider
+type FrameworkServiceFactory ProviderFactory[FrameworkServiceProvider]
+
+// ExtensionHost coordinates registering service targets, wiring event handlers, and signaling readiness.
+type ExtensionHost struct {
+	client *AzdClient
+
+	serviceTargets        []ServiceTargetRegistration
+	previewHosts          map[string]bool
+	frameworkServices     []FrameworkServiceRegistration
+	projectHandlers       []ProjectEventRegistration
+	serviceHandlers       []ServiceEventRegistration
+	provisioningProviders []ProvisioningProviderRegistration
+	validationChecks      []ValidationCheckRegistration
+
+	serviceTargetManager        serviceTargetRegistrar
+	serviceTargetPreviewManager serviceTargetRegistrar
+	frameworkServiceManager     frameworkServiceRegistrar
+	eventManager                extensionEventManager
+	provisioningManager         provisioningRegistrar
+	validationManager           *ValidationManager
+}
+
+// NewExtensionHost creates a new ExtensionHost for the supplied azd client.
+func NewExtensionHost(client *AzdClient) *ExtensionHost {
+	return &ExtensionHost{
+		client: client,
+	}
+}
+
+// Client returns the underlying AzdClient.
+// This is useful when service target or framework service factories need the client,
+// for example when called from a [NewListenCommand] configure callback:
+//
+//	azdext.NewListenCommand(func(host *azdext.ExtensionHost) {
+//	    host.WithServiceTarget("appservice", func() azdext.ServiceTargetProvider {
+//	        return NewAppServiceProvider(host.Client())
+//	    })
+//	})
+func (er *ExtensionHost) Client() *AzdClient {
+	return er.client
+}
+
+// ServiceTargets returns a copy of the service target providers registered so far,
+// letting tests and tooling introspect registrations without invoking Run.
+func (er *ExtensionHost) ServiceTargets() []ServiceTargetRegistration {
+	return slices.Clone(er.serviceTargets)
+}
+
+// ProvisioningProviders returns a copy of the provisioning providers registered so
+// far. See [ExtensionHost.ServiceTargets].
+func (er *ExtensionHost) ProvisioningProviders() []ProvisioningProviderRegistration {
+	return slices.Clone(er.provisioningProviders)
+}
+
+func (er *ExtensionHost) initManagers(extensionId string, brokerLogger *log.Logger) {
+	if er.serviceTargetManager == nil {
+		er.serviceTargetManager = NewServiceTargetManager(extensionId, er.client, brokerLogger)
+	}
+	if er.serviceTargetPreviewManager == nil {
+		er.serviceTargetPreviewManager = newServiceTargetPreviewManager(extensionId, er.client, brokerLogger)
+	}
+	if er.frameworkServiceManager == nil {
+		er.frameworkServiceManager = NewFrameworkServiceManager(extensionId, er.client, brokerLogger)
+	}
+	if er.eventManager == nil {
+		er.eventManager = NewEventManager(extensionId, er.client, brokerLogger)
+	}
+	if er.provisioningManager == nil {
+		er.provisioningManager = NewProvisioningManager(extensionId, er.client, brokerLogger)
+	}
+	if er.validationManager == nil {
+		er.validationManager = NewValidationManager(extensionId, er.client, brokerLogger)
+	}
+}
+
+// WithServiceTarget registers a service target provider to be wired when Run is invoked.
+func (er *ExtensionHost) WithServiceTarget(host string, factory ServiceTargetFactory) *ExtensionHost {
+	er.serviceTargets = append(er.serviceTargets, ServiceTargetRegistration{Host: host, Factory: factory})
+	return er
+}
+
+// WithBetaServiceTargetPreview registers a service target like [ExtensionHost.WithServiceTarget] and also
+// opts it into the experimental v1beta deployment preview used by `azd deploy --preview`.
+// Providers created by the factory must implement preview.ServiceTargetPreviewProvider from pkg/azdext/preview.
+// Preview runs on a fresh provider without Initialize; the factory is not called during registration.
+// Preview registration is best effort: when azd does not support it, the service target still works normally.
+func (er *ExtensionHost) WithBetaServiceTargetPreview(host string, factory ServiceTargetFactory) *ExtensionHost {
+	er.serviceTargets = append(er.serviceTargets, ServiceTargetRegistration{Host: host, Factory: factory})
+	if er.previewHosts == nil {
+		er.previewHosts = map[string]bool{}
+	}
+	er.previewHosts[host] = true
+	return er
+}
+
+// WithFrameworkService registers a framework service provider to be wired when Run is invoked.
+func (er *ExtensionHost) WithFrameworkService(language string, factory FrameworkServiceFactory) *ExtensionHost {
+	er.frameworkServices = append(er.frameworkServices, FrameworkServiceRegistration{Language: language, Factory: factory})
+	return er
+}
+
+// WithProjectEventHandler registers a project-level event handler to be wired when Run is invoked.
+func (er *ExtensionHost) WithProjectEventHandler(eventName string, handler ProjectEventHandler) *ExtensionHost {
+	er.projectHandlers = append(er.projectHandlers, ProjectEventRegistration{EventName: eventName, Handler: handler})
+	return er
+}
+
+// WithServiceEventHandler registers a service-level event handler to be wired when Run is invoked.
+func (er *ExtensionHost) WithServiceEventHandler(
+	eventName string,
+	handler ServiceEventHandler,
+	options *ServiceEventOptions,
+) *ExtensionHost {
+	er.serviceHandlers = append(er.serviceHandlers, ServiceEventRegistration{
+		EventName: eventName,
+		Handler:   handler,
+		Options:   options,
+	})
+	return er
+}
+
+// WithProvisioningProvider registers a provisioning provider to be wired when Run is invoked.
+func (er *ExtensionHost) WithProvisioningProvider(
+	name string,
+	factory ProvisioningProviderFactory,
+) *ExtensionHost {
+	er.provisioningProviders = append(
+		er.provisioningProviders,
+		ProvisioningProviderRegistration{Name: name, Factory: factory},
+	)
+	return er
+}
+
+// WithValidationCheck registers a validation check to be wired when Run is invoked.
+// The checkType identifies the validation context (e.g. "provision"),
+// and the ruleID is a stable identifier for this check.
+func (er *ExtensionHost) WithValidationCheck(
+	reg ValidationCheckRegistration,
+) *ExtensionHost {
+	er.validationChecks = append(er.validationChecks, reg)
+	return er
+}
+
+// Run wires the configured service targets and event handlers, signals readiness, and blocks until shutdown.
+func (er *ExtensionHost) Run(ctx context.Context) error {
+	extensionId := getExtensionId(ctx)
+
+	// Wait for debugger if AZD_EXT_DEBUG is set
+	// When user declines or cancels, continue so extension doesn't exit while azd continues
+	_ = WaitForDebugger(ctx, er.client)
+
+	// Broker trace loggers are silent by default (io.Discard in NewMessageBroker).
+	// When AZD_EXT_DEBUG or AZD_DEBUG is truthy, enable verbose broker logging to
+	// stderr for diagnostics while keeping the global logger untouched.
+	// AZD_DEBUG is set automatically by azd core when the user passes --debug,
+	// so extension developers get consistent debug logging without needing to
+	// understand AZD_EXT_DEBUG separately.
+	// Uses strconv.ParseBool to match WaitForDebugger semantics (accepts
+	// "1", "t", "TRUE", "true", etc.).
+	var brokerLogger *log.Logger
+	if isDebug, err := strconv.ParseBool(os.Getenv("AZD_EXT_DEBUG")); err == nil && isDebug {
+		brokerLogger = log.New(os.Stderr, "", log.LstdFlags)
+	} else if isDebug, err := strconv.ParseBool(os.Getenv("AZD_DEBUG")); err == nil && isDebug {
+		brokerLogger = log.New(os.Stderr, "", log.LstdFlags)
+	}
+	er.initManagers(extensionId, brokerLogger)
+
+	// Determine which managers will be active
+	hasServiceTargets := len(er.serviceTargets) > 0
+	hasPreviewServiceTargets := len(er.previewHosts) > 0
+	hasFrameworkServices := len(er.frameworkServices) > 0
+	hasEventHandlers := len(er.projectHandlers) > 0 || len(er.serviceHandlers) > 0
+	hasProvisioningProviders := len(er.provisioningProviders) > 0
+	hasValidationChecks := len(er.validationChecks) > 0
+
+	// Set up defer for cleanup
+	defer func() {
+		if hasServiceTargets {
+			_ = er.serviceTargetManager.Close()
+		}
+		if hasPreviewServiceTargets {
+			_ = er.serviceTargetPreviewManager.Close()
+		}
+		if hasFrameworkServices {
+			_ = er.frameworkServiceManager.Close()
+		}
+		if hasEventHandlers {
+			_ = er.eventManager.Close()
+		}
+		if hasProvisioningProviders {
+			_ = er.provisioningManager.Close()
+		}
+		if hasValidationChecks {
+			_ = er.validationManager.Close()
+		}
+	}()
+
+	// Collect active receivers and start them BEFORE registration
+	// This ensures broker.Run() is active to receive registration responses
+	receivers := []serviceReceiver{}
+	if hasServiceTargets {
+		receivers = append(receivers, er.serviceTargetManager)
+	}
+	if hasPreviewServiceTargets {
+		receivers = append(receivers, er.serviceTargetPreviewManager)
+	}
+	if hasFrameworkServices {
+		receivers = append(receivers, er.frameworkServiceManager)
+	}
+	if hasEventHandlers {
+		receivers = append(receivers, er.eventManager)
+	}
+	if hasProvisioningProviders {
+		receivers = append(receivers, er.provisioningManager)
+	}
+	if hasValidationChecks {
+		receivers = append(receivers, er.validationManager)
+	}
+
+	// Start receiving messages from active managers in separate goroutines
+	// CRITICAL: This must happen BEFORE any Register() calls that use broker.Send()
+	var receiveWaitGroup sync.WaitGroup
+	receiverErrors := make(chan error, len(receivers))
+
+	for _, receiver := range receivers {
+		r := receiver
+		receiveWaitGroup.Go(func() {
+			if err := r.Receive(ctx); err != nil {
+				receiverErrors <- fmt.Errorf("receiver error: %w", err)
+			}
+		})
+	}
+
+	// Wait for all active receivers' brokers to signal readiness before starting registrations
+	var readyErrors []error
+	for _, receiver := range receivers {
+		if err := receiver.Ready(ctx); err != nil {
+			readyErrors = append(readyErrors, fmt.Errorf("receiver not ready: %w", err))
+		}
+	}
+
+	// Check if any managers failed to become ready
+	if len(readyErrors) > 0 {
+		return errors.Join(readyErrors...)
+	}
+
+	// Now that receivers are running, perform registrations
+	// The broker.Run() in each Receive() will process the registration responses
+
+	// Register all registrations in parallel - service targets, framework services, event handlers, and provisioning
+	var registrationsWaitGroup sync.WaitGroup
+	totalCount := len(er.serviceTargets) + len(er.frameworkServices) +
+		len(er.projectHandlers) + len(er.serviceHandlers) +
+		len(er.provisioningProviders) + len(er.validationChecks)
+	registrationErrChan := make(chan error, totalCount)
+
+	// Register service targets in parallel
+	for _, reg := range er.serviceTargets {
+		if reg.Factory == nil {
+			return fmt.Errorf("service target provider for host '%s' is nil", reg.Host)
+		}
+
+		r := reg
+		registrationsWaitGroup.Go(func() {
+			if err := er.serviceTargetManager.Register(ctx, r.Factory, r.Host); err != nil {
+				registrationErrChan <- fmt.Errorf("failed to register service target '%s': %w", r.Host, err)
+				return
+			}
+
+			// Preview is optional and registered only after the stable host is owned by this extension.
+			// azd versions without the preview override reject it as a duplicate registration,
+			// and normal deployment must keep working there.
+			if er.previewHosts[r.Host] {
+				if err := er.serviceTargetPreviewManager.Register(ctx, r.Factory, r.Host); err != nil {
+					log.Printf("deployment preview is unavailable for service target '%s': %v", r.Host, err)
+				}
+			}
+		})
+	}
+
+	// Register framework services in parallel
+	for _, reg := range er.frameworkServices {
+		if reg.Factory == nil {
+			return fmt.Errorf("framework service provider for language '%s' is nil", reg.Language)
+		}
+
+		r := reg
+		registrationsWaitGroup.Go(func() {
+			if err := er.frameworkServiceManager.Register(ctx, r.Factory, r.Language); err != nil {
+				registrationErrChan <- fmt.Errorf("failed to register framework service '%s': %w", r.Language, err)
+			}
+		})
+	}
+
+	// Register project event handlers in parallel
+	for _, reg := range er.projectHandlers {
+		if reg.Handler == nil {
+			return fmt.Errorf("project event handler for '%s' is nil", reg.EventName)
+		}
+
+		r := reg
+		registrationsWaitGroup.Go(func() {
+			if err := er.eventManager.AddProjectEventHandler(ctx, r.EventName, r.Handler); err != nil {
+				registrationErrChan <- fmt.Errorf("failed to add project event handler '%s': %w", r.EventName, err)
+			}
+		})
+	}
+
+	// Register service event handlers in parallel
+	for _, reg := range er.serviceHandlers {
+		if reg.Handler == nil {
+			return fmt.Errorf("service event handler for '%s' is nil", reg.EventName)
+		}
+
+		r := reg
+		registrationsWaitGroup.Go(func() {
+			if err := er.eventManager.AddServiceEventHandler(ctx, r.EventName, r.Handler, r.Options); err != nil {
+				registrationErrChan <- fmt.Errorf("failed to add service event handler '%s': %w", r.EventName, err)
+			}
+		})
+	}
+
+	// Register provisioning providers in parallel
+	for _, reg := range er.provisioningProviders {
+		if reg.Factory == nil {
+			return fmt.Errorf("provisioning provider for '%s' is nil", reg.Name)
+		}
+
+		r := reg
+		registrationsWaitGroup.Go(func() {
+			if err := er.provisioningManager.Register(ctx, r.Factory, r.Name); err != nil {
+				registrationErrChan <- fmt.Errorf(
+					"failed to register provisioning provider '%s': %w", r.Name, err,
+				)
+			}
+		})
+	}
+
+	// Register validation checks in parallel
+	for _, reg := range er.validationChecks {
+		if reg.Factory == nil {
+			return fmt.Errorf(
+				"validation check factory for '%s/%s' is nil",
+				reg.CheckType, reg.RuleID,
+			)
+		}
+
+		r := reg
+		registrationsWaitGroup.Go(func() {
+			if err := er.validationManager.Register(
+				ctx, r.Factory, r.CheckType, r.RuleID,
+			); err != nil {
+				registrationErrChan <- fmt.Errorf(
+					"failed to register validation check '%s/%s': %w",
+					r.CheckType, r.RuleID, err,
+				)
+			}
+		})
+	}
+
+	// Wait for ALL registrations to complete in parallel
+	registrationsWaitGroup.Wait()
+	close(registrationErrChan)
+
+	// Check for any registration errors - collect all errors
+	var registrationErrors []error
+	for err := range registrationErrChan {
+		registrationErrors = append(registrationErrors, err)
+	}
+
+	if len(registrationErrors) > 0 {
+		if len(registrationErrors) == 1 {
+			return registrationErrors[0]
+		}
+		// Multiple errors - combine them using Go's standard error joining
+		return errors.Join(registrationErrors...)
+	}
+
+	// Signal readiness after all registrations are complete
+	if err := callReady(ctx, er.client); err != nil {
+		return err
+	}
+
+	// If no receivers, just return after signaling ready
+	if len(receivers) == 0 {
+		return nil
+	}
+
+	// Wait for all receivers to complete and monitor for errors
+	receiversDone := make(chan struct{})
+	go func() {
+		receiveWaitGroup.Wait()
+		close(receiverErrors)
+		close(receiversDone)
+	}()
+
+	// Block until context cancellation, receiver error, or receivers complete
+	select {
+	case <-ctx.Done():
+		log.Println("Extension host context cancelled, shutting down")
+		return nil // Context cancellation is expected, not an error
+	case err := <-receiverErrors:
+		if err != nil {
+			return err
+		}
+		// Continue waiting for more errors or completion
+		return nil
+	case <-receiversDone:
+		// All receivers completed normally
+		return nil
+	}
+}
+
+func callReady(ctx context.Context, client *AzdClient) error {
+	_, err := client.Extension().Ready(ctx, &ReadyRequest{})
+	if err == nil {
+		return nil
+	}
+
+	switch status.Code(err) {
+	case codes.Canceled, codes.Unavailable:
+		return nil
+	default:
+		return fmt.Errorf("failed to signal readiness (status=%s): %w", status.Code(err), err)
+	}
+}

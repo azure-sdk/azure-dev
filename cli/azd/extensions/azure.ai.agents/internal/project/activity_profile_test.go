@@ -1,0 +1,447 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package project
+
+import (
+	"testing"
+
+	"azureaiagent/internal/pkg/agents/agent_api"
+	"azureaiagent/internal/pkg/agents/agent_yaml"
+	"azureaiagent/internal/pkg/envkey"
+
+	"github.com/azure/azure-dev/cli/azd/pkg/azdext"
+	"github.com/stretchr/testify/require"
+)
+
+func TestIsActivityProtocol(t *testing.T) {
+	tests := []struct {
+		name string
+		ca   agent_yaml.ContainerAgent
+		want bool
+	}{
+		{
+			name: "container activity",
+			ca: agent_yaml.ContainerAgent{
+				Protocols: []agent_yaml.ProtocolVersionRecord{
+					{Protocol: "activity", Version: "2.0.0"},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "endpoint activity protocol",
+			ca: agent_yaml.ContainerAgent{
+				AgentEndpoint: &agent_yaml.AgentEndpoint{
+					Protocols: []string{"activity"},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "legacy activity_protocol with surrounding whitespace",
+			ca: agent_yaml.ContainerAgent{
+				Protocols: []agent_yaml.ProtocolVersionRecord{
+					{Protocol: " activity_protocol ", Version: "v1"},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "responses protocol only",
+			ca: agent_yaml.ContainerAgent{
+				Protocols: []agent_yaml.ProtocolVersionRecord{
+					{Protocol: "responses", Version: "2.0.0"},
+				},
+				AgentEndpoint: &agent_yaml.AgentEndpoint{
+					Protocols: []string{"responses"},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "empty definition",
+			ca:   agent_yaml.ContainerAgent{},
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsActivityProtocol(tc.ca); got != tc.want {
+				t.Errorf("IsActivityProtocol() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveActivityProfile(t *testing.T) {
+	t.Run("activity agent resolves simple", func(t *testing.T) {
+		ca := agent_yaml.ContainerAgent{
+			Protocols: []agent_yaml.ProtocolVersionRecord{
+				{Protocol: "activity", Version: "2.0.0"},
+			},
+		}
+		got := ResolveActivityProfile(ca)
+		if !got.IsActivity {
+			t.Fatalf("expected IsActivity=true")
+		}
+		if got.UseCase != ActivityUseCaseSimple {
+			t.Errorf("UseCase = %q, want %q", got.UseCase, ActivityUseCaseSimple)
+		}
+	})
+
+	t.Run("non-activity agent resolves empty profile", func(t *testing.T) {
+		ca := agent_yaml.ContainerAgent{
+			Protocols: []agent_yaml.ProtocolVersionRecord{
+				{Protocol: "responses", Version: "2.0.0"},
+			},
+		}
+		got := ResolveActivityProfile(ca)
+		if got.IsActivity {
+			t.Fatalf("expected IsActivity=false")
+		}
+		if got.UseCase != "" {
+			t.Errorf("UseCase = %q, want empty", got.UseCase)
+		}
+	})
+}
+
+func TestResolveActivityProfileWithSettings(t *testing.T) {
+	activityAgent := agent_yaml.ContainerAgent{
+		Protocols: []agent_yaml.ProtocolVersionRecord{{Protocol: "activity", Version: "2.0.0"}},
+	}
+
+	t.Run("digital worker resolves", func(t *testing.T) {
+		profile, err := ResolveActivityProfileWithSettings(activityAgent, &ActivitySettings{
+			DigitalWorkerType: agent_api.DigitalWorkerTypeM365,
+			Publish: &ActivityPublishConfig{
+				PublishScope: "tenant",
+			},
+		})
+		require.NoError(t, err)
+		require.True(t, profile.IsActivity)
+		require.Equal(t, ActivityUseCaseDigitalWorker, profile.UseCase)
+	})
+
+	t.Run("digital worker allows omitted publish block", func(t *testing.T) {
+		profile, err := ResolveActivityProfileWithSettings(activityAgent, &ActivitySettings{
+			DigitalWorkerType: agent_api.DigitalWorkerTypeM365,
+		})
+		require.NoError(t, err)
+		require.Equal(t, ActivityUseCaseDigitalWorker, profile.UseCase)
+	})
+
+	t.Run("classification allows publish fields to be overridden later", func(t *testing.T) {
+		boundaries := []string{"invalid.boundary"}
+		profile, err := ResolveActivityProfileWithSettings(activityAgent, &ActivitySettings{
+			DigitalWorkerType: agent_api.DigitalWorkerTypeM365,
+			Publish: &ActivityPublishConfig{
+				PublishScope: "shared",
+				OptionalPermissionScopes: []Microsoft365PermissionScopes{
+					{Scopes: []string{""}},
+				},
+				AccessBoundaries: &boundaries,
+			},
+		})
+		require.NoError(t, err)
+		require.Equal(t, ActivityUseCaseDigitalWorker, profile.UseCase)
+	})
+
+	t.Run("digital worker accepts optional permissions and boundaries", func(t *testing.T) {
+		boundaries := []string{"read.1on1.developers", "write.group.developers"}
+		profile, err := ResolveActivityProfileWithSettings(activityAgent, &ActivitySettings{
+			DigitalWorkerType: agent_api.DigitalWorkerTypeM365,
+			Publish: &ActivityPublishConfig{
+				OptionalPermissionScopes: []Microsoft365PermissionScopes{
+					{ResourceAppID: "resource-app", Scopes: []string{"McpServers.Mail.All"}},
+				},
+				AccessBoundaries: &boundaries,
+			},
+		})
+		require.NoError(t, err)
+		require.Equal(t, ActivityUseCaseDigitalWorker, profile.UseCase)
+		require.True(t, profile.IsActivity)
+	})
+
+	t.Run("digital worker rejects missing resource app id", func(t *testing.T) {
+		_, err := ResolveActivityProfileForDeploy(activityAgent, &ActivitySettings{
+			DigitalWorkerType: agent_api.DigitalWorkerTypeM365,
+			Publish: &ActivityPublishConfig{
+				OptionalPermissionScopes: []Microsoft365PermissionScopes{
+					{Scopes: []string{"McpServers.Mail.All"}},
+				},
+			},
+		})
+		require.ErrorContains(t, err, "resourceAppId is required")
+	})
+
+	t.Run("digital worker rejects empty permission scopes", func(t *testing.T) {
+		_, err := ResolveActivityProfileForDeploy(activityAgent, &ActivitySettings{
+			DigitalWorkerType: agent_api.DigitalWorkerTypeM365,
+			Publish: &ActivityPublishConfig{
+				OptionalPermissionScopes: []Microsoft365PermissionScopes{
+					{ResourceAppID: "resource-app"},
+				},
+			},
+		})
+		require.ErrorContains(t, err, "scopes must not be empty")
+	})
+
+	t.Run("digital worker requires tenant publish scope", func(t *testing.T) {
+		_, err := ResolveActivityProfileForDeploy(activityAgent, &ActivitySettings{
+			DigitalWorkerType: agent_api.DigitalWorkerTypeM365,
+			Publish: &ActivityPublishConfig{
+				PublishScope: "shared",
+			},
+		})
+		require.ErrorContains(t, err, "publishScope must be tenant")
+	})
+
+	t.Run("digital worker rejects unsupported access boundary", func(t *testing.T) {
+		boundaries := []string{"read.1on1.tenant"}
+		_, err := ResolveActivityProfileForDeploy(activityAgent, &ActivitySettings{
+			DigitalWorkerType: agent_api.DigitalWorkerTypeM365,
+			Publish:           &ActivityPublishConfig{AccessBoundaries: &boundaries},
+		})
+		require.ErrorContains(t, err, "unsupported value")
+	})
+
+	t.Run("digital worker requires activity protocol", func(t *testing.T) {
+		_, err := ResolveActivityProfileWithSettings(agent_yaml.ContainerAgent{}, &ActivitySettings{
+			DigitalWorkerType: agent_api.DigitalWorkerTypeM365,
+		})
+		require.ErrorContains(t, err, "Activity-protocol")
+	})
+
+	t.Run("simple rejects optional permission scopes", func(t *testing.T) {
+		_, err := ResolveActivityProfileForDeploy(activityAgent, &ActivitySettings{
+			Publish: &ActivityPublishConfig{OptionalPermissionScopes: []Microsoft365PermissionScopes{}},
+		})
+		require.ErrorContains(t, err, "activity.digitalWorkerType=m365")
+	})
+
+	t.Run("simple rejects access boundaries", func(t *testing.T) {
+		boundaries := []string{}
+		_, err := ResolveActivityProfileForDeploy(activityAgent, &ActivitySettings{
+			Publish: &ActivityPublishConfig{AccessBoundaries: &boundaries},
+		})
+		require.ErrorContains(t, err, "activity.digitalWorkerType=m365")
+	})
+
+	t.Run("unsupported digital worker type rejected", func(t *testing.T) {
+		_, err := ResolveActivityProfileWithSettings(activityAgent, &ActivitySettings{
+			DigitalWorkerType: agent_api.DigitalWorkerType("slack"),
+		})
+		require.ErrorContains(t, err, `activity.digitalWorkerType must be "m365" when specified`)
+	})
+}
+
+func TestResolveDeployedActivityProfile(t *testing.T) {
+	t.Run("service m365 overrides local simple", func(t *testing.T) {
+		got, err := ResolveDeployedActivityProfile(
+			ActivityProfile{IsActivity: true, UseCase: ActivityUseCaseSimple},
+			agent_api.DigitalWorkerTypeM365,
+		)
+		require.NoError(t, err)
+		require.Equal(t, ActivityUseCaseDigitalWorker, got.UseCase)
+	})
+
+	t.Run("configured digital worker requires service classification", func(t *testing.T) {
+		_, err := ResolveDeployedActivityProfile(
+			ActivityProfile{IsActivity: true, UseCase: ActivityUseCaseDigitalWorker},
+			"",
+		)
+		require.ErrorContains(t, err, "no digital_worker_type")
+	})
+
+	t.Run("unknown service classification is rejected", func(t *testing.T) {
+		_, err := ResolveDeployedActivityProfile(
+			ActivityProfile{IsActivity: true, UseCase: ActivityUseCaseSimple},
+			"future-worker",
+		)
+		require.ErrorContains(t, err, "unsupported digital_worker_type")
+	})
+}
+
+func TestDigitalWorkerTypeMismatchSuggestionRequiresRecreation(t *testing.T) {
+	t.Parallel()
+
+	suggestion := digitalWorkerTypeMismatchSuggestion()
+	require.Contains(t, suggestion, "delete and recreate")
+	require.NotContains(t, suggestion, "redeploy")
+}
+
+func TestDigitalWorkerBotTransitionWarning(t *testing.T) {
+	t.Parallel()
+
+	serviceName := "worker"
+	profile := ActivityProfile{IsActivity: true, UseCase: ActivityUseCaseDigitalWorker}
+	env := map[string]string{
+		envkey.AgentBotName(serviceName):          "legacy-bot",
+		envkey.AgentBotResourceGroup(serviceName): "legacy-rg",
+		envkey.AgentBotOwned(serviceName):         "true",
+	}
+
+	warning := digitalWorkerBotTransitionWarning(serviceName, profile, env)
+	require.Contains(t, warning, `service "worker" changed to digital_worker`)
+	require.Contains(t, warning, `Azure Bot "legacy-bot"`)
+	require.Contains(t, warning, `resource group "legacy-rg"`)
+	require.Contains(t, warning, "delete the legacy Bot manually")
+
+	require.Empty(t, digitalWorkerBotTransitionWarning(serviceName, ActivityProfile{
+		UseCase: ActivityUseCaseSimple,
+	}, env))
+}
+
+// TestActivityDeclarationSurvivesInitRoundTrip locks the behavior that
+// `azd ai agent init` preserves the activity-protocol declaration (container
+// protocols + agent_endpoint) when it moves an agent definition into azure.yaml
+// service properties. Without this, postdeploy's activity gate would never fire
+// on an init-generated project. It guards against a future refactor silently
+// dropping AgentEndpoint/Protocols from the inline round-trip.
+func TestActivityDeclarationSurvivesInitRoundTrip(t *testing.T) {
+	src := agent_yaml.ContainerAgent{
+		AgentDefinition: agent_yaml.AgentDefinition{
+			Kind: agent_yaml.AgentKindHosted,
+			Name: "echo28ju3pm",
+		},
+		Protocols: []agent_yaml.ProtocolVersionRecord{
+			{Protocol: "activity_protocol", Version: "v1"},
+		},
+		AgentEndpoint: &agent_yaml.AgentEndpoint{
+			Protocols: []string{"activity"},
+			AuthorizationSchemes: []agent_yaml.AuthorizationScheme{
+				{Type: "BotServiceRbac"},
+			},
+		},
+	}
+
+	props, err := AgentDefinitionToServiceProperties(src, nil)
+	require.NoError(t, err)
+
+	svc := &azdext.ServiceConfig{
+		Name:                 "echo28ju3pm",
+		Host:                 "azure.ai.agent",
+		AdditionalProperties: props,
+	}
+
+	got, isHosted, found, _, err := AgentDefinitionFromService(svc)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, isHosted)
+
+	require.True(t, IsActivityProtocol(got), "activity declaration must survive the round-trip")
+	require.True(t, ResolveActivityProfile(got).IsActivity)
+
+	require.Len(t, got.Protocols, 1)
+	require.Equal(t, "activity_protocol", got.Protocols[0].Protocol)
+	require.NotNil(t, got.AgentEndpoint)
+	require.Equal(t, []string{"activity"}, got.AgentEndpoint.Protocols)
+	require.Len(t, got.AgentEndpoint.AuthorizationSchemes, 1)
+	require.Equal(t, "BotServiceRbac", got.AgentEndpoint.AuthorizationSchemes[0].Type)
+}
+
+// expectedActivityEndpoint is the agent_endpoint shape a pure-activity agent must
+// carry: the friendly "activity" protocol guarded by BotServiceRbac. It is the
+// expected-shape oracle for these tests — it mirrors what ComposeActivityAgentEndpoint
+// produces for an activity-only selection and what the manifest path emits, so the
+// tests can assert both init paths converge on the same declaration.
+func expectedActivityEndpoint() *agent_yaml.AgentEndpoint {
+	return &agent_yaml.AgentEndpoint{
+		Protocols: []string{"activity"},
+		AuthorizationSchemes: []agent_yaml.AuthorizationScheme{
+			{Type: "BotServiceRbac"},
+		},
+	}
+}
+
+// TestActivityAgentEndpoint pins the endpoint declaration that `azd init` from
+// local code injects for an activity_protocol agent. It must match the
+// manifest-based shape (friendly "activity" protocol guarded by BotServiceRbac)
+// so the two init paths produce identical azure.yaml and both satisfy deploy.
+func TestActivityAgentEndpoint(t *testing.T) {
+	ep := expectedActivityEndpoint()
+	require.NotNil(t, ep)
+	require.Equal(t, []string{"activity"}, ep.Protocols)
+	require.Len(t, ep.AuthorizationSchemes, 1)
+	require.Equal(t, "BotServiceRbac", ep.AuthorizationSchemes[0].Type)
+
+	// A definition assembled the way init_from_code does (protocol record +
+	// injected endpoint) must be recognized as an activity agent.
+	ca := agent_yaml.ContainerAgent{
+		AgentDefinition: agent_yaml.AgentDefinition{Kind: agent_yaml.AgentKindHosted, Name: "echo"},
+		Protocols:       []agent_yaml.ProtocolVersionRecord{{Protocol: "activity_protocol", Version: "v1"}},
+		AgentEndpoint:   expectedActivityEndpoint(),
+	}
+	require.True(t, IsActivityProtocol(ca))
+	require.Equal(t, ActivityUseCaseSimple, ResolveActivityProfile(ca).UseCase)
+}
+
+// TestComposeActivityAgentEndpoint verifies that Activity requirements are folded
+// into an agent's agent_endpoint instead of overwriting it, so Activity can
+// coexist with other protocols. A pure-activity agent must still produce the
+// exact expectedActivityEndpoint() shape.
+func TestComposeActivityAgentEndpoint(t *testing.T) {
+	t.Run("pure activity matches expectedActivityEndpoint", func(t *testing.T) {
+		ep := ComposeActivityAgentEndpoint(nil, []agent_yaml.ProtocolVersionRecord{
+			{Protocol: "activity", Version: "2.0.0"},
+		})
+		require.Equal(t, []string{"activity"}, ep.Protocols)
+		require.Len(t, ep.AuthorizationSchemes, 1)
+		require.Equal(t, "BotServiceRbac", ep.AuthorizationSchemes[0].Type)
+	})
+
+	t.Run("activity coexists with responses and invocations", func(t *testing.T) {
+		ep := ComposeActivityAgentEndpoint(nil, []agent_yaml.ProtocolVersionRecord{
+			{Protocol: "responses", Version: "2.0.0"},
+			{Protocol: "invocations", Version: "1.0.0"},
+			{Protocol: "activity", Version: "2.0.0"},
+		})
+		require.Equal(t, []string{"responses", "invocations", "activity"}, ep.Protocols)
+		require.Len(t, ep.AuthorizationSchemes, 1)
+		require.Equal(t, "BotServiceRbac", ep.AuthorizationSchemes[0].Type)
+	})
+
+	t.Run("legacy activity_protocol is normalized to activity", func(t *testing.T) {
+		ep := ComposeActivityAgentEndpoint(nil, []agent_yaml.ProtocolVersionRecord{
+			{Protocol: "responses", Version: "2.0.0"},
+			{Protocol: "activity_protocol", Version: "v1"},
+		})
+		require.Equal(t, []string{"responses", "activity"}, ep.Protocols)
+	})
+
+	t.Run("existing schemes are preserved and rbac is not duplicated", func(t *testing.T) {
+		existing := &agent_yaml.AgentEndpoint{
+			Protocols: []string{"responses"},
+			AuthorizationSchemes: []agent_yaml.AuthorizationScheme{
+				{Type: "EntraId"},
+				{Type: "BotServiceRbac"},
+			},
+		}
+		ep := ComposeActivityAgentEndpoint(existing, []agent_yaml.ProtocolVersionRecord{
+			{Protocol: "responses", Version: "2.0.0"},
+			{Protocol: "activity", Version: "2.0.0"},
+		})
+		require.Equal(t, []string{"responses", "activity"}, ep.Protocols)
+		require.Len(t, ep.AuthorizationSchemes, 2)
+		require.Equal(t, "EntraId", ep.AuthorizationSchemes[0].Type)
+		require.Equal(t, "BotServiceRbac", ep.AuthorizationSchemes[1].Type)
+	})
+
+	t.Run("explicit scheme without rbac is preserved", func(t *testing.T) {
+		existing := &agent_yaml.AgentEndpoint{
+			AuthorizationSchemes: []agent_yaml.AuthorizationScheme{
+				{Type: "BotServiceTenant"},
+			},
+		}
+
+		ep := ComposeActivityAgentEndpoint(existing, []agent_yaml.ProtocolVersionRecord{
+			{Protocol: "activity", Version: "2.0.0"},
+		})
+
+		require.Equal(t, []agent_yaml.AuthorizationScheme{
+			{Type: "BotServiceTenant"},
+		}, ep.AuthorizationSchemes)
+	})
+}

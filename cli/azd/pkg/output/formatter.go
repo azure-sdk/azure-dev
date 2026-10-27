@@ -4,7 +4,6 @@
 package output
 
 import (
-	"context"
 	"fmt"
 	"io"
 )
@@ -20,7 +19,14 @@ const (
 
 type Formatter interface {
 	Kind() Format
-	Format(obj interface{}, writer io.Writer, opts interface{}) error
+	Format(obj any, writer io.Writer, opts any) error
+}
+
+// Queryable is an optional interface that a Formatter may implement to support
+// JMESPath filtering on arbitrary objects. Console messages (e.g. error output)
+// use this to apply --query without going through the full Format() pipeline.
+type Queryable interface {
+	QueryFilter(obj any) (any, error)
 }
 
 func NewFormatter(format string) (Formatter, error) {
@@ -36,43 +42,4 @@ func NewFormatter(format string) (Formatter, error) {
 	default:
 		return nil, fmt.Errorf("unsupported format %v", format)
 	}
-}
-
-type contextKey string
-
-const (
-	formatterContextKey contextKey = "formatter"
-	writerContextKey    contextKey = "writer"
-)
-
-// Sets the output formatter that will be used to format data back to std out
-func WithFormatter(ctx context.Context, formatter Formatter) context.Context {
-	return context.WithValue(ctx, formatterContextKey, formatter)
-}
-
-// Gets the formatter that had been previously specified.
-// If not found will default to `None` formatter.
-func GetFormatter(ctx context.Context) Formatter {
-	formatter, ok := ctx.Value(formatterContextKey).(Formatter)
-	if !ok {
-		return &NoneFormatter{}
-	}
-
-	return formatter
-}
-
-// Sets the io.Writer implementation used for printing to std out
-func WithWriter(ctx context.Context, writer io.Writer) context.Context {
-	return context.WithValue(ctx, writerContextKey, writer)
-}
-
-// Gets the io.Writer implementation previously specified.
-// If not found will return a default writer implementation.
-func GetWriter(ctx context.Context) io.Writer {
-	writer, ok := ctx.Value(writerContextKey).(io.Writer)
-	if !ok {
-		return GetDefaultWriter()
-	}
-
-	return writer
 }

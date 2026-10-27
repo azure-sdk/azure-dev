@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
 package appinsightsexporter
 
 import (
@@ -70,7 +73,7 @@ func newTestClientServer() (Transmitter, *testServer) {
 	return client, server
 }
 
-func newTestTlsClientServer(t *testing.T) (Transmitter, *testServer) {
+func newTestTlsClientServer() (Transmitter, *testServer) {
 	server := &testServer{}
 	server.server = httptest.NewTLSServer(server)
 	server.notify = make(chan *testRequest, 1)
@@ -78,18 +81,23 @@ func newTestTlsClientServer(t *testing.T) (Transmitter, *testServer) {
 	server.responseData = make([]byte, 0)
 	server.responseHeaders = make(map[string]string)
 
-	client := NewTransmitter(fmt.Sprintf("https://%s/v2/track", server.server.Listener.Addr().String()), server.server.Client())
+	client := NewTransmitter(
+		fmt.Sprintf("https://%s/v2/track", server.server.Listener.Addr().String()),
+		server.server.Client(),
+	)
 
 	return client, server
 }
 
 func TestBasicTransitTls(t *testing.T) {
-	client, server := newTestTlsClientServer(t)
+	t.Parallel()
+	client, server := newTestTlsClientServer()
 
 	doBasicTransmit(client, server, t)
 }
 
 func TestBasicTransmit(t *testing.T) {
+	t.Parallel()
 	client, server := newTestClientServer()
 
 	doBasicTransmit(client, server, t)
@@ -100,9 +108,9 @@ func doBasicTransmit(client Transmitter, server *testServer, t *testing.T) {
 
 	server.responseData = []byte(`{"itemsReceived":3, "itemsAccepted":5, "errors":[]}`)
 	server.responseHeaders["Content-type"] = "application/json"
-	result, err := client.Transmit([]byte("foobar"), make(TelemetryItems, 0))
+	result, err := client.Transmit(t.Context(), []byte("foobar"), make(TelemetryItems, 0))
 	if err != nil {
-		fmt.Println(err.Error())
+		t.Log(err.Error())
 	}
 	req := server.waitForRequest(t)
 
@@ -171,13 +179,16 @@ func doBasicTransmit(client Transmitter, server *testServer, t *testing.T) {
 }
 
 func TestFailedTransmit(t *testing.T) {
+	t.Parallel()
 	client, server := newTestClientServer()
 	defer server.Close()
 
 	server.responseCode = errorResponse
-	server.responseData = []byte(`{"itemsReceived":3, "itemsAccepted":0, "errors":[{"index": 2, "statusCode": 500, "message": "Hello"}]}`)
+	server.responseData = []byte(
+		`{"itemsReceived":3, "itemsAccepted":0, "errors":[{"index": 2, "statusCode": 500, "message": "Hello"}]}`,
+	)
 	server.responseHeaders["Content-type"] = "application/json"
-	result, err := client.Transmit([]byte("foobar"), make(TelemetryItems, 0))
+	result, err := client.Transmit(t.Context(), []byte("foobar"), make(TelemetryItems, 0))
 	server.waitForRequest(t)
 
 	if err != nil {
@@ -222,6 +233,7 @@ func TestFailedTransmit(t *testing.T) {
 }
 
 func TestThrottledTransmit(t *testing.T) {
+	t.Parallel()
 	client, server := newTestClientServer()
 	defer server.Close()
 
@@ -229,7 +241,7 @@ func TestThrottledTransmit(t *testing.T) {
 	server.responseData = make([]byte, 0)
 	server.responseHeaders["Content-type"] = "application/json"
 	server.responseHeaders["retry-after"] = "Wed, 09 Aug 2017 23:43:57 UTC"
-	result, err := client.Transmit([]byte("foobar"), make(TelemetryItems, 0))
+	result, err := client.Transmit(t.Context(), []byte("foobar"), make(TelemetryItems, 0))
 	server.waitForRequest(t)
 
 	if err != nil {
@@ -309,6 +321,7 @@ func checkTransmitResult(t *testing.T, result *TransmissionResult, expected *res
 }
 
 func TestTransmitResults(t *testing.T) {
+	t.Parallel()
 	retryAfter := time.Unix(1502322237, 0)
 	partialNoRetries := &BackendResponse{
 		ItemsAccepted: 3,
@@ -379,6 +392,7 @@ func TestTransmitResults(t *testing.T) {
 }
 
 func TestGetRetryItems(t *testing.T) {
+	t.Parallel()
 	// Keep a pristine copy.
 	originalPayload, originalItems := makePayload()
 
@@ -422,7 +436,7 @@ func TestGetRetryItems(t *testing.T) {
 
 func makePayload() ([]byte, TelemetryItems) {
 	var buffer TelemetryItems
-	for i := 0; i < 7; i++ {
+	for range 7 {
 		buffer = append(buffer, *SpanToEnvelope(getDefaultSpanStub().Snapshot()))
 	}
 

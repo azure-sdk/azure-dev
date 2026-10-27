@@ -1,0 +1,2553 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package cmd
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"slices"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"azureaiagent/internal/cmd/nextstep"
+	"azureaiagent/internal/exterrors"
+	"azureaiagent/internal/pkg/agents/agent_api"
+	"azureaiagent/internal/telemetry"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/azure/azure-dev/cli/azd/pkg/azdext"
+	foundryTelemetry "github.com/azure/azure-dev/cli/azd/pkg/foundry/telemetry"
+	"github.com/fatih/color"
+	"github.com/spf13/cobra"
+)
+
+type invokeFlags struct {
+	userIdentityFlags
+	message         string
+	inputFile       string
+	local           bool
+	name            string
+	port            int
+	timeout         int
+	session         string
+	newSession      bool
+	conversation    string
+	newConversation bool
+	protocol        string
+	agentEndpoint   string
+	version         string
+	outputFmt       string
+	callID          string
+	clientHeaders   []string
+	longRunning     bool
+	noWait          bool
+	debugLatency    bool
+}
+
+func (f *invokeFlags) forceNewConversation() bool {
+	return f.newConversation || f.newSession
+}
+
+// outputRaw is the sentinel value of the inherited --output flag that selects
+// raw mode. In raw mode the full HTTP response (status line, headers, and body)
+// is dumped to stdout without any parsing or formatting, mirroring `curl -i`.
+const outputRaw = "raw"
+
+// outputDefault preserves the existing parsed/friendly behavior. It is the
+// SDK-substituted default when the user does not pass --output. We register
+// the per-command default explicitly so the help text matches behavior.
+const outputDefault = "default"
+
+const defaultInvokeTimeoutSeconds = 30 * 60
+const maxInvokeVersionLength = 128
+
+var createInvokeVersionSession = createInvokeVersionSessionImpl
+
+type InvokeAction struct {
+	flags                 *invokeFlags
+	noPrompt              bool
+	debugLatencyExplicit  bool
+	endpoint              *parsedAgentEndpoint
+	clientHeaders         http.Header
+	protocolServiceName   string
+	resolvedRemoteContext *remoteContext
+	resolvedBody          []byte
+	resolvedBodyLabel     string
+	bodyResolved          bool
+	credential            azcore.TokenCredential
+	invokeReporter        foundryTelemetry.Reporter
+}
+
+func newInvokeCommand(extCtx *azdext.ExtensionContext) *cobra.Command {
+	flags := &invokeFlags{}
+	extCtx = ensureExtensionContext(extCtx)
+
+	cmd := &cobra.Command{
+		Use:   "invoke [name] [message]",
+		Short: "Send a message to your prompt or hosted agent.",
+		Long: `Send a message to your prompt or hosted agent.
+
+Invocation Target:
+By default the agent is invoked remotely on Foundry. When a single
+argument is provided it is treated as the message and the agent name
+is auto-detected from azure.yaml. With two arguments the first is the
+agent name and the second is the message.
+
+When --protocol is omitted, complete deployed endpoint data is used when
+available. Endpoint data created by an older extension must be refreshed by
+redeploying or bypassed with --protocol. Otherwise the agent definition is
+used. If neither identifies exactly one invocable protocol, pass --protocol
+explicitly.
+
+Voice Agents:
+For prompt voice agents and hosted voice wrappers, open your agent in the
+Microsoft Foundry portal at https://ai.azure.com to try it.
+For programmatic voice access, use the voice WebSocket endpoint shown by 'azd show' or
+'azd ai agent show' with a Voice Live client. Text invoke is for HTTP-based
+hosted agent protocols such as responses, invocations, and a2a.
+
+Request Body:
+Use --input-file/-f to send the contents of a file as the request body
+instead of a positional message argument. This is useful for structured
+or large payloads with the invocations protocol, or for sending a complete
+JSON-RPC request with the a2a protocol.
+
+Local Development:
+Use --local to target a locally running agent (started via 'azd ai agent run')
+instead of Foundry. The a2a protocol is remote-only and cannot be used with
+--local.
+
+Sessions & Identity:
+Sessions are persisted per-agent — consecutive invokes reuse the same
+session automatically. Pass --new-session to force a reset.
+
+Use --version to invoke a specific deployed agent version. When provided,
+azd creates or reuses a hosted agent session backed by that version.
+
+For agents configured with header-based isolation, pass --user-identity
+on each invoke. Locally it is sent as the x-agent-user-id header; for
+remote invokes it is sent as the x-ms-user-identity header.
+
+Use --call-id to send a call ID with a local invoke. It is sent as the
+x-agent-foundry-call-id header and applies only to local invocations; it is
+ignored for remote requests.
+
+Use --client-header to send custom x-client-* request headers in "Name: Value"
+format (repeatable). The responses and invocations protocols forward the
+x-client-* header family to the agent; other header names are rejected, and
+the flag is not supported with the a2a protocol (which does not propagate
+x-client-* headers). For identity headers use --user-identity or --call-id.
+
+Response Output:
+Use --output raw (or -o raw) to dump the unmodified server response (status
+line, headers, and body verbatim) to stdout. Useful for debugging server
+behavior and inspecting response headers (for example, the agent version
+header). Friendly summary lines like "Session:" and "Invocation:" are
+suppressed in raw mode.
+
+Platform Latency:
+Remote Hosted Agent Responses and Invocations requests include platform latency diagnostics
+by default. A compact summary is shown after a successful invocation when the
+service returns timing headers. Use --debug-latency=false to disable collection
+and the summary. This is independent of the global --debug logging flag.
+Local, prompt-agent, and a2a invokes do not collect platform latency.
+Explicit --debug-latency=true is rejected for these routes; omit the flag
+or use --debug-latency=false.
+Raw output includes the returned headers without a formatted latency summary.
+
+Long-running Invocations:
+Use --long-running with the Responses protocol to start work that continues running in
+the service if this command disconnects. The command remains attached until the work
+finishes. Add --no-wait to return after azd receives the Response ID.
+This option does not provide crash recovery or automatic reconnection.`,
+		Example: `  # Invoke the remote agent on Foundry (auto-detects agent from azure.yaml)
+  azd ai agent invoke "Hello!"
+
+  # Invoke a specific remote agent by name
+  azd ai agent invoke my-agent "Hello!"
+
+  # Invoke using a specific protocol
+  azd ai agent invoke --protocol invocations "Hello!"
+
+  # Invoke a deployed agent over the a2a protocol
+  azd ai agent invoke --protocol a2a "Hello!"
+
+  # Invoke the a2a protocol with a complete JSON-RPC request from a file
+  azd ai agent invoke --protocol a2a -f a2a-request.json
+
+  # Invoke with a file as the request body
+  azd ai agent invoke -f request.json
+
+  # Invoke a named agent with a file body
+  azd ai agent invoke my-agent -f request.json
+
+  # Invoke locally (agent must be running via 'azd ai agent run')
+  azd ai agent invoke --local "Hello!"
+
+  # Invoke a specific agent locally (useful in multi-agent projects)
+  azd ai agent invoke my-agent --local "Hello!"
+
+  # Start background work and remain attached until it finishes
+  azd ai agent invoke --long-running "Run the long task"
+
+  # Start background work and return after its Response ID is received
+  azd ai agent invoke --long-running --no-wait "Run the long task"
+
+  # Start a new session (discard conversation history)
+  azd ai agent invoke --new-session "Hello!"
+
+  # Invoke a specific deployed agent version
+  azd ai agent invoke --version 3 "Hello!"
+
+  # Dump the raw server response (status line, headers, body) for debugging
+  azd ai agent invoke --output raw "Hello!"
+
+  # Disable platform latency diagnostics
+  azd ai agent invoke --debug-latency=false "Hello!"
+
+  # Send custom x-client-* headers (repeatable)
+  azd ai agent invoke --client-header "x-client-request-id: abc123" --client-header "x-client-tenant: contoso" "Hello!"
+
+  # Invoke a deployed agent from any directory using the endpoint URL shown by 'azd ai agent show'
+  azd ai agent invoke \
+    --agent-endpoint https://<acct>.services.ai.azure.com/api/projects/<proj>/agents/<name>/endpoint/protocols/openai/responses?api-version=v1 \
+    "Hello!"`,
+		Args: cobra.RangeArgs(0, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := azdext.WithAccessToken(cmd.Context())
+
+			// The inherited global --output flag is parsed and validated by the
+			// extension SDK (see azdext.RegisterFlagOptions below). Snapshot the
+			// resolved value into our flags struct so the rest of this action
+			// reads a single field.
+			flags.outputFmt = extCtx.OutputFormat
+
+			switch len(args) {
+			case 2:
+				flags.name = args[0]
+				flags.message = args[1]
+			case 1:
+				// Single arg could be a name (when -f is used) or a message
+				if flags.inputFile != "" {
+					flags.name = args[0]
+				} else {
+					flags.message = args[0]
+				}
+			case 0:
+				// Only valid when -f is provided
+			}
+
+			action := &InvokeAction{
+				flags:                flags,
+				noPrompt:             extCtx.NoPrompt,
+				debugLatencyExplicit: cmd.Flags().Changed("debug-latency"),
+			}
+
+			// Agent-endpoint structural conflicts are surfaced first so the user sees
+			// the precise reason their invocation cannot proceed.
+			if flags.agentEndpoint != "" {
+				if err := validateAgentEndpointFlags(cmd, flags); err != nil {
+					return err
+				}
+				parsed, err := parseAgentEndpoint(flags.agentEndpoint)
+				if err != nil {
+					return err
+				}
+				flags.protocol = string(parsed.Protocol)
+				flags.name = parsed.AgentName
+				action.endpoint = parsed
+			}
+
+			if flags.inputFile != "" && flags.message != "" {
+				return exterrors.Validation(
+					exterrors.CodeInvalidParameter,
+					"cannot use --input-file and a message argument together",
+					"provide either a message argument or --input-file, not both",
+				)
+			}
+			if flags.inputFile == "" && flags.message == "" {
+				return exterrors.Validation(
+					exterrors.CodeInvalidParameter,
+					"a message argument or --input-file is required",
+					"provide a message as a positional argument, or use --input-file/-f to send a file",
+				)
+			}
+
+			if err := validateInvokeVersionFlags(cmd, flags); err != nil {
+				return err
+			}
+
+			if cmd.Flags().Changed("conversation-id") && strings.TrimSpace(flags.conversation) == "" {
+				return exterrors.Validation(
+					exterrors.CodeInvalidParameter,
+					"--conversation-id cannot be empty",
+					"provide a valid conversation ID or omit --conversation-id",
+				)
+			}
+
+			if flags.forceNewConversation() && flags.conversation != "" {
+				return exterrors.Validation(
+					exterrors.CodeConflictingArguments,
+					"cannot use conversation reset flags with --conversation-id",
+					"remove --conversation-id to start a new conversation, or remove the reset flag to reuse it",
+				)
+			}
+
+			if flags.protocol != "" {
+				p := agent_api.AgentProtocol(flags.protocol)
+				if !p.IsInvocable() {
+					return exterrors.Validation(
+						exterrors.CodeInvalidParameter,
+						fmt.Sprintf("unsupported protocol %q for invocation", flags.protocol),
+						"supported protocols are: responses, invocations, a2a",
+					)
+				}
+				if flags.local && !p.IsLocalInvocable() {
+					return exterrors.Validation(
+						exterrors.CodeInvalidParameter,
+						fmt.Sprintf("the %s protocol cannot be invoked against a local agent", flags.protocol),
+						"omit --local to invoke the deployed agent, "+
+							"or use --protocol responses/invocations for local invocation",
+					)
+				}
+			}
+
+			clientHeaders, err := parseCustomHeaders(flags.clientHeaders)
+			if err != nil {
+				return err
+			}
+			// A2A routes through a translating proxy with its own fixed header
+			// set and does not propagate x-client-* to the agent, so accepting
+			// the flag there would silently drop the headers.
+			if len(clientHeaders) > 0 && agent_api.AgentProtocol(flags.protocol) == agent_api.AgentProtocolA2A {
+				return exterrors.Validation(
+					exterrors.CodeInvalidParameter,
+					"--client-header is not supported with the a2a protocol",
+					"the a2a protocol does not forward x-client-* headers to the agent; "+
+						"use --protocol responses or invocations to send client headers",
+				)
+			}
+			action.clientHeaders = clientHeaders
+
+			if flags.noWait && !flags.longRunning {
+				return exterrors.Validation(
+					exterrors.CodeConflictingArguments,
+					"--no-wait requires --long-running",
+					"add --long-running or remove --no-wait",
+				)
+			}
+			if flags.longRunning {
+				if cmd.Flags().Changed("timeout") {
+					return exterrors.Validation(
+						exterrors.CodeConflictingArguments,
+						"--timeout cannot be used with --long-running",
+						"remove --timeout; background Responses remain attached until completion or interruption",
+					)
+				}
+				if flags.local {
+					return exterrors.Validation(
+						exterrors.CodeInvalidParameter,
+						"--long-running is supported only for remote Responses agents",
+						"remove --local and invoke a deployed Responses agent",
+					)
+				}
+				if flags.outputFmt == outputRaw {
+					return exterrors.Validation(
+						exterrors.CodeInvalidParameter,
+						"--output raw is not supported with --long-running",
+						"remove --output raw so azd can save the Response identity",
+					)
+				}
+			}
+
+			return action.Run(ctx)
+		},
+	}
+
+	cmd.Flags().BoolVarP(&flags.local, "local", "l", false, "Invoke on localhost instead of Foundry")
+	cmd.Flags().BoolVar(&flags.debugLatency, "debug-latency", true,
+		"Collect and show platform latency for remote responses/invocations; use --debug-latency=false to disable")
+	cmd.Flags().StringVarP(&flags.inputFile, "input-file", "f", "", "Path to a file whose contents are sent as the request body")
+	cmd.Flags().StringVarP(&flags.protocol, "protocol", "p", "",
+		"Protocol to use: responses, invocations, or a2a. "+
+			"Auto-detected from deployment data or the agent definition; "+
+			"pass --protocol when it cannot be determined.")
+	cmd.Flags().IntVar(&flags.port, "port", DefaultPort, "Local server port")
+	cmd.Flags().IntVarP(
+		&flags.timeout,
+		"timeout",
+		"t",
+		defaultInvokeTimeoutSeconds,
+		"Request timeout in seconds (0 for no timeout)",
+	)
+	cmd.Flags().StringVarP(&flags.session, "session-id", "s", "", "Explicit session ID override")
+	cmd.Flags().BoolVar(&flags.newSession, "new-session", false, "Force a new session (discard saved one)")
+	cmd.Flags().StringVar(&flags.conversation, "conversation-id", "", "Explicit conversation ID override")
+	cmd.Flags().BoolVar(&flags.newConversation, "new-conversation", false, "Force a new conversation (discard saved one)")
+	addUserIdentityFlag(cmd, &flags.userIdentityFlags)
+	cmd.Flags().StringVar(
+		&flags.callID,
+		"call-id",
+		"",
+		"Call ID header value (sent as "+agent_api.AgentFoundryCallIDHeader+" for local invocations only; "+
+			"ignored for remote requests)",
+	)
+	cmd.Flags().StringArrayVar(
+		&flags.clientHeaders,
+		"client-header",
+		nil,
+		`Custom x-client-* request header in "Name: Value" format (repeatable). `+
+			"The responses and invocations protocols forward the x-client-* header family to the agent; "+
+			"other header names are rejected and the flag is not supported with a2a.",
+	)
+	cmd.Flags().StringVar(
+		&flags.agentEndpoint,
+		"agent-endpoint",
+		"",
+		"Full endpoint URL of a deployed agent (run 'azd ai agent show' to see it). "+
+			"Invokes without requiring an azd project; protocol is derived from the URL.",
+	)
+	cmd.Flags().StringVar(
+		&flags.version,
+		"version",
+		"",
+		"Agent version to invoke (creates or reuses a session backed by that version)",
+	)
+	cmd.Flags().BoolVar(
+		&flags.longRunning,
+		"long-running",
+		false,
+		"Continue service-side execution after disconnection; remain attached unless --no-wait is specified",
+	)
+	cmd.Flags().BoolVar(
+		&flags.noWait,
+		"no-wait",
+		false,
+		"Return after receiving the service-assigned ID; requires --long-running",
+	)
+
+	// Register `raw` as an additional allowed value on the inherited global
+	// --output/-o flag. The extension SDK forbids extensions from registering
+	// their own --output flag (reserved); RegisterFlagOptions is the supported
+	// way to add a per-command value to it. The SDK validates the value before
+	// RunE runs and rejects unknown values with a clear "supported: ..." error.
+	// The detailed behavior of raw mode is documented in the command's Long text.
+	azdext.RegisterFlagOptions(cmd, azdext.FlagOptions{
+		Name:          "output",
+		AllowedValues: []string{outputDefault, outputRaw},
+		Default:       outputDefault,
+	})
+
+	return cmd
+}
+
+func validateInvokeVersionFlags(cmd *cobra.Command, flags *invokeFlags) error {
+	if flags.version == "" && !cmd.Flags().Changed("version") {
+		return nil
+	}
+
+	flags.version = strings.TrimSpace(flags.version)
+	if flags.version == "" {
+		return exterrors.Validation(
+			exterrors.CodeInvalidAgentVersion,
+			"--version requires a non-empty agent version",
+			"provide an agent version, for example: azd ai agent invoke --version 3 \"Hello\"",
+		)
+	}
+	if err := validateInvokeVersionValue(flags.version); err != nil {
+		return exterrors.Validation(
+			exterrors.CodeInvalidAgentVersion,
+			fmt.Sprintf("invalid --version value %q: %s", flags.version, err),
+			"agent versions may contain only letters, numbers, dots, underscores, and hyphens",
+		)
+	}
+	if flags.local {
+		return exterrors.Validation(
+			exterrors.CodeInvalidParameter,
+			"cannot use --version with --local; versions apply only to deployed Foundry agents",
+			"remove --local to invoke a deployed version, or omit --version for local invocation",
+		)
+	}
+	if flags.session != "" {
+		return exterrors.Validation(
+			exterrors.CodeInvalidParameter,
+			"cannot use --version with --session-id; sessions are already bound to a version when created",
+			"use --version without --session-id to create or reuse a version-backed session, "+
+				"or use --session-id without --version to invoke an existing session",
+		)
+	}
+
+	return nil
+}
+
+func validateInvokeVersionValue(version string) error {
+	if len(version) > maxInvokeVersionLength {
+		return fmt.Errorf("must be at most %d characters", maxInvokeVersionLength)
+	}
+	if strings.ContainsFunc(version, func(r rune) bool {
+		return !isInvokeVersionChar(r)
+	}) {
+		return fmt.Errorf("contains unsupported characters")
+	}
+
+	return nil
+}
+
+func isInvokeVersionChar(r rune) bool {
+	return r >= 'A' && r <= 'Z' ||
+		r >= 'a' && r <= 'z' ||
+		r >= '0' && r <= '9' ||
+		r == '.' ||
+		r == '_' ||
+		r == '-'
+}
+
+// validateAgentEndpointFlags rejects flags that have no effect (or conflict) when --agent-endpoint
+// is used. Ephemeral mode has no project, no local persistence, and no localhost target.
+func validateAgentEndpointFlags(cmd *cobra.Command, flags *invokeFlags) error {
+	// Disallowed companion flags for --agent-endpoint, in the order checked.
+	// `set` is true when the flag is meaningfully present on the command line.
+	checks := []struct {
+		name       string
+		set        bool
+		suggestion string
+	}{
+		{"--local", flags.local, "omit --local to invoke the deployed agent at the given URL"},
+		{
+			"a positional agent name",
+			flags.name != "",
+			"the agent name is read from the --agent-endpoint URL; remove the positional argument",
+		},
+		{"--port", cmd.Flags().Changed("port"), "--port targets a local agent; omit it when using --agent-endpoint"},
+		{"--protocol", cmd.Flags().Changed("protocol"), "the protocol is read from the --agent-endpoint URL; omit --protocol"},
+	}
+
+	for _, c := range checks {
+		if c.set {
+			return exterrors.Validation(
+				exterrors.CodeInvalidParameter,
+				fmt.Sprintf("--agent-endpoint cannot be combined with %s", c.name),
+				c.suggestion,
+			)
+		}
+	}
+	return nil
+}
+
+func (a *InvokeAction) Run(ctx context.Context) error {
+	if a.flags.inputFile != "" {
+		if _, _, err := a.resolveBody(); err != nil {
+			return err
+		}
+	}
+
+	// Prompt (kind=managed) agents use a workspace-rooted Responses API on the
+	// harness. When the resolved azure.ai.agent service is a prompt agent we
+	// route there before the hosted protocol resolution — unless the user
+	// explicitly targeted a local server (--local) or a full deployed agent
+	// endpoint (--agent-endpoint), in which case we honor that intent.
+	if a.endpoint == nil && !a.flags.local &&
+		(a.flags.protocol == "" || agent_api.AgentProtocol(a.flags.protocol) == agent_api.AgentProtocolResponses) {
+		azdClient, err := azdext.NewAzdClient()
+		if err != nil {
+			return fmt.Errorf("failed to create azd client: %w", err)
+		}
+		defer azdClient.Close()
+		pctx, isPrompt, pErr := resolvePromptAgentService(
+			ctx, azdClient, a.flags.name, a.noPrompt, withVoiceInvocationGuidance(),
+		)
+		if pErr != nil {
+			if errors.Is(pErr, errVoiceInvocationUnsupported) {
+				return pErr
+			}
+			if localErr, ok := errors.AsType[*azdext.LocalError](pErr); ok {
+				return localErr
+			}
+			if _, ok := errors.AsType[agentServiceLookupNotFoundError](pErr); !ok || a.flags.name == "" {
+				return fmt.Errorf("failed to resolve prompt agent service: %w", pErr)
+			}
+		}
+		if isPrompt {
+			if err := a.validateDebugLatencyRoute(agent_api.AgentProtocolResponses, true); err != nil {
+				return err
+			}
+			return a.runPromptInvoke(ctx, pctx)
+		}
+	}
+
+	protocol, err := a.resolveProtocol(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Re-validate after protocol resolution: when --protocol was omitted the
+	// protocol may have been auto-detected as a2a from the service definition. In
+	// that case the flag-parse guard above was skipped and clientHeaders was
+	// populated, but a2aRemote never calls applyCustomHeaders — the headers
+	// would be silently dropped, which is the exact silent no-op the guard
+	// intends to prevent.
+	if a.flags.longRunning && protocol != agent_api.AgentProtocolResponses {
+		a.closeResolvedRemoteContextClient()
+		return exterrors.Validation(
+			exterrors.CodeInvalidParameter,
+			fmt.Sprintf("--long-running is not supported with the %s protocol", protocol),
+			"use a deployed Responses agent or remove --long-running",
+		)
+	}
+
+	if len(a.clientHeaders) > 0 && protocol == agent_api.AgentProtocolA2A {
+		a.closeResolvedRemoteContextClient()
+		return exterrors.Validation(
+			exterrors.CodeInvalidParameter,
+			"--client-header is not supported with the a2a protocol",
+			"the a2a protocol does not forward x-client-* headers to the agent; "+
+				"use --protocol responses or invocations to send client headers",
+		)
+	}
+
+	if err := a.validateDebugLatencyRoute(protocol, false); err != nil {
+		a.closeResolvedRemoteContextClient()
+		return err
+	}
+
+	if a.flags.local {
+		switch protocol {
+		case agent_api.AgentProtocolInvocations:
+			return a.invocationsLocal(ctx)
+		case agent_api.AgentProtocolA2A:
+			return a.a2aLocal(ctx)
+		default:
+			return a.responsesLocal(ctx)
+		}
+	}
+
+	// Remote: route by protocol. Each handler reports usage after resolving its target.
+	switch protocol {
+	case agent_api.AgentProtocolInvocations:
+		return a.invocationsRemote(ctx)
+	case agent_api.AgentProtocolA2A:
+		return a.a2aRemote(ctx)
+	default:
+		return a.responsesRemote(ctx)
+	}
+}
+
+func (a *InvokeAction) reportInvokeUsageForRemote(
+	ctx context.Context, protocol agent_api.AgentProtocol, rc *remoteContext,
+) {
+	// Explicit endpoints have no project-backed kind to inspect. For project-backed
+	// routes, count only hosted agents; prompt, voice and workflow are excluded.
+	if a.endpoint == nil && !rc.hosted {
+		return
+	}
+	a.reportInvokeUsage(ctx, protocol, rc)
+}
+
+func (a *InvokeAction) reportInvokeUsage(
+	ctx context.Context, protocol agent_api.AgentProtocol, rc *remoteContext,
+) {
+	event := telemetry.AgentInvokeSelected(string(protocol), a.flags.longRunning, a.flags.noWait)
+	if a.invokeReporter != nil {
+		a.invokeReporter.Report(ctx, event)
+		return
+	}
+	if rc.azdClient != nil {
+		foundryTelemetry.NewReporter(rc.azdClient.Telemetry(), nil).Report(ctx, event)
+		return
+	}
+
+	azdClient, err := azdext.NewAzdClient()
+	if err != nil {
+		azdext.NewLogger("agent.telemetry").Debug("telemetry client unavailable", "event", event.Name)
+		return
+	}
+	defer azdClient.Close()
+	foundryTelemetry.NewReporter(azdClient.Telemetry(), nil).Report(ctx, event)
+}
+
+func (a *InvokeAction) closeResolvedRemoteContextClient() {
+	if a.resolvedRemoteContext != nil && a.resolvedRemoteContext.azdClient != nil {
+		a.resolvedRemoteContext.azdClient.Close()
+		a.resolvedRemoteContext.azdClient = nil
+	}
+}
+
+// emitInvokeSuccessNextStep prints the resolver-driven Next: block after a
+// successful invoke. Each of invoke's four success paths funnels through
+// this helper so policy lives in `nextstep`, not in the command handler.
+//
+// State is intentionally nil: ResolveAfterInvoke's success branches don't
+// inspect State (`resolver.go:resolveInvokeSuccess`), and the gRPC cost of
+// AssembleState is wasted when the result isn't used. The failure helper
+// below makes the same choice — see its doc for the resolver-side
+// rationale that justifies skipping AssembleState even on failure today.
+//
+// Caller contract for `agentName`: pass the azure.yaml service name, NOT
+// the deployed Foundry agent name. The resolver embeds this verbatim
+// into the suggested `azd ai agent show <agentName>`, and `show` keys on
+// `s.Name` from azure.yaml (helpers.go:resolveAgentService). The remote
+// invoke functions translate `name` in place from service name to
+// Foundry name for the URL path; they MUST capture the service name
+// separately and pass that here. See `responsesRemote` /
+// `invocationsRemote` for the `serviceName` tracking pattern. The
+// resolver-level contract is locked by
+// TestResolveAfterInvoke_Success / "remote success with agent name →
+// show <agent> + monitor" in `nextstep/resolver_test.go`.
+//
+// Output is gated on a TTY stdout per the nextstep call-site contract
+// (`nextstep/types.go`, `nextstep/format.go`, `helpers.go:isTerminal`):
+// the package never inspects TTY state, so callers must. Without the gate,
+// piped or redirected stdout (`invoke > out.txt`, `invoke | tee log`,
+// CI capture) would receive the human-only guidance block mixed in with
+// the agent's reply.
+func (a *InvokeAction) emitInvokeSuccessNextStep(mode nextstep.InvokeMode, agentName string) {
+	_ = printNextIfTerminal(os.Stdout, nextstep.ResolveAfterInvoke(nil, mode, agentName, nil))
+}
+
+// emitInvokeFailureNextStep prints the resolver-driven Next: block when
+// an invoke fails. sessionCode is the value of the `x-adc-response-details`
+// response header (or empty when the failure has no platform-classified
+// session error code — e.g. local-server failures, connect errors, or
+// any 4xx/5xx that didn't carry the header). Local-invoke failures pass
+// the empty string and get a generic "see local server output" line per
+// the resolver's InvokeLocal branch.
+//
+// State is intentionally nil with the same rationale as the success
+// helper: today `resolveInvokeFailure(_ *State, mode, _ string, failure)`
+// ignores State entirely (the `_` in the signature is load-bearing), and
+// AssembleState costs an extra gRPC roundtrip the user pays for at the
+// exact moment they're staring at an error message. If a future failure
+// branch grows state-aware behavior, this is the single line to update.
+//
+// Output is TTY-gated for the same reason the success helper is — piped
+// or redirected stdout must receive only the agent's reply (or the
+// terminal error message via the host), never the human-only Next: block.
+//
+// Output ordering: the Next: block prints BEFORE the error message
+// (which the host renders after this function returns). This is the
+// "hint: ... error: ..." pattern git uses — acceptable for an
+// interactive command, and avoids the sentinel-error / silent-stderr
+// gymnastics that would be needed to flip the order. Revisit if user
+// feedback says the block should print after the error.
+func (a *InvokeAction) emitInvokeFailureNextStep(mode nextstep.InvokeMode, agentName, sessionCode string) {
+	failure := &nextstep.InvokeFailure{
+		SessionCode: nextstep.SessionErrorCode(sessionCode),
+	}
+	_ = printNextIfTerminal(os.Stdout, nextstep.ResolveAfterInvoke(nil, mode, agentName, failure))
+}
+
+// resolveProtocol returns the protocol to use for this invocation.
+func (a *InvokeAction) resolveProtocol(
+	ctx context.Context,
+) (agent_api.AgentProtocol, error) {
+	if a.flags.protocol != "" {
+		return agent_api.AgentProtocol(a.flags.protocol), nil
+	}
+
+	if !a.flags.local {
+		rc, err := a.resolveRemoteContextForInvoke(ctx)
+		if err != nil {
+			return "", err
+		}
+
+		protocol, err := a.resolveDeployedProtocol(ctx, rc)
+		if err != nil {
+			if rc.azdClient != nil {
+				rc.azdClient.Close()
+			}
+			return "", err
+		}
+		a.resolvedRemoteContext = rc
+		return protocol, nil
+	}
+
+	azdClient, err := azdext.NewAzdClient()
+	if err != nil {
+		return "", fmt.Errorf("failed to create azd client: %w", err)
+	}
+	defer azdClient.Close()
+
+	protocol, serviceName, err := resolveAgentProtocol(
+		ctx, azdClient, a.flags.name, a.noPrompt,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	// Cache the resolved service name so downstream calls avoid re-prompting.
+	if a.flags.name == "" && serviceName != "" {
+		a.protocolServiceName = serviceName
+	}
+
+	return protocol, nil
+}
+
+func (a *InvokeAction) resolveDeployedProtocol(
+	ctx context.Context,
+	rc *remoteContext,
+) (agent_api.AgentProtocol, error) {
+	if rc.deployedProtocolMetadataIncomplete {
+		return "", exterrors.Compatibility(
+			exterrors.CodeIncompleteAgentProtocolMetadata,
+			fmt.Sprintf(
+				"deployed protocol metadata for agent service %q is incomplete",
+				rc.serviceName,
+			),
+			fmt.Sprintf(
+				"wait for the deployment to finish, run `azd deploy %s` "+
+					"to refresh protocol metadata, or pass --protocol explicitly",
+				strconv.Quote(rc.serviceName),
+			),
+		)
+	}
+	if rc.deployedProtocolMetadataStale {
+		return "", exterrors.Compatibility(
+			exterrors.CodeLegacyAgentProtocolMetadata,
+			fmt.Sprintf(
+				"deployed protocol metadata for agent service %q was created by an older extension version",
+				rc.serviceName,
+			),
+			fmt.Sprintf(
+				"run `azd deploy %s` to refresh protocol metadata, or pass --protocol explicitly",
+				strconv.Quote(rc.serviceName),
+			),
+		)
+	}
+
+	if rc.version != "" && rc.version != rc.deployedVersion {
+		deployedDesc := "the latest deployment"
+		if rc.deployedVersion != "" {
+			deployedDesc = fmt.Sprintf("version %q", rc.deployedVersion)
+		}
+		return "", exterrors.Validation(
+			exterrors.CodeInvalidParameter,
+			fmt.Sprintf(
+				"cannot determine protocol for agent version %q because deployed protocol metadata reflects %s",
+				rc.version,
+				deployedDesc,
+			),
+			"pass --protocol explicitly (for example: --protocol responses)",
+		)
+	}
+
+	deployed := uniqueAgentProtocols(rc.invocableProtocols)
+	var local []agent_api.AgentProtocol
+	if len(deployed) != 1 && rc.azdClient != nil && rc.serviceName != "" {
+		if rc.deployedProtocolMetadata && len(deployed) == 0 {
+			return "", remoteProtocolSelectionError(deployed, "")
+		}
+		var err error
+		local, err = resolveAgentInvocableProtocols(
+			ctx,
+			rc.azdClient,
+			rc.serviceName,
+			a.noPrompt,
+		)
+		if err != nil {
+			return "", remoteProtocolSelectionError(
+				deployed,
+				fmt.Sprintf("the local definition could not determine the protocol: %v", err),
+			)
+		}
+	}
+
+	return selectRemoteInvokeProtocol(deployed, local)
+}
+
+func selectRemoteInvokeProtocol(
+	deployed []agent_api.AgentProtocol,
+	local []agent_api.AgentProtocol,
+) (agent_api.AgentProtocol, error) {
+	deployed = uniqueAgentProtocols(deployed)
+	local = uniqueAgentProtocols(local)
+	switch len(deployed) {
+	case 0:
+		if len(local) == 1 {
+			return local[0], nil
+		}
+		return "", remoteProtocolSelectionError(deployed, "")
+	case 1:
+		return deployed[0], nil
+	}
+
+	if len(local) == 1 && containsAgentProtocol(deployed, local[0]) {
+		return local[0], nil
+	}
+	return "", remoteProtocolSelectionError(deployed, "")
+}
+
+func uniqueAgentProtocols(
+	protocols []agent_api.AgentProtocol,
+) []agent_api.AgentProtocol {
+	unique := make([]agent_api.AgentProtocol, 0, len(protocols))
+	seen := make(map[agent_api.AgentProtocol]struct{}, len(protocols))
+	for _, protocol := range protocols {
+		if _, ok := seen[protocol]; ok {
+			continue
+		}
+		seen[protocol] = struct{}{}
+		unique = append(unique, protocol)
+	}
+	return unique
+}
+
+func invocableProtocolsFromEndpoints(
+	endpoints map[agent_api.AgentProtocol]string,
+) []agent_api.AgentProtocol {
+	if len(endpoints) == 0 {
+		return nil
+	}
+
+	var protocols []agent_api.AgentProtocol
+	for _, protocol := range agent_api.InvocableProtocols() {
+		if strings.TrimSpace(endpoints[protocol]) != "" {
+			protocols = append(protocols, protocol)
+		}
+	}
+	return protocols
+}
+
+func containsAgentProtocol(
+	protocols []agent_api.AgentProtocol,
+	target agent_api.AgentProtocol,
+) bool {
+	return slices.Contains(protocols, target)
+}
+
+func remoteProtocolSelectionError(
+	protocols []agent_api.AgentProtocol,
+	reason string,
+) error {
+	if len(protocols) == 0 {
+		message := "could not determine an invocable protocol for the deployed agent"
+		if reason != "" {
+			message += ": " + reason
+		}
+		return exterrors.Validation(
+			exterrors.CodeInvalidParameter,
+			message,
+			"pass --protocol responses, --protocol invocations, or --protocol a2a",
+		)
+	}
+
+	names := make([]string, len(protocols))
+	for i, protocol := range protocols {
+		names[i] = string(protocol)
+	}
+	message := fmt.Sprintf(
+		"the deployed agent exposes multiple invocable protocols: %s",
+		strings.Join(names, ", "),
+	)
+	if reason != "" {
+		message += "; " + reason
+	}
+	return exterrors.Validation(
+		exterrors.CodeInvalidParameter,
+		message,
+		"pass --protocol to choose one of the deployed protocols",
+	)
+}
+
+func (a *InvokeAction) resolveRemoteContextForInvoke(
+	ctx context.Context,
+) (*remoteContext, error) {
+	if a.resolvedRemoteContext != nil {
+		return a.resolvedRemoteContext, nil
+	}
+	return a.resolveRemoteContext(ctx)
+}
+
+func (a *InvokeAction) serviceNameSelector() string {
+	if a.protocolServiceName != "" {
+		return a.protocolServiceName
+	}
+	return a.flags.name
+}
+
+func (a *InvokeAction) httpTimeout() time.Duration {
+	if a.flags.timeout <= 0 {
+		return 0 // no timeout
+	}
+	return time.Duration(a.flags.timeout) * time.Second
+}
+
+// resolveBody returns the request body for invoke calls.
+// When --input-file is set, the file contents are returned; otherwise the message string is used.
+func (a *InvokeAction) resolveBody() ([]byte, string, error) {
+	if a.bodyResolved {
+		return a.resolvedBody, a.resolvedBodyLabel, nil
+	}
+
+	if a.flags.inputFile != "" {
+		//nolint:gosec // G304: inputFile is a user-provided CLI flag
+		data, err := os.ReadFile(a.flags.inputFile)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to read input file %q: %w", a.flags.inputFile, err)
+		}
+		a.resolvedBody = data
+		a.resolvedBodyLabel = fmt.Sprintf("(from file %s)", a.flags.inputFile)
+		a.bodyResolved = true
+		return a.resolvedBody, a.resolvedBodyLabel, nil
+	}
+
+	a.resolvedBody = []byte(a.flags.message)
+	a.resolvedBodyLabel = fmt.Sprintf("%q", a.flags.message)
+	a.bodyResolved = true
+	return a.resolvedBody, a.resolvedBodyLabel, nil
+}
+
+// contentTypeForBody returns "application/json" if data is valid JSON,
+// otherwise "text/plain".
+func contentTypeForBody(data []byte) string {
+	if json.Valid(data) {
+		return "application/json"
+	}
+	return "text/plain"
+}
+
+// printInvokeTiming prints the client-observed duration after a successful invocation.
+func printInvokeTiming(w io.Writer, total time.Duration) {
+	_, _ = color.New(color.FgGreen).Fprintf(w, "\nClient elapsed: %s\n", formatDuration(total))
+}
+
+// formatDuration formats a duration for display in timing output.
+// Always uses seconds with 3 decimal places for consistency.
+func formatDuration(d time.Duration) string {
+	return fmt.Sprintf("%.3fs", d.Seconds())
+}
+
+// localConnectRetryBudget bounds how long a `--local` invoke waits for the
+// agent's listener to start accepting connections before giving up. The first
+// `azd ai agent run` in a fresh project can take 30–60 s to bind (Python venv
+// + pip install + Foundry handshake), and the listener binds a few seconds
+// after `run` reports ready, so a single connect attempt frequently races
+// startup. Retrying connection-refused errors within this budget makes the
+// quickstart's immediate `invoke --local` deterministic. See issue #8411.
+const localConnectRetryBudget = 60 * time.Second
+
+// localConnectRetryInitialBackoff and localConnectRetryMaxBackoff bound the
+// exponential backoff between connect attempts.
+const (
+	localConnectRetryInitialBackoff = 500 * time.Millisecond
+	localConnectRetryMaxBackoff     = 2 * time.Second
+)
+
+// isConnectionRefused reports whether err is a TCP connection-refused error.
+// A refused connection guarantees the request bytes were never delivered to
+// the server, so this is the only failure class that is safe to retry for a
+// non-idempotent local invoke (retrying can't produce a duplicate side effect).
+func isConnectionRefused(err error) bool {
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	// On Windows a refused dial surfaces as WSAECONNREFUSED rather than the
+	// POSIX syscall.ECONNREFUSED, so the check above misses it.
+	return isPlatformConnRefused(err)
+}
+
+// doLocalRequestWithRetry sends the request built by newReq, retrying only on
+// connection-refused errors within localConnectRetryBudget. This covers the
+// window where the local agent process is running but its listener hasn't
+// bound yet. Any other error (timeout, mid-flight failure, non-2xx status) is
+// returned to the caller unchanged so genuine failures surface immediately.
+// The request is rebuilt on each attempt because client.Do consumes the body.
+func doLocalRequestWithRetry(
+	ctx context.Context,
+	client *http.Client,
+	newReq func() (*http.Request, error),
+) (*http.Response, error) {
+	deadline := time.Now().Add(localConnectRetryBudget)
+	backoff := localConnectRetryInitialBackoff
+	notified := false
+	for {
+		req, err := newReq()
+		if err != nil {
+			return nil, err
+		}
+		resp, err := client.Do(req) //nolint:gosec // G704: URL targets localhost with user-configured port
+		if err == nil {
+			return resp, nil
+		}
+		if !isConnectionRefused(err) || time.Now().After(deadline) {
+			return nil, err
+		}
+		if !notified {
+			// Progress note on stderr keeps raw-mode stdout clean while
+			// reassuring the user we're waiting rather than hung.
+			fmt.Fprintln(os.Stderr, "Waiting for the local agent to accept connections...")
+			notified = true
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < localConnectRetryMaxBackoff {
+			backoff *= 2
+			if backoff > localConnectRetryMaxBackoff {
+				backoff = localConnectRetryMaxBackoff
+			}
+		}
+	}
+}
+
+func (a *InvokeAction) responsesLocal(ctx context.Context) error {
+	port := a.flags.port
+
+	body, bodyLabel, err := a.resolveBody()
+	if err != nil {
+		return err
+	}
+
+	msg := string(body)
+
+	// Open azd client for session/conversation persistence.
+	var azdClient *azdext.AzdClient
+	if c, err := azdext.NewAzdClient(); err == nil {
+		azdClient = c
+		defer azdClient.Close()
+	}
+
+	agentKey := resolveLocalAgentKey(ctx, azdClient, a.serviceNameSelector(), a.noPrompt)
+
+	// Resolve local session and conversation IDs (always generated locally).
+	var sid, convID string
+	if azdClient != nil {
+		sid, err = resolveStoredID(
+			ctx, azdClient, agentKey, a.flags.session, a.flags.newSession, "sessions", true,
+		)
+		if err != nil {
+			log.Printf("invoke local: failed to resolve session ID: %v", err)
+		}
+		convID, err = resolveStoredID(
+			ctx, azdClient, agentKey, a.flags.conversation, a.flags.forceNewConversation(), "conversations", true,
+		)
+		if err != nil {
+			log.Printf("invoke local: failed to resolve conversation ID: %v", err)
+		}
+	}
+
+	raw := a.flags.outputFmt == outputRaw
+	if !raw {
+		fmt.Printf("Target:       localhost:%d (local)\n", port)
+		fmt.Printf("Message:      %s\n", bodyLabel)
+		printSessionStatus("Session:      ", sid)
+		fmt.Printf("Conversation: %s\n\n", convID)
+	}
+
+	reqBody := map[string]any{
+		"input": msg,
+	}
+	if sid != "" {
+		reqBody["session_id"] = sid
+	}
+	if convID != "" {
+		reqBody["conversation"] = map[string]string{"id": convID}
+	}
+
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	reqURL := fmt.Sprintf("http://localhost:%d/responses", port)
+	newReq := func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(payload))
+		if err != nil {
+			return nil, err
+		}
+		applyCustomHeaders(req, a.clientHeaders)
+		req.Header.Set("Content-Type", "application/json")
+		applyLocalUserIdentityHeader(req, &a.flags.userIdentityFlags)
+		applyLocalCallIDHeader(req, a.flags.callID)
+		if raw {
+			// Disable Go's transparent gzip handling so the dumped headers and
+			// body match what the server actually sent on the wire.
+			req.Header.Set("Accept-Encoding", "identity")
+		}
+		return req, nil
+	}
+
+	client := &http.Client{Timeout: a.httpTimeout()}
+	invokeStart := time.Now()
+	resp, err := doLocalRequestWithRetry(ctx, client, newReq)
+	if err != nil {
+		return fmt.Errorf(
+			"could not connect to localhost:%d -- is the agent running? Start it with: azd ai agent run",
+			port,
+		)
+	}
+	defer resp.Body.Close()
+
+	if raw {
+		// Stream the body verbatim to stdout (avoids buffering large responses).
+		if dumpErr := writeRawResponse(os.Stdout, resp); dumpErr != nil {
+			return dumpErr
+		}
+		if resp.StatusCode >= 400 {
+			return fmt.Errorf(
+				"POST %s failed with HTTP %d: %s",
+				reqURL, resp.StatusCode, resp.Status,
+			)
+		}
+		return nil
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+	totalDuration := time.Since(invokeStart)
+
+	if resp.StatusCode >= 400 {
+		if traceID := responseTraceID(resp); traceID != "" {
+			fmt.Printf("Trace ID:     %s\n", traceID)
+		}
+		a.emitInvokeFailureNextStep(nextstep.InvokeLocal, "", "")
+		return fmt.Errorf(
+			"POST %s failed with HTTP %d: %s\n%s",
+			reqURL, resp.StatusCode, resp.Status, string(respBody),
+		)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		// Not JSON -- just print raw response
+		fmt.Println(string(respBody))
+		printInvokeTiming(os.Stdout, totalDuration)
+		a.emitInvokeSuccessNextStep(nextstep.InvokeLocal, "")
+		return nil
+	}
+
+	if err := printAgentResponse(result, "local"); err != nil {
+		return err
+	}
+	printInvokeTiming(os.Stdout, totalDuration)
+	a.emitInvokeSuccessNextStep(nextstep.InvokeLocal, "")
+	return nil
+}
+
+// remoteContext holds the resolved inputs for a remote (Foundry) invoke.
+// In ephemeral mode (--agent-endpoint) the project endpoint / agent name /
+// api-version come from the parsed URL.
+//
+// agentKey is the persistence key used by the global UserConfig store. It is
+// non-empty whenever session/conversation IDs should be saved or resumed:
+//   - project mode: derived from AGENT_{SVC}_ENDPOINT
+//   - ephemeral mode: derived from the parsed --agent-endpoint URL
+//     (independent of api-version / trailing slash / fragment)
+//
+// In standalone mode (no parent azd daemon, e.g. running the extension binary
+// directly outside an azd command) azdClient is nil and persistence helpers
+// no-op. agentKey may still be non-empty in that case.
+type remoteContext struct {
+	name                               string
+	serviceName                        string
+	agentKey                           string
+	projectEndpoint                    string
+	apiVersion                         string
+	version                            string
+	deployedVersion                    string
+	hosted                             bool
+	invocableProtocols                 []agent_api.AgentProtocol
+	deployedProtocolMetadata           bool
+	deployedProtocolMetadataIncomplete bool
+	deployedProtocolMetadataStale      bool
+	azdClient                          *azdext.AzdClient
+	bearerToken                        string
+}
+
+func (rc *remoteContext) nextStepName() string {
+	if rc.serviceName != "" {
+		return rc.serviceName
+	}
+	return rc.name
+}
+
+// remoteAgentNameFromService applies the project-service resolution result to
+// the invoke target name. A protocol-selected service is not a Foundry agent
+// name, so it must not survive when no deployed/brownfield name was resolved.
+// A positional name remains an intentional direct target whether the protocol
+// was explicit or auto-detected.
+func remoteAgentNameFromService(
+	currentName string,
+	info *AgentServiceInfo,
+	protocolServiceSelected bool,
+) string {
+	if info != nil && info.AgentName != "" {
+		return info.AgentName
+	}
+	if protocolServiceSelected {
+		return ""
+	}
+	return currentName
+}
+
+// remoteAgentServiceResolutionError preserves direct-name fallback only when
+// the deployed name is known not to map to a project service.
+func remoteAgentServiceResolutionError(resolveErr error, directNameProvided bool) error {
+	if errors.Is(resolveErr, errVoiceInvocationUnsupported) {
+		return resolveErr
+	}
+	if resolveErr == nil {
+		return nil
+	}
+	if directNameProvided {
+		if _, ok := errors.AsType[agentServiceLookupNotFoundError](resolveErr); ok {
+			return nil
+		}
+	}
+	return fmt.Errorf("failed to resolve agent service for remote invoke: %w", resolveErr)
+}
+
+func unresolvedRemoteAgentNameError(serviceName string) error {
+	if serviceName != "" {
+		return exterrors.Dependency(
+			exterrors.CodeMissingAgentEnvVars,
+			fmt.Sprintf("agent service %q does not appear to have been deployed", serviceName),
+			"run `azd deploy` before invoking, or pass an existing Foundry agent name "+
+				"or --agent-endpoint explicitly",
+		)
+	}
+	return fmt.Errorf(
+		"agent name is required; provide as the first argument or " +
+			"define an azure.ai.agent service in azure.yaml",
+	)
+}
+
+// resolveRemoteContext returns the inputs required to invoke a remote agent.
+// In project mode it opens an azd client and reads the environment; in ephemeral
+// mode (--agent-endpoint) it skips both. Brownfield resolution may authenticate
+// to verify that the inline agent exists, so remote callers validate the request
+// body before calling this method. Callers must close rc.azdClient when non-nil.
+func (a *InvokeAction) resolveRemoteContext(ctx context.Context) (*remoteContext, error) {
+	rc := &remoteContext{apiVersion: DefaultAgentAPIVersion, version: a.flags.version}
+
+	if a.endpoint != nil {
+		rc.name = a.endpoint.AgentName
+		rc.projectEndpoint = a.endpoint.ProjectEndpoint
+		if a.endpoint.APIVersion != "" {
+			rc.apiVersion = a.endpoint.APIVersion
+		}
+		rc.agentKey = buildAgentKey(a.endpoint.ProjectEndpoint, a.endpoint.AgentName, rc.version, false)
+		// Best-effort attach to the parent azd daemon so session/conversation IDs
+		// persist across invokes via global UserConfig. When running the extension
+		// binary directly (standalone), this fails and we proceed without persistence.
+		if azdClient, err := azdext.NewAzdClient(); err == nil {
+			rc.azdClient = azdClient
+		}
+		return rc, nil
+	}
+
+	azdClient, err := azdext.NewAzdClient()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create azd client: %w", err)
+	}
+	rc.azdClient = azdClient
+
+	rc.name = a.flags.name
+	// Auto-resolve agent name and version from azure.yaml. Track the
+	// azure.yaml service name separately from the deployed Foundry name
+	// so post-success next-step suggestions emit the service name; show
+	// keys on s.Name in azure.yaml and would 404 on the deployed Foundry
+	// name in the divergent case.
+	resolutionOptions := []agentServiceResolutionOption{
+		withBrownfieldInlineAgentName(),
+		withVoiceInvocationGuidance(),
+		withHostedKind(),
+	}
+	if a.flags.protocol == "" {
+		resolutionOptions = append(
+			resolutionOptions,
+			withDeployedProtocolEndpoints(),
+			withDeployedAgentNameLookup(),
+		)
+	} else {
+		resolutionOptions = append(resolutionOptions, withOptionalDeployedAgentNameLookup())
+	}
+	info, serviceErr := resolveAgentServiceFromProject(
+		ctx,
+		azdClient,
+		a.serviceNameSelector(),
+		a.noPrompt,
+		resolutionOptions...,
+	)
+	if serviceErr != nil {
+		if isAgentProtocolEndpointsError(serviceErr) {
+			azdClient.Close()
+			return nil, serviceErr
+		}
+		if info != nil {
+			azdClient.Close()
+			return nil, fmt.Errorf(
+				"failed to resolve agent service %q for remote invoke: %w",
+				info.ServiceName,
+				serviceErr,
+			)
+		}
+		if err := remoteAgentServiceResolutionError(serviceErr, a.flags.name != ""); err != nil {
+			azdClient.Close()
+			return nil, err
+		}
+	} else {
+		rc.serviceName = info.ServiceName
+		rc.hosted = info.IsHosted
+		rc.name = remoteAgentNameFromService(rc.name, info, a.protocolServiceName != "")
+		rc.invocableProtocols = invocableProtocolsFromEndpoints(info.ProtocolEndpoints)
+		rc.deployedProtocolMetadata = info.ProtocolEndpointsPresent
+		rc.deployedProtocolMetadataIncomplete = info.ProtocolEndpointsIncomplete
+		rc.deployedProtocolMetadataStale = info.ProtocolEndpointsStale
+		rc.deployedVersion = info.Version
+		if info.AgentEndpoint != "" {
+			rc.agentKey = buildRemoteAgentKeyFromEndpoint(info.AgentEndpoint)
+		}
+		if info.ProjectEndpoint != "" {
+			rc.projectEndpoint = info.ProjectEndpoint
+		}
+	}
+	if rc.name == "" {
+		azdClient.Close()
+		return nil, unresolvedRemoteAgentNameError(rc.serviceName)
+	}
+
+	if rc.projectEndpoint == "" {
+		ep, err := resolveAgentEndpoint(ctx, "", "")
+		if err != nil {
+			azdClient.Close()
+			return nil, err
+		}
+		rc.projectEndpoint = ep
+	}
+	if rc.agentKey == "" {
+		rc.agentKey = buildAgentKey(rc.projectEndpoint, rc.name, rc.version, false)
+	}
+	return rc, nil
+}
+
+func (rc *remoteContext) legacyKeys() []string {
+	if rc.version != "" {
+		return nil
+	}
+	return legacyKeysForRemote(rc.name)
+}
+
+func (a *InvokeAction) resolveRemoteSessionID(ctx context.Context, rc *remoteContext) (string, error) {
+	if rc.version == "" {
+		if rc.agentKey != "" && rc.azdClient != nil {
+			return resolveStoredID(
+				ctx,
+				rc.azdClient,
+				rc.agentKey,
+				a.flags.session,
+				a.flags.newSession,
+				"sessions",
+				false,
+				rc.legacyKeys()...,
+			)
+		}
+		return a.flags.session, nil
+	}
+
+	if rc.agentKey != "" && rc.azdClient != nil && !a.flags.newSession {
+		sid, err := resolveStoredID(
+			ctx,
+			rc.azdClient,
+			rc.agentKey,
+			"",
+			false,
+			"sessions",
+			false,
+		)
+		if err != nil {
+			return "", err
+		}
+		if sid != "" {
+			return sid, nil
+		}
+	}
+
+	apiVersion := rc.apiVersion
+	if apiVersion == "" {
+		apiVersion = DefaultAgentAPIVersion
+	}
+	session, err := createInvokeVersionSession(ctx, rc.projectEndpoint, rc.name, rc.version, apiVersion)
+	if err != nil {
+		return "", err
+	}
+	if session == nil || session.AgentSessionID == "" {
+		return "", fmt.Errorf(
+			"created session for agent version %q but the service returned an empty session ID",
+			rc.version,
+		)
+	}
+
+	if rc.agentKey != "" && rc.azdClient != nil {
+		saveContextValue(ctx, rc.azdClient, rc.agentKey, session.AgentSessionID, "sessions")
+	}
+
+	return session.AgentSessionID, nil
+}
+
+func createInvokeVersionSessionImpl(
+	ctx context.Context,
+	projectEndpoint string,
+	agentName string,
+	agentVersion string,
+	apiVersion string,
+) (*agent_api.AgentSessionResource, error) {
+	if apiVersion == "" {
+		apiVersion = DefaultAgentAPIVersion
+	}
+
+	credential, err := newAgentCredential()
+	if err != nil {
+		return nil, err
+	}
+
+	client := agent_api.NewAgentClient(projectEndpoint, credential)
+	session, err := client.CreateSession(
+		ctx,
+		agentName,
+		&agent_api.CreateAgentSessionRequest{
+			VersionIndicator: &agent_api.VersionIndicator{
+				Type:         "version_ref",
+				AgentVersion: agentVersion,
+			},
+		},
+		apiVersion,
+		nil,
+	)
+	if err != nil {
+		return nil, exterrors.ServiceFromAzure(err, exterrors.OpCreateSession)
+	}
+
+	return session, nil
+}
+
+// acquireBearerToken obtains a Foundry bearer token. Called after request body
+// validation so that local errors (e.g., a missing --input-file) are surfaced
+// before any auth round-trip is attempted.
+func (a *InvokeAction) acquireBearerToken(ctx context.Context) (string, error) {
+	credential := a.credential
+	if credential == nil {
+		var err error
+		credential, err = newAgentCredential()
+		if err != nil {
+			return "", err
+		}
+	}
+	token, err := credential.GetToken(ctx, policy.TokenRequestOptions{
+		Scopes: []string{"https://ai.azure.com/.default"},
+	})
+	if err != nil {
+		return "", ephemeralAuthError(a.endpoint != nil, err)
+	}
+	return token.Token, nil
+}
+
+// ephemeralAuthError wraps a token-acquisition failure with a login suggestion when
+// the user is invoking outside an azd project (where mis-configured credentials are common).
+func ephemeralAuthError(ephemeral bool, err error) error {
+	if !ephemeral {
+		return fmt.Errorf("failed to get auth token: %w", err)
+	}
+	return exterrors.Auth(
+		exterrors.CodeAuthFailed,
+		fmt.Sprintf("failed to get auth token: %v", err),
+		"run `azd auth login` and try again",
+	)
+}
+
+func (a *InvokeAction) responsesRemote(ctx context.Context) error {
+	body, bodyLabel, err := a.resolveBody()
+	if err != nil {
+		return err
+	}
+
+	rc, err := a.resolveRemoteContextForInvoke(ctx)
+	if err != nil {
+		return err
+	}
+	if rc.azdClient != nil {
+		defer rc.azdClient.Close()
+	}
+	a.reportInvokeUsageForRemote(ctx, agent_api.AgentProtocolResponses, rc)
+
+	agentKey := rc.agentKey
+	if agentKey == "" && rc.azdClient != nil {
+		log.Printf("warning: agent endpoint not available, session state will not be persisted")
+	}
+
+	var responseStore responseStateStore
+	if rc.azdClient != nil && agentKey != "" {
+		responseStore = newUserConfigResponseStateStore(rc.azdClient)
+	}
+
+	// Acquire the bearer token after body validation so a local input error
+	// (e.g., unreadable --input-file) does not pay an unnecessary auth round-trip
+	// and is surfaced before any auth failure.
+	rc.bearerToken, err = a.acquireBearerToken(ctx)
+	if err != nil {
+		return err
+	}
+
+	msg := string(body)
+
+	// Session ID — routes to the same microVM container instance.
+	// When empty, let the server assign one.
+	sid, err := a.resolveRemoteSessionID(ctx, rc)
+	if err != nil {
+		return err
+	}
+
+	// Conversation ID — enables multi-turn memory via Foundry Conversations API.
+	var convID string
+	if agentKey != "" && rc.azdClient != nil {
+		convID, err = resolveConversationID(
+			ctx,
+			rc.azdClient,
+			agentKey,
+			a.flags.conversation,
+			a.flags.forceNewConversation(),
+			rc.projectEndpoint,
+			rc.bearerToken,
+			rc.name,
+			rc.apiVersion,
+			a.flags.sessionRequestOptions(),
+			rc.legacyKeys()...,
+		)
+		if err != nil {
+			return err
+		}
+	} else if a.flags.conversation != "" {
+		convID = a.flags.conversation
+	} else {
+		convID, err = createConversation(
+			ctx,
+			rc.projectEndpoint,
+			rc.name,
+			rc.bearerToken,
+			rc.apiVersion,
+			a.flags.sessionRequestOptions(),
+		)
+		if err != nil {
+			return err
+		}
+	}
+	reqBody := buildResponsesRequestBody(msg, sid, convID, a.flags.longRunning)
+
+	raw := a.flags.outputFmt == outputRaw
+	if !raw {
+		fmt.Printf("Agent:        %s (remote)\n", rc.name)
+		fmt.Printf("Message:      %s\n", bodyLabel)
+		if rc.version != "" {
+			fmt.Printf("Version:      %s\n", rc.version)
+		}
+		printSessionStatus("Session:      ", sid)
+		fmt.Printf("Conversation: %s\n", convID)
+		fmt.Println()
+	}
+
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	respURL := buildResponsesURL(rc.projectEndpoint, rc.name, rc.apiVersion)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, respURL, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	applyCustomHeaders(req, a.clientHeaders)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+rc.bearerToken)
+	applyRemoteUserIdentityHeader(req, &a.flags.userIdentityFlags)
+	latency := newInvokeLatency(req, a.flags.debugLatency, a.flags.longRunning)
+	if raw {
+		// Disable Go's transparent gzip handling so the dumped headers and
+		// body match what the server actually sent on the wire.
+		req.Header.Set("Accept-Encoding", "identity")
+	}
+
+	client := &http.Client{Timeout: a.httpTimeout()}
+	if a.flags.longRunning {
+		client = responseStreamHTTPClient()
+	}
+	invokeStart := time.Now()
+	//nolint:gosec // G704: URL is built from a validated Foundry endpoint (env or --agent-endpoint)
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST %s failed: %w", respURL, err)
+	}
+	defer resp.Body.Close()
+
+	// Always capture session state from response headers (needed even in raw mode
+	// so subsequent invokes can reuse the session). Headers are read, not consumed.
+	latency.captureResponse(resp)
+	sessionLabel := "Session:      "
+	if raw {
+		sessionLabel = ""
+	}
+	captureResponseSession(ctx, rc.azdClient, agentKey, sid, resp, sessionLabel)
+
+	if raw {
+		if dumpErr := writeRawResponse(os.Stdout, resp); dumpErr != nil {
+			return dumpErr
+		}
+		if resp.StatusCode >= 400 {
+			return fmt.Errorf(
+				"POST %s failed with HTTP %d: %s",
+				respURL, resp.StatusCode, resp.Status,
+			)
+		}
+		return nil
+	}
+
+	if traceID := responseTraceID(resp); traceID != "" {
+		fmt.Printf("Trace ID:     %s\n", traceID)
+	}
+
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(resp.Body)
+		a.emitInvokeFailureNextStep(nextstep.InvokeRemote, rc.nextStepName(), resp.Header.Get("x-adc-response-details"))
+		return fmt.Errorf("POST %s failed with HTTP %d: %s\n%s", respURL, resp.StatusCode, resp.Status, string(respBody))
+	}
+	tracker := &responseIdentityTracker{
+		store:    responseStore,
+		agentKey: agentKey,
+		writer:   os.Stdout,
+	}
+	streamErr := readResponsesSSE(
+		ctx,
+		resp.Body,
+		os.Stdout,
+		rc.name,
+		responsesSSEOptions{
+			requireTerminal: a.flags.longRunning,
+			onResponseID: func(responseID string) error {
+				if err := tracker.Apply(ctx, responseID); err != nil {
+					return err
+				}
+				if a.flags.noWait && tracker.saveErr != nil {
+					return tracker.saveErr
+				}
+				if a.flags.noWait {
+					return errBackgroundNoWait
+				}
+				return nil
+			},
+		},
+	)
+	useCurrent := errors.Is(streamErr, errBackgroundNoWait) && responseStore != nil && tracker.saveErr == nil
+	followCommand := a.responseLifecycleCommand(rc, tracker.responseID, invocationFollow, useCurrent)
+	if a.flags.noWait && tracker.responseID != "" {
+		if errors.Is(streamErr, errBackgroundNoWait) {
+			streamErr = nil
+		}
+		if streamErr == nil {
+			if err := latency.writeTo(os.Stdout); err != nil {
+				return err
+			}
+		}
+		_, guidanceErr := fmt.Fprintf(os.Stdout, "\nNext:\n  %s\n", followCommand)
+		return errors.Join(streamErr, guidanceErr)
+	}
+	if streamErr != nil {
+		if a.flags.longRunning && tracker.responseID != "" &&
+			errors.Is(streamErr, errResponsesStreamDisconnected) {
+			return fmt.Errorf("%w; replay and follow it with `%s`", streamErr, followCommand)
+		}
+		return streamErr
+	}
+	totalDuration := time.Since(invokeStart)
+	printInvokeTiming(os.Stdout, totalDuration)
+	if err := latency.writeTo(os.Stdout); err != nil {
+		return err
+	}
+	a.emitInvokeSuccessNextStep(nextstep.InvokeRemote, rc.nextStepName())
+	return nil
+}
+
+func (a *InvokeAction) invocationsLocal(ctx context.Context) error {
+	port := a.flags.port
+
+	body, bodyLabel, err := a.resolveBody()
+	if err != nil {
+		return err
+	}
+
+	var azdClient *azdext.AzdClient
+	if c, err := azdext.NewAzdClient(); err == nil {
+		azdClient = c
+		defer azdClient.Close()
+	}
+
+	// Resolve the agent service ONCE. The same plain name feeds both:
+	//   - agentKey (composite, port + project + name) for the session
+	//     and conversation store, where the wider scope is needed to
+	//     avoid cross-project collisions in the shared config store.
+	//   - agentName (plain) for the OpenAPI cache filename, which lives
+	//     inside .azure/<envName>/ (already project-isolated) and must
+	//     match `nextstep.ReadCachedOpenAPISpec`'s reader, which only
+	//     knows the azure.yaml service name.
+	// Resolving twice would re-prompt the user on multi-agent projects
+	// AND risk picking different services for the two values (silent
+	// state corruption: session under A, cache under B).
+	agentName := resolveLocalAgentName(ctx, azdClient, a.serviceNameSelector(), a.noPrompt)
+	agentKey := buildLocalAgentKey(DefaultPort, agentName, "", resolveProjectPath(ctx, azdClient))
+
+	// Resolve local session ID (generated locally, not server-assigned).
+	var sid string
+	if azdClient != nil {
+		sid, err = resolveStoredID(
+			ctx, azdClient, agentKey, a.flags.session, a.flags.newSession, "sessions", true,
+		)
+		if err != nil {
+			log.Printf("invoke local: failed to resolve session ID: %v", err)
+		}
+	}
+
+	raw := a.flags.outputFmt == outputRaw
+	if !raw {
+		fmt.Printf("Target:   localhost:%d (local, invocations protocol)\n", port)
+		fmt.Printf("Input:    %s\n", bodyLabel)
+		printSessionStatus("Session:  ", sid)
+		fmt.Println()
+	}
+
+	localBaseURL := fmt.Sprintf("http://localhost:%d", port)
+
+	// Fetch and cache the agent's OpenAPI spec (always refresh for local).
+	if azdClient != nil {
+		if path, fresh := fetchOpenAPISpec(ctx, azdClient, localBaseURL, agentName, "local", "", "", true); fresh {
+			if !raw {
+				fmt.Printf("OpenAPI spec saved to %s\n", path)
+			}
+		}
+	}
+
+	invURL := localBaseURL + "/invocations"
+	if sid != "" {
+		invURL += "?agent_session_id=" + url.QueryEscape(sid)
+	}
+
+	newReq := func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, invURL, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		applyCustomHeaders(req, a.clientHeaders)
+		req.Header.Set("Content-Type", contentTypeForBody(body))
+		applyLocalUserIdentityHeader(req, &a.flags.userIdentityFlags)
+		applyLocalCallIDHeader(req, a.flags.callID)
+		if raw {
+			// Disable Go's transparent gzip handling so the dumped headers and
+			// body match what the server actually sent on the wire.
+			req.Header.Set("Accept-Encoding", "identity")
+		}
+		return req, nil
+	}
+
+	client := &http.Client{Timeout: a.httpTimeout()}
+	invokeStart := time.Now()
+	resp, err := doLocalRequestWithRetry(ctx, client, newReq)
+	if err != nil {
+		return fmt.Errorf(
+			"could not connect to localhost:%d -- is the agent running? Start it with: azd ai agent run",
+			port,
+		)
+	}
+	defer resp.Body.Close()
+
+	// Print the invocation ID if the agent returned one.
+	if !raw {
+		if invID := resp.Header.Get("x-agent-invocation-id"); invID != "" {
+			fmt.Printf("Invocation:   %s\n", invID)
+		}
+	}
+
+	if err := handleInvocationResponse(ctx, resp, "", "", agentName, a.httpTimeout(), "", nil, raw, nil); err != nil {
+		// See invocationsRemote for the status-code rationale.
+		if !raw && resp.StatusCode >= 400 {
+			a.emitInvokeFailureNextStep(nextstep.InvokeLocal, agentName, "")
+		}
+		return err
+	}
+	totalDuration := time.Since(invokeStart)
+	if !raw {
+		printInvokeTiming(os.Stdout, totalDuration)
+		a.emitInvokeSuccessNextStep(nextstep.InvokeLocal, agentName)
+	}
+	return nil
+}
+
+// invocationsRemote sends the user's message to Foundry using
+// the invocations protocol (POST /agents/{name}/endpoint/protocols/invocations).
+func (a *InvokeAction) invocationsRemote(ctx context.Context) error {
+	body, bodyLabel, err := a.resolveBody()
+	if err != nil {
+		return err
+	}
+
+	rc, err := a.resolveRemoteContextForInvoke(ctx)
+	if err != nil {
+		return err
+	}
+	if rc.azdClient != nil {
+		defer rc.azdClient.Close()
+	}
+	a.reportInvokeUsageForRemote(ctx, agent_api.AgentProtocolInvocations, rc)
+
+	agentKey := rc.agentKey
+	if agentKey == "" && rc.azdClient != nil {
+		log.Printf("warning: agent endpoint not available, session state will not be persisted")
+	}
+
+	if a.flags.newConversation {
+		fmt.Fprintln(os.Stderr,
+			"note: --new-conversation has no effect for the invocations protocol "+
+				"(memory is bound to the session; use --new-session to reset).")
+	}
+
+	// Acquire the bearer token after body validation so a local input error
+	// (e.g., unreadable --input-file) does not pay an unnecessary auth round-trip
+	// and is surfaced before any auth failure.
+	rc.bearerToken, err = a.acquireBearerToken(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Session ID — routes to the same container instance.
+	sid, err := a.resolveRemoteSessionID(ctx, rc)
+	if err != nil {
+		return err
+	}
+
+	raw := a.flags.outputFmt == outputRaw
+	if !raw {
+		fmt.Printf("Agent:    %s (remote, invocations protocol)\n", rc.name)
+		fmt.Printf("Input:    %s\n", bodyLabel)
+		if rc.version != "" {
+			fmt.Printf("Version:  %s\n", rc.version)
+		}
+		printSessionStatus("Session:  ", sid)
+		fmt.Println()
+	}
+
+	remoteBaseURL := fmt.Sprintf("%s/agents/%s/endpoint/protocols", rc.projectEndpoint, rc.name)
+
+	// Fetch and cache the agent's OpenAPI spec only in project mode. In ephemeral
+	// mode (--agent-endpoint) we deliberately avoid the on-disk side effect since
+	// the user is one-off targeting a remote endpoint.
+	if rc.azdClient != nil && a.endpoint == nil {
+		fetchOpenAPISpec(ctx, rc.azdClient, remoteBaseURL, rc.name, "remote", rc.bearerToken, rc.apiVersion, false)
+	}
+
+	invURL := buildInvocationsURL(rc.projectEndpoint, rc.name, rc.apiVersion, sid)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, invURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	applyCustomHeaders(req, a.clientHeaders)
+	req.Header.Set("Content-Type", contentTypeForBody(body))
+	req.Header.Set("Authorization", "Bearer "+rc.bearerToken)
+	applyRemoteUserIdentityHeader(req, &a.flags.userIdentityFlags)
+	latency := newInvokeLatency(req, a.flags.debugLatency, false)
+	if raw {
+		// Disable Go's transparent gzip handling so the dumped headers and
+		// body match what the server actually sent on the wire.
+		req.Header.Set("Accept-Encoding", "identity")
+	}
+
+	client := &http.Client{Timeout: a.httpTimeout()}
+	invokeStart := time.Now()
+	//nolint:gosec // G704: URL is built from a validated Foundry endpoint (env or --agent-endpoint)
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST %s failed: %w", invURL, err)
+	}
+	defer resp.Body.Close()
+
+	invocationID, err := invocationIDFromResponse(resp)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < http.StatusBadRequest && invocationID != "" && rc.azdClient != nil && agentKey != "" {
+		if err := newInvocationStateStore(rc.azdClient).Save(
+			ctx,
+			agentKey,
+			savedInvocation{InvocationID: invocationID},
+		); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: Invocation %s was accepted, but its ID was not saved: %v\n", invocationID, err)
+		}
+	}
+	if !raw && invocationID != "" {
+		fmt.Printf("Invocation:   %s\n", invocationID)
+	}
+
+	// Always capture session state from response headers (needed even in raw mode
+	// so subsequent invokes can reuse the session). Reads headers, not the body.
+	latency.captureResponse(resp)
+	sessionLabel := "Session:  "
+	if raw {
+		sessionLabel = ""
+	}
+	captureResponseSession(ctx, rc.azdClient, agentKey, sid, resp, sessionLabel)
+
+	sessionCode := resp.Header.Get("x-adc-response-details")
+	if err := handleInvocationResponse(
+		ctx,
+		resp,
+		rc.projectEndpoint,
+		rc.bearerToken,
+		rc.name,
+		a.httpTimeout(),
+		rc.apiVersion,
+		a.flags.sessionRequestOptions(),
+		raw,
+		latency,
+	); err != nil {
+		// Only emit failure Next: for platform HTTP failures.
+		// 200 OK with an agent-error envelope (handleInvocationSync /
+		// handleInvocationSSE returning fmt.Errorf("agent error...")) is
+		// an agent-level error; the platform's SessionErrorCode vocabulary
+		// doesn't apply, and the responses protocol's equivalent
+		// (printAgentResponse / readResponsesSSE agent errors) is also
+		// not wired. Keeps the two protocols' UX consistent.
+		if !raw && resp.StatusCode >= 400 {
+			a.emitInvokeFailureNextStep(nextstep.InvokeRemote, rc.nextStepName(), sessionCode)
+		}
+		return err
+	}
+	totalDuration := time.Since(invokeStart)
+	if !raw {
+		printInvokeTiming(os.Stdout, totalDuration)
+		if err := latency.writeTo(os.Stdout); err != nil {
+			return err
+		}
+		a.emitInvokeSuccessNextStep(nextstep.InvokeRemote, rc.nextStepName())
+	}
+	return nil
+}
+
+// handleInvocationResponse dispatches the response from a POST /invocations call
+// to the correct handler based on the HTTP status code and content type.
+//
+// When raw is true, the response is dumped verbatim (status line + headers + body)
+// to stdout instead of being parsed:
+//   - 2xx sync/SSE: the response is streamed through writeRawResponse so SSE
+//     events flow through unbuffered.
+//   - 202 LRO: the initial 202 is dumped, then polling continues silently until
+//     terminal state, then the terminal response is dumped after a "---"
+//     separator. Intermediate polls are not surfaced to avoid noise.
+//   - 4xx/5xx: dumped verbatim before the structured error is returned so the
+//     caller's Next: guidance still fires on stderr while stdout shows the
+//     server's raw bytes.
+func handleInvocationResponse(
+	ctx context.Context,
+	resp *http.Response,
+	endpoint string,
+	bearerToken string,
+	agentName string,
+	timeout time.Duration,
+	apiVersion string,
+	options *agent_api.SessionRequestOptions,
+	raw bool,
+	latency *invokeLatency,
+) error {
+	if raw {
+		if resp.StatusCode == http.StatusAccepted {
+			return handleInvocationLRO(ctx, resp, endpoint, bearerToken, agentName, timeout, apiVersion, options, raw, latency)
+		}
+		if err := writeRawResponse(os.Stdout, resp); err != nil {
+			return err
+		}
+		if resp.StatusCode >= 400 {
+			requestURL := "/invocations"
+			if resp.Request != nil && resp.Request.URL != nil {
+				requestURL = resp.Request.URL.String()
+			}
+			return fmt.Errorf(
+				"POST %s failed with HTTP %d: %s",
+				requestURL, resp.StatusCode, resp.Status,
+			)
+		}
+		return nil
+	}
+
+	if traceID := responseTraceID(resp); traceID != "" {
+		fmt.Printf("Trace ID:     %s\n", traceID)
+	}
+
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(resp.Body)
+		requestURL := "/invocations"
+		if resp.Request != nil && resp.Request.URL != nil {
+			requestURL = resp.Request.URL.String()
+		}
+		return fmt.Errorf(
+			"POST %s failed with HTTP %d: %s\n%s",
+			requestURL, resp.StatusCode, resp.Status, string(respBody),
+		)
+	}
+
+	if resp.StatusCode == http.StatusAccepted {
+		return handleInvocationLRO(ctx, resp, endpoint, bearerToken, agentName, timeout, apiVersion, options, raw, latency)
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if strings.HasPrefix(contentType, "text/event-stream") {
+		return handleInvocationSSE(os.Stdout, resp.Body, agentName)
+	}
+
+	return handleInvocationSync(resp.Body, agentName)
+}
+
+// handleInvocationSync handles a synchronous (200 OK, immediate result) invocations response.
+func handleInvocationSync(body io.Reader, agentName string) error {
+	respBody, err := io.ReadAll(body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Try to detect the recommended error envelope
+	var result map[string]any
+	if err := json.Unmarshal(respBody, &result); err == nil {
+		if errObj, ok := result["error"].(map[string]any); ok {
+			msg, _ := errObj["message"].(string)
+			errType, _ := errObj["type"].(string)
+			code, _ := errObj["code"].(string)
+			label := code
+			if label == "" {
+				label = errType
+			}
+			if label != "" {
+				return fmt.Errorf("agent error (%s): %s", label, msg)
+			}
+			return fmt.Errorf("agent error: %s", msg)
+		}
+	}
+
+	// Print response — try pretty JSON, fall back to raw text
+	if json.Valid(respBody) {
+		var pretty bytes.Buffer
+		if err := json.Indent(&pretty, respBody, "", "  "); err == nil {
+			fmt.Printf("[%s] %s\n", agentName, pretty.String())
+			return nil
+		}
+	}
+
+	fmt.Printf("[%s] %s\n", agentName, string(respBody))
+	return nil
+}
+
+// handleInvocationSSE handles a streaming (200 OK, text/event-stream) invocations response.
+// The invocations protocol has a developer-defined SSE format, so we print data lines as they arrive.
+func handleInvocationSSE(w io.Writer, body io.Reader, agentName string) error {
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	var printed bool
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if data, ok := strings.CutPrefix(line, "data: "); ok {
+			if data == "[DONE]" {
+				break
+			}
+
+			// Try to detect error events
+			var errEnvelope struct {
+				Error struct {
+					Message string `json:"message"`
+					Type    string `json:"type"`
+					Code    string `json:"code"`
+				} `json:"error"`
+			}
+			if json.Unmarshal([]byte(data), &errEnvelope) == nil && errEnvelope.Error.Message != "" {
+				label := errEnvelope.Error.Code
+				if label == "" {
+					label = errEnvelope.Error.Type
+				}
+				if label != "" {
+					return fmt.Errorf("agent error (%s): %s", label, errEnvelope.Error.Message)
+				}
+				return fmt.Errorf("agent error: %s", errEnvelope.Error.Message)
+			}
+
+			// Print data as-is, one line per SSE data object
+			if !printed {
+				fmt.Fprintf(w, "[%s] ", agentName)
+				printed = true
+			}
+			fmt.Fprintln(w, data)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading response stream: %w", err)
+	}
+
+	return nil
+}
+
+var (
+	defaultLROPollInterval = 2 * time.Second //nolint:revive // package-level var allows test overrides
+	maxLROPollInterval     = 30 * time.Second
+)
+
+// handleInvocationLRO handles a long-running operation (202 Accepted) invocations response
+// by polling GET on the invocation's status URL (derived from the original request URL)
+// until a terminal state is reached.
+//
+// When raw is true, the initial 202 response and the final terminal response
+// are written verbatim to stdout (separated by a "---" line). Intermediate
+// polls and progress messages are suppressed.
+func handleInvocationLRO(
+	ctx context.Context,
+	resp *http.Response,
+	endpoint string,
+	bearerToken string,
+	agentName string,
+	timeout time.Duration,
+	apiVersion string,
+	options *agent_api.SessionRequestOptions,
+	raw bool,
+	latency *invokeLatency,
+) error {
+	latency.captureResponse(resp)
+	// Read the 202 body once -- used for both invocation ID extraction and status display.
+	body202, readErr := io.ReadAll(resp.Body)
+	if raw && readErr != nil {
+		return fmt.Errorf("failed to read 202 response body: %w", readErr)
+	}
+	var bodyJSON map[string]any
+	if len(body202) > 0 {
+		_ = json.Unmarshal(body202, &bodyJSON) // best-effort; bodyJSON stays nil on failure
+	}
+
+	invocationID := resp.Header.Get("x-agent-invocation-id")
+	if invocationID == "" && bodyJSON != nil {
+		if id, ok := bodyJSON["invocation_id"].(string); ok {
+			invocationID = id
+		}
+	}
+	if invocationID == "" {
+		return fmt.Errorf(
+			"received 202 Accepted but no invocation ID found " +
+				"(expected x-agent-invocation-id response header)",
+		)
+	}
+
+	if raw {
+		// Dump the initial 202 verbatim. Rewind the body via a fresh
+		// reader since we already consumed it for invocation-ID extraction.
+		resp.Body = io.NopCloser(bytes.NewReader(body202))
+		if err := writeRawResponse(os.Stdout, resp); err != nil {
+			return err
+		}
+		// Leading newline guarantees visual separation even if the 202
+		// body ends without one.
+		if _, err := fmt.Fprint(os.Stdout, "\r\n---\r\n"); err != nil {
+			return err
+		}
+	} else {
+		// Display initial 202 status if present
+		if bodyJSON != nil {
+			if status, _ := bodyJSON["status"].(string); status != "" {
+				fmt.Printf("[%s] Invocation %s: %s\n", agentName, invocationID, status)
+			}
+		}
+
+		// TODO: Async-with-callbacks (§5.4) is not yet supported. If the agent uses
+		// a callback pattern, this polling loop will time out. Consider adding callback
+		// support in a future iteration.
+
+		fmt.Printf("[%s] Polling for result (invocation %s)...\n", agentName, invocationID)
+	}
+
+	// Derive the poll URL from the original request URL so this works for both
+	// local and remote agents. The original URL looks like .../invocations?...
+	// and the poll URL inserts the invocation ID: .../invocations/{id}?...
+	var pollURL string
+	if resp.Request != nil && resp.Request.URL != nil {
+		baseURL := resp.Request.URL.String()
+		if i := strings.Index(baseURL, "/invocations?"); i >= 0 {
+			pollURL = baseURL[:i] + "/invocations/" + invocationID + baseURL[i+len("/invocations"):]
+		}
+	}
+	if pollURL == "" {
+		if apiVersion == "" {
+			apiVersion = DefaultAgentAPIVersion
+		}
+		pollURL = fmt.Sprintf(
+			"%s/agents/%s/endpoint/protocols/invocations/%s?api-version=%s",
+			endpoint, agentName, invocationID, url.QueryEscape(apiVersion),
+		)
+	}
+
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+
+	pollInterval := defaultLROPollInterval
+
+	for {
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			return fmt.Errorf(
+				"timed out waiting for invocation %s to complete (timeout: %s)",
+				invocationID, timeout,
+			)
+		}
+
+		time.Sleep(pollInterval)
+
+		req, err := http.NewRequestWithContext(
+			ctx, http.MethodGet, pollURL, nil,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create poll request: %w", err)
+		}
+		if bearerToken != "" {
+			req.Header.Set("Authorization", "Bearer "+bearerToken)
+		}
+		options.ApplyHeaders(req.Header)
+		if raw {
+			// Disable Go's transparent gzip handling so the dumped headers
+			// and body match what the server actually sent on the wire.
+			req.Header.Set("Accept-Encoding", "identity")
+		}
+
+		client := &http.Client{Timeout: 30 * time.Second}
+		pollResp, err := client.Do(req) //nolint:gosec // G704: endpoint from azd environment
+		if err != nil {
+			return fmt.Errorf("GET %s failed: %w", pollURL, err)
+		}
+		latency.captureResponse(pollResp)
+
+		pollBody, readErr := io.ReadAll(pollResp.Body)
+		_ = pollResp.Body.Close()
+		if raw && readErr != nil {
+			return fmt.Errorf("failed to read poll response body: %w", readErr)
+		}
+
+		if pollResp.StatusCode == http.StatusNotFound {
+			continue // invocation not yet registered
+		}
+
+		if pollResp.StatusCode >= 400 {
+			if raw {
+				pollResp.Body = io.NopCloser(bytes.NewReader(pollBody))
+				if dumpErr := writeRawResponse(os.Stdout, pollResp); dumpErr != nil {
+					return dumpErr
+				}
+				// Body was already dumped to stdout; don't repeat it in stderr.
+				return fmt.Errorf(
+					"GET %s failed with HTTP %d: %s",
+					pollURL, pollResp.StatusCode, pollResp.Status,
+				)
+			}
+			return fmt.Errorf(
+				"GET %s failed with HTTP %d: %s\n%s",
+				pollURL, pollResp.StatusCode, pollResp.Status, string(pollBody),
+			)
+		}
+
+		var result map[string]any
+		if err := json.Unmarshal(pollBody, &result); err == nil {
+			status, _ := result["status"].(string)
+			switch status {
+			case "completed":
+				if raw {
+					pollResp.Body = io.NopCloser(bytes.NewReader(pollBody))
+					return writeRawResponse(os.Stdout, pollResp)
+				}
+				fmt.Printf("[%s] Invocation completed.\n", agentName)
+				// Pretty-print the result
+				if json.Valid(pollBody) {
+					var pretty bytes.Buffer
+					if err := json.Indent(&pretty, pollBody, "", "  "); err == nil {
+						fmt.Println(pretty.String())
+						return nil
+					}
+				}
+				fmt.Println(string(pollBody))
+				return nil
+			case "failed":
+				if raw {
+					pollResp.Body = io.NopCloser(bytes.NewReader(pollBody))
+					if dumpErr := writeRawResponse(os.Stdout, pollResp); dumpErr != nil {
+						return dumpErr
+					}
+					// Body was already dumped; return a concise error.
+					if errObj, ok := result["error"].(map[string]any); ok {
+						msg, _ := errObj["message"].(string)
+						code, _ := errObj["code"].(string)
+						return fmt.Errorf("invocation failed (%s): %s", code, msg)
+					}
+					return fmt.Errorf("invocation failed")
+				}
+				if errObj, ok := result["error"].(map[string]any); ok {
+					msg, _ := errObj["message"].(string)
+					code, _ := errObj["code"].(string)
+					return fmt.Errorf("invocation failed (%s): %s", code, msg)
+				}
+				return fmt.Errorf("invocation failed: %s", string(pollBody))
+			case "cancelled":
+				if raw {
+					pollResp.Body = io.NopCloser(bytes.NewReader(pollBody))
+					if dumpErr := writeRawResponse(os.Stdout, pollResp); dumpErr != nil {
+						return dumpErr
+					}
+				}
+				return fmt.Errorf("invocation was cancelled")
+			}
+		}
+
+		// Respect Retry-After header from the poll response
+		if ra := pollResp.Header.Get("Retry-After"); ra != "" {
+			if seconds, err := strconv.Atoi(ra); err == nil && seconds > 0 {
+				pollInterval = min(time.Duration(seconds)*time.Second, maxLROPollInterval)
+			}
+		}
+	}
+}
+
+// createConversation creates a new Foundry conversation for multi-turn memory.
+func createConversation(
+	ctx context.Context,
+	projectEndpoint, agentName, bearerToken, apiVersion string,
+	options *agent_api.SessionRequestOptions,
+) (string, error) {
+	if apiVersion == "" {
+		apiVersion = DefaultAgentAPIVersion
+	}
+	convURL := fmt.Sprintf(
+		"%s/agents/%s/endpoint/protocols/openai/conversations?api-version=%s",
+		projectEndpoint, agentName, url.QueryEscape(apiVersion),
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, convURL, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+bearerToken)
+	options.ApplyHeaders(req.Header)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req) //nolint:gosec // G704: endpoint is resolved from azd environment configuration
+	if err != nil {
+		return "", fmt.Errorf("POST %s failed: %w", convURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("POST %s failed with HTTP %d: %s\n%s", convURL, resp.StatusCode, resp.Status, string(respBody))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", err
+	}
+
+	if id, ok := result["id"].(string); ok {
+		return id, nil
+	}
+	return "", fmt.Errorf("conversation response missing 'id' field")
+}
+
+// responseTraceID returns the trace ID from the response, preferring x-request-id
+// and falling back to apim-request-id. If a header value is comma-folded (which
+// can happen when an intermediary like APIM combines duplicate headers per
+// RFC 7230 §3.2.2), the first non-empty token is returned.
+func responseTraceID(resp *http.Response) string {
+	raw := resp.Header.Get("x-request-id")
+	if raw == "" {
+		raw = resp.Header.Get("apim-request-id")
+	}
+	for part := range strings.SplitSeq(raw, ",") {
+		if id := strings.TrimSpace(part); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+// printAgentResponse pretty-prints the output_text items from an agent response.
+func printAgentResponse(result map[string]any, title string) error {
+	// Check for agent-level errors (e.g., agent runtime failures)
+	if status, _ := result["status"].(string); status == "failed" {
+		if errObj, ok := result["error"].(map[string]any); ok {
+			msg, _ := errObj["message"].(string)
+			code, _ := errObj["code"].(string)
+			return fmt.Errorf("agent failed (%s): %s", code, msg)
+		}
+		return fmt.Errorf("agent returned failed status")
+	}
+
+	// Check for server-level errors (e.g., local agentserver: {"code": "server_error", "message": "..."})
+	if code, ok := result["code"].(string); ok && code != "" {
+		msg, _ := result["message"].(string)
+		return fmt.Errorf("agent error (%s): %s", code, msg)
+	}
+
+	outputItems, ok := result["output"].([]any)
+	if !ok {
+		// Try printing the whole response as formatted JSON
+		jsonBytes, _ := json.MarshalIndent(result, "", "  ")
+		fmt.Println(string(jsonBytes))
+		return nil
+	}
+
+	printed := false
+	for _, item := range outputItems {
+		itemMap, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		contentItems, ok := itemMap["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, content := range contentItems {
+			contentMap, ok := content.(map[string]any)
+			if !ok {
+				continue
+			}
+			if contentMap["type"] == "output_text" {
+				if text, ok := contentMap["text"].(string); ok {
+					fmt.Printf("[%s] %s\n", title, text)
+					printed = true
+				}
+			}
+		}
+	}
+
+	if !printed {
+		jsonBytes, _ := json.MarshalIndent(result, "", "  ")
+		fmt.Println(string(jsonBytes))
+	}
+	return nil
+}

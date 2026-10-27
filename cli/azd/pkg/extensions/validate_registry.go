@@ -1,0 +1,433 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package extensions
+
+import (
+	"fmt"
+	"regexp"
+	"slices"
+	"strings"
+
+	"github.com/Masterminds/semver/v3"
+)
+
+// ValidPlatforms defines the valid os/arch combinations for extension artifacts.
+var ValidPlatforms = []string{
+	"windows/amd64",
+	"windows/arm64",
+	"darwin/amd64",
+	"darwin/arm64",
+	"linux/amd64",
+	"linux/arm64",
+}
+
+// ValidCapabilities defines the valid capability types for extensions.
+var ValidCapabilities = []CapabilityType{
+	CustomCommandCapability,
+	LifecycleEventsCapability,
+	McpServerCapability,
+	ServiceTargetProviderCapability,
+	FrameworkServiceProviderCapability,
+	MetadataCapability,
+	ProvisioningProviderCapability,
+	ValidationProviderCapability,
+}
+
+// validChecksumAlgorithms defines the supported checksum algorithms.
+var validChecksumAlgorithms = []string{"sha256", "sha512"}
+
+// extensionIdRegex validates extension ID format: dot-separated lowercase segments with hyphens.
+var extensionIdRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
+
+// ValidationSeverity represents the severity of a validation error.
+type ValidationSeverity string
+
+const (
+	// ValidationError is a validation error that prevents the registry from being valid.
+	ValidationError ValidationSeverity = "error"
+	// ValidationWarning is a validation warning that does not prevent the registry from being valid.
+	ValidationWarning ValidationSeverity = "warning"
+)
+
+// ValidationIssue represents a single validation finding.
+type ValidationIssue struct {
+	// Severity is the severity of the validation issue (error or warning).
+	Severity ValidationSeverity `json:"severity"`
+	// Message describes the validation issue.
+	Message string `json:"message"`
+}
+
+// ExtensionValidationResult represents the validation result for a single extension.
+type ExtensionValidationResult struct {
+	// Id is the extension ID (may be empty if missing).
+	Id string `json:"id"`
+	// DisplayName is the extension display name.
+	DisplayName string `json:"displayName"`
+	// LatestVersion is the latest version string found.
+	LatestVersion string `json:"latestVersion"`
+	// Capabilities lists the capabilities of the latest version.
+	Capabilities []CapabilityType `json:"capabilities"`
+	// Platforms lists the platforms of the latest version.
+	Platforms []string `json:"platforms"`
+	// Issues contains all validation issues found.
+	Issues []ValidationIssue `json:"issues"`
+	// Valid is true if no errors were found.
+	Valid bool `json:"valid"`
+}
+
+// RegistryValidationResult represents the validation result for an entire registry file.
+type RegistryValidationResult struct {
+	// Issues contains registry-level validation issues.
+	Issues []ValidationIssue `json:"issues,omitempty"`
+	// Extensions contains validation results for each extension.
+	Extensions []ExtensionValidationResult `json:"extensions"`
+	// Valid is true if all extensions are valid and no registry-level errors exist.
+	Valid bool `json:"valid"`
+}
+
+// addError adds a registry-level error.
+func (r *RegistryValidationResult) addError(msg string) {
+	r.Issues = append(r.Issues, ValidationIssue{
+		Severity: ValidationError,
+		Message:  msg,
+	})
+	r.Valid = false
+}
+
+// addWarning adds a registry-level warning.
+func (r *RegistryValidationResult) addWarning(msg string) {
+	r.Issues = append(r.Issues, ValidationIssue{
+		Severity: ValidationWarning,
+		Message:  msg,
+	})
+}
+
+// ValidateRegistry validates a complete registry including registry-level
+// fields and all extensions.
+func ValidateRegistry(
+	registry *Registry, strict bool,
+) *RegistryValidationResult {
+	result := &RegistryValidationResult{Valid: true}
+	if registry == nil {
+		result.addError("registry is nil")
+		return result
+	}
+
+	result = ValidateExtensions(registry.Extensions, strict)
+	validateSchemaVersion(result, registry.SchemaVersion, strict)
+	return result
+}
+
+// validateSchemaVersion validates the registry-level schemaVersion field.
+func validateSchemaVersion(
+	result *RegistryValidationResult,
+	schemaVersion string,
+	strict bool,
+) {
+	if schemaVersion == "" {
+		result.addWarning(
+			"missing 'schemaVersion' field; " +
+				"consider adding a schema version for forward compatibility",
+		)
+		return
+	}
+
+	if _, err := semver.NewVersion(schemaVersion); err != nil {
+		result.addError(fmt.Sprintf(
+			"invalid schemaVersion format %q: %v",
+			schemaVersion, err,
+		))
+	}
+}
+
+// ValidateExtensions validates a slice of parsed extension metadata.
+func ValidateExtensions(exts []*ExtensionMetadata, strict bool) *RegistryValidationResult {
+	result := &RegistryValidationResult{
+		Valid: true,
+	}
+
+	// Index published versions per extension id so declared dependencies can be
+	// checked against what the registry actually offers.
+	availableVersions := buildVersionIndex(exts)
+
+	for _, ext := range exts {
+		var extResult ExtensionValidationResult
+		if ext == nil {
+			extResult = ExtensionValidationResult{
+				Issues: []ValidationIssue{{Severity: ValidationError, Message: "null extension entry"}},
+				Valid:  false,
+			}
+		} else {
+			extResult = validateExtension(ext, strict)
+			validateExtensionDependencies(&extResult, ext, availableVersions)
+		}
+		result.Extensions = append(result.Extensions, extResult)
+		if !extResult.Valid {
+			result.Valid = false
+		}
+	}
+
+	return result
+}
+
+// buildVersionIndex maps each extension id to the version strings it publishes.
+func buildVersionIndex(exts []*ExtensionMetadata) map[string][]string {
+	index := make(map[string][]string, len(exts))
+	for _, ext := range exts {
+		if ext == nil || ext.Id == "" {
+			continue
+		}
+		for _, ver := range ext.Versions {
+			if ver.Version != "" {
+				index[ext.Id] = append(index[ext.Id], ver.Version)
+			}
+		}
+	}
+	return index
+}
+
+// validateExtension validates a single extension metadata entry.
+func validateExtension(ext *ExtensionMetadata, strict bool) ExtensionValidationResult {
+	result := ExtensionValidationResult{
+		Id:          ext.Id,
+		DisplayName: ext.DisplayName,
+		Valid:       true,
+	}
+
+	// Required fields
+	if ext.Id == "" {
+		result.addError("missing or empty required field 'id'")
+	} else if !extensionIdRegex.MatchString(ext.Id) {
+		result.addError(fmt.Sprintf("invalid extension ID format '%s': must be dot-separated lowercase segments "+
+			"(e.g. 'publisher.extension' or 'publisher.category.extension')", ext.Id))
+	}
+
+	if ext.DisplayName == "" {
+		result.addError("missing or empty required field 'displayName'")
+	}
+
+	if ext.Description == "" {
+		result.addError("missing or empty required field 'description'")
+	}
+
+	if len(ext.Versions) == 0 {
+		result.addError("missing or empty required field 'versions'")
+		return result
+	}
+
+	// Validate each version
+	for i, ver := range ext.Versions {
+		validateVersion(&result, ext.Id, i, &ver, strict)
+	}
+
+	// Find latest version using semver ordering
+	latestVer := findLatestVersion(ext.Versions)
+	if latestVer != nil {
+		result.LatestVersion = latestVer.Version
+		result.Capabilities = latestVer.Capabilities
+		if latestVer.Artifacts != nil {
+			for platform := range latestVer.Artifacts {
+				result.Platforms = append(result.Platforms, platform)
+			}
+		}
+	}
+
+	return result
+}
+
+// findLatestVersion finds the latest version using strict semver ordering.
+func findLatestVersion(versions []ExtensionVersion) *ExtensionVersion {
+	var latest *ExtensionVersion
+	var latestSemver *semver.Version
+
+	for i := range versions {
+		v, err := semver.StrictNewVersion(versions[i].Version)
+		if err != nil {
+			continue
+		}
+
+		if latestSemver == nil || v.GreaterThan(latestSemver) {
+			latest = &versions[i]
+			latestSemver = v
+		}
+	}
+
+	// If no valid semver found, fall back to last element
+	if latest == nil && len(versions) > 0 {
+		latest = &versions[len(versions)-1]
+	}
+
+	return latest
+}
+
+// validateVersion validates a single version entry within an extension.
+func validateVersion(
+	result *ExtensionValidationResult,
+	extensionId string,
+	index int,
+	ver *ExtensionVersion,
+	strict bool,
+) {
+	prefix := fmt.Sprintf("versions[%d]", index)
+
+	// Validate semver format using the semver package
+	if ver.Version == "" {
+		result.addError(fmt.Sprintf("%s: missing required field 'version'", prefix))
+	} else if _, err := semver.StrictNewVersion(ver.Version); err != nil {
+		result.addError(fmt.Sprintf("%s: invalid semver format '%s' "+
+			"(expected MAJOR.MINOR.PATCH with optional pre-release suffix)", prefix, ver.Version))
+	}
+
+	// Validate capabilities
+	for _, cap := range ver.Capabilities {
+		if !isValidCapability(cap) {
+			result.addError(fmt.Sprintf("%s: unknown capability '%s' (valid: %s)",
+				prefix, cap, strings.Join(capabilityStrings(), ", ")))
+		}
+	}
+
+	// Enforce that each version has at least one artifact or dependency
+	hasArtifacts := len(ver.Artifacts) > 0
+	hasDependencies := len(ver.Dependencies) > 0
+	if !hasArtifacts && !hasDependencies {
+		result.addError(fmt.Sprintf("%s: version must define at least one artifact or dependency", prefix))
+	}
+
+	// Validate artifacts
+	if hasArtifacts {
+		for platform, artifact := range ver.Artifacts {
+			artifactPrefix := fmt.Sprintf("%s.artifacts[%s]", prefix, platform)
+
+			if !isValidPlatform(platform) {
+				result.addError(fmt.Sprintf("%s: unknown platform '%s' (valid: %s)",
+					artifactPrefix, platform, strings.Join(ValidPlatforms, ", ")))
+			}
+
+			if artifact.URL == "" {
+				result.addError(fmt.Sprintf("%s: missing required field 'url'", artifactPrefix))
+			}
+
+			if artifact.Checksum.Value == "" {
+				if strict {
+					result.addError(fmt.Sprintf("%s: missing required checksum", artifactPrefix))
+				} else {
+					result.addWarning(fmt.Sprintf("%s: missing checksum (recommended for integrity verification)",
+						artifactPrefix))
+				}
+			} else if artifact.Checksum.Algorithm == "" {
+				result.addError(fmt.Sprintf("%s: checksum value present but missing algorithm "+
+					"(supported: %s)", artifactPrefix, strings.Join(validChecksumAlgorithms, ", ")))
+			} else if !isValidChecksumAlgorithm(artifact.Checksum.Algorithm) {
+				result.addError(fmt.Sprintf("%s: unsupported checksum algorithm '%s' "+
+					"(supported: %s)", artifactPrefix, artifact.Checksum.Algorithm,
+					strings.Join(validChecksumAlgorithms, ", ")))
+			}
+		}
+	}
+}
+
+// validateExtensionDependencies checks the declared dependencies of every version
+// of an extension against what the registry publishes.
+func validateExtensionDependencies(
+	result *ExtensionValidationResult,
+	ext *ExtensionMetadata,
+	availableVersions map[string][]string,
+) {
+	for i := range ext.Versions {
+		validateDependencies(result, &ext.Versions[i], availableVersions)
+	}
+}
+
+// validateDependencies checks that every dependency declared by ver can be
+// resolved within the registry. azd resolves an extension's dependencies from
+// the parent's own source at install time, so a registry is expected to be
+// self-contained for the dependencies it declares.
+//
+// A dependency whose id is not present in the registry is reported as a warning
+// rather than an error: the validator may run against a partial or in-progress
+// registry, and the dependency could already be installed at resolution time. A
+// dependency whose id is present but whose version constraint matches no published
+// version is reported as an error, because it can never be resolved (this is the
+// failure that breaks coordinated multi-extension bumps). The same constraint
+// matcher used by the installer is reused so validation mirrors install-time
+// resolution.
+//
+// Messages name the depending version and dependency directly (rather than array
+// indices) so a failure reads clearly on its own; the owning extension id is
+// supplied by the caller's context (grouped output or a test prefix).
+func validateDependencies(
+	result *ExtensionValidationResult,
+	ver *ExtensionVersion,
+	availableVersions map[string][]string,
+) {
+	for _, dep := range ver.Dependencies {
+		if dep.Id == "" {
+			result.addError(fmt.Sprintf("version %s declares a dependency with no 'id'", ver.Version))
+			continue
+		}
+
+		versions, known := availableVersions[dep.Id]
+		if !known {
+			result.addWarning(fmt.Sprintf(
+				"version %s depends on %s, which is not in this registry "+
+					"(to resolve, it must be published in this registry or already installed)",
+				ver.Version, dep.Id))
+			continue
+		}
+
+		// An empty constraint matches any published version.
+		if dep.Version == "" {
+			continue
+		}
+
+		satisfied := false
+		for _, candidate := range versions {
+			if matchesVersionConstraint(dep.Version, candidate) {
+				satisfied = true
+				break
+			}
+		}
+
+		if !satisfied {
+			result.addError(fmt.Sprintf(
+				"version %s depends on %s %q, but no published version satisfies it (available: %s)",
+				ver.Version, dep.Id, dep.Version, strings.Join(versions, ", ")))
+		}
+	}
+}
+
+func (r *ExtensionValidationResult) addError(msg string) {
+	r.Issues = append(r.Issues, ValidationIssue{
+		Severity: ValidationError,
+		Message:  msg,
+	})
+	r.Valid = false
+}
+
+func (r *ExtensionValidationResult) addWarning(msg string) {
+	r.Issues = append(r.Issues, ValidationIssue{
+		Severity: ValidationWarning,
+		Message:  msg,
+	})
+}
+
+func isValidCapability(cap CapabilityType) bool {
+	return slices.Contains(ValidCapabilities, cap)
+}
+
+func isValidPlatform(platform string) bool {
+	return slices.Contains(ValidPlatforms, platform)
+}
+
+func isValidChecksumAlgorithm(alg string) bool {
+	return slices.Contains(validChecksumAlgorithms, alg)
+}
+
+func capabilityStrings() []string {
+	result := make([]string, len(ValidCapabilities))
+	for i, cap := range ValidCapabilities {
+		result[i] = string(cap)
+	}
+	return result
+}

@@ -1,0 +1,78 @@
+# Release History
+
+<!-- cspell:ignore herohua -->
+
+## 1.0.0-beta.8 (2026-09-24)
+
+### Other Changes
+
+- [[#10114]](https://github.com/Azure/azure-dev/pull/10114) Update gRPC to v1.83.2 to address the GHSA-2v4p-qf9q-27wj security advisory.
+- [[#10128]](https://github.com/Azure/azure-dev/pull/10128) Update OpenTelemetry Go to v1.45.0 to address the GHSA-8wmf-6v46-5gfg security advisory.
+
+## 1.0.0-beta.7 (2026-09-10)
+
+### Features Added
+
+- [[#9943]](https://github.com/Azure/azure-dev/pull/9943) Refresh the embedded Agent Inspector UI with run filtering, improved accessibility and exports, connection recovery, and detailed failure timelines. Thanks @herohua for the contribution!
+
+## 1.0.0-beta.6 (2026-09-04)
+
+### Features Added
+
+- [[#9860]](https://github.com/Azure/azure-dev/pull/9860) Refresh the embedded Inspector UI with event search, filtering, export actions, restored approvals, and improved tool and error details. Thanks @herohua for the contribution!
+
+### Other Changes
+
+- [[#9825]](https://github.com/Azure/azure-dev/pull/9825) Update gRPC to v1.83.1 to address the GHSA-vp52-pcj8-j9qc security advisory.
+
+## 1.0.0-beta.5 (2026-08-24)
+
+### Other Changes
+
+- [[#9580]](https://github.com/Azure/azure-dev/pull/9580) Report when the Agent Inspector interface is ready while preserving the originating trace context.
+
+## 1.0.0-beta.4 (2026-08-20)
+
+### Features Added
+
+- [[#9652]](https://github.com/Azure/azure-dev/pull/9652) Refresh the embedded Agent Inspector UI with response overviews, reasoning details, approval handling, and response metrics.
+
+## 1.0.0-beta.3 (2026-08-06)
+
+### Other Changes
+
+- [[#9416]](https://github.com/Azure/azure-dev/pull/9416) Upgrade `google.golang.org/grpc` to v1.82.1 to address security advisories.
+
+## 1.0.0-beta.2 (2026-07-09)
+
+### Bugs Fixed
+
+- [[#8958]](https://github.com/Azure/azure-dev/pull/8958) Fix inspector display name and example description. Thanks @anchenyi for the contribution!
+
+### Other Changes
+
+- [[#9027]](https://github.com/Azure/azure-dev/pull/9027) Bump `golang.org/x/crypto` to v0.53.0 (and transitively `golang.org/x/net` to v0.55.0) to address security advisories.
+
+## 1.0.0-beta.1 (2026-06-30)
+
+### Features Added
+
+- [[#8890]](https://github.com/Azure/azure-dev/pull/8890) Bump `requiredAzdVersion` to `>=1.27.0`.
+- [[#8651]](https://github.com/Azure/azure-dev/pull/8651) Update Go to 1.26.4 and bump golang.org/x/crypto and golang.org/x/net. Thanks @hemarina for the contribution!
+
+## 0.0.1-preview (2026-05-22)
+
+Initial preview release of the Agent Inspector extension.
+
+### Features Added
+
+- Agent Inspector extension: serves the Inspector single-page app on loopback and bridges it to a locally running agent over WebSocket JSON-RPC and HTTP/SSE proxying.
+- Added `azd ai inspector launch` to start the Inspector standalone; the `azd ai inspector` command group is kept for future subcommands.
+- Integrated with `azd ai agent run` so the Inspector is launched automatically for local agent runs (opt out with `--no-inspector`).
+
+### Other Changes
+
+- Hardened the loopback server with `Host`/`Origin` allowlisting, proxy URL constraints (http/https, loopback hosts, configured agent port), bounded WebSocket frame size, read/write deadlines, ping/pong, and Content-Security-Policy and related hardening headers on the served SPA.
+- Restricted `openUrlInBrowser` to `http`/`https` URLs.
+- Suppressed proxy body logging and stdout output when launched in silent mode from `azd ai agent run`.
+- Added panic recovery in per-message RPC goroutines and fixed a nil-map race in stream registration during session cleanup.

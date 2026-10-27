@@ -1,0 +1,723 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+// optimize_helpers.go provides shared utilities for optimize commands:
+// connection flag resolution, job ID persistence in the azd environment,
+// portal link construction, and candidate table rendering.
+
+package cmd
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+
+	"azureaiagent/internal/pkg/agents/eval_api"
+	"azureaiagent/internal/pkg/agents/opt_eval"
+	"azureaiagent/internal/pkg/agents/optimize_api"
+	"azureaiagent/internal/pkg/paths"
+
+	azdext "github.com/azure/azure-dev/cli/azd/pkg/azdext"
+	"github.com/azure/azure-dev/cli/azd/pkg/output"
+	"github.com/fatih/color"
+	"github.com/spf13/cobra"
+)
+
+// optimizeConnectionFlags holds connection settings shared across all optimize sub-commands.
+type optimizeConnectionFlags struct {
+	projectEndpoint string // Foundry project endpoint URL
+	endpoint        string // direct optimization service URL (for local dev only)
+}
+
+// register adds the connection flags to the given cobra command.
+func (f *optimizeConnectionFlags) register(cmd *cobra.Command) {
+	cmd.Flags().StringVarP(&f.projectEndpoint, "project-endpoint", "p", "", "Foundry project endpoint URL")
+	cmd.Flags().StringVar(&f.endpoint, "endpoint", "", "Optimization service endpoint (for local dev)")
+}
+
+// resolve returns the project endpoint for optimize API calls.
+// projectEndpointFromEnv returns the project endpoint from FOUNDRY_PROJECT_ENDPOINT
+// or AZURE_AI_PROJECT_ENDPOINT (deprecated) environment variables (in that priority order).
+// Returns empty string if neither is set.
+func projectEndpointFromEnv() string {
+	if ep := os.Getenv("FOUNDRY_PROJECT_ENDPOINT"); ep != "" {
+		return strings.TrimRight(ep, "/")
+	}
+	if ep := os.Getenv("AZURE_AI_PROJECT_ENDPOINT"); ep != "" { // deprecated fallback
+		return strings.TrimRight(ep, "/")
+	}
+	return ""
+}
+
+// Priority: --endpoint flag → --project-endpoint → azd environment → FOUNDRY_PROJECT_ENDPOINT env var.
+// envName selects a specific azd environment; empty means "current default".
+func (f *optimizeConnectionFlags) resolve(ctx context.Context, envName string) (string, error) {
+	if f.endpoint != "" {
+		return strings.TrimRight(f.endpoint, "/"), nil
+	}
+
+	// Explicit --project-endpoint flag
+	if f.projectEndpoint != "" {
+		return strings.TrimRight(f.projectEndpoint, "/"), nil
+	}
+
+	// When an explicit envName is provided, read FOUNDRY_PROJECT_ENDPOINT
+	// directly from that environment instead of relying on the default
+	// cascade (which always reads the current/default environment).
+	if envName != "" {
+		if ep := endpointFromNamedEnv(ctx, envName); ep != "" {
+			return strings.TrimRight(ep, "/"), nil
+		}
+	}
+
+	// Try azd environment / global config cascade (works when running under azd)
+	projectEndpoint, err := resolveAgentEndpoint(ctx, "", "")
+	if err != nil {
+		// Fall back to FOUNDRY_PROJECT_ENDPOINT or AZURE_AI_PROJECT_ENDPOINT env var (works standalone)
+		if ep := projectEndpointFromEnv(); ep != "" {
+			return ep, nil
+		}
+		return "", fmt.Errorf("could not resolve project endpoint\n\n" +
+			"Set FOUNDRY_PROJECT_ENDPOINT, provide --project-endpoint (-p),\n" +
+			"or run 'azd ai agent init'")
+	}
+
+	return projectEndpoint, nil
+}
+
+// endpointFromNamedEnv reads FOUNDRY_PROJECT_ENDPOINT from the specified
+// azd environment. Returns empty string on any failure.
+func endpointFromNamedEnv(ctx context.Context, envName string) string {
+	azdClient, err := azdext.NewAzdClient()
+	if err != nil {
+		return ""
+	}
+	defer azdClient.Close()
+
+	env := getExistingEnvironment(ctx, envName, azdClient)
+	if env == nil {
+		return ""
+	}
+	v, err := azdClient.Environment().GetValue(ctx, &azdext.GetEnvRequest{
+		EnvName: env.Name,
+		Key:     "FOUNDRY_PROJECT_ENDPOINT",
+	})
+	if err != nil || v.Value == "" {
+		return ""
+	}
+	return v.Value
+}
+
+// optimizeLastJobIDKey is the global azd environment key for the most recent
+// optimization job ID. It is used by `optimize status` (which has no agent
+// context) and as a fallback when a per-agent job ID is not set.
+const optimizeLastJobIDKey = "OPTIMIZE_LAST_OPERATION_ID"
+
+// optimizeEnvKeyName returns the identifier used to derive per-agent optimize
+// env keys (job ID, candidate ID). It prefers the azd service name so the keys
+// align with AGENT_{KEY}_NAME / AGENT_{KEY}_OPTIMIZATION_CANDIDATE_ID, and
+// falls back to the agent name for standalone --agent usage without a project.
+func optimizeEnvKeyName(serviceName, agentName string) string {
+	if serviceName != "" {
+		return serviceName
+	}
+	return agentName
+}
+
+// optimizeJobIDKeyForAgent returns the per-agent azd environment key that stores
+// the optimization job ID, mirroring AGENT_{KEY}_OPTIMIZATION_CANDIDATE_ID. The
+// name should be the azd service name (see optimizeEnvKeyName).
+func optimizeJobIDKeyForAgent(name string) string {
+	return fmt.Sprintf("AGENT_%s_OPTIMIZATION_JOB_ID", toServiceKey(name))
+}
+
+// saveLastOptimizeJobID stores the operation ID in the azd environment under
+// both the per-agent key (AGENT_{KEY}_OPTIMIZATION_JOB_ID) and the global
+// last-job key. Best-effort — silently ignores errors (e.g., when running
+// outside azd).
+func saveLastOptimizeJobID(ctx context.Context, agentName, operationID, envName string) {
+	azdClient, err := azdext.NewAzdClient()
+	if err != nil {
+		return
+	}
+	defer azdClient.Close()
+
+	env := getExistingEnvironment(ctx, envName, azdClient)
+	if env == nil {
+		return
+	}
+
+	// Per-agent key — used by apply/deploy/postdeploy to promote the correct job.
+	if agentName != "" {
+		_, _ = azdClient.Environment().SetValue(ctx, &azdext.SetEnvRequest{
+			EnvName: env.Name,
+			Key:     optimizeJobIDKeyForAgent(agentName),
+			Value:   operationID,
+		})
+	}
+
+	// Global key — convenience for `optimize status` and a fallback.
+	_, _ = azdClient.Environment().SetValue(ctx, &azdext.SetEnvRequest{
+		EnvName: env.Name,
+		Key:     optimizeLastJobIDKey,
+		Value:   operationID,
+	})
+}
+
+// loadOptimizeJobIDForAgent retrieves the optimization job ID for a specific
+// agent, preferring the per-agent key and falling back to the global last-job
+// key. Returns empty string if neither is available.
+func loadOptimizeJobIDForAgent(ctx context.Context, agentName, envName string) string {
+	azdClient, err := azdext.NewAzdClient()
+	if err != nil {
+		return ""
+	}
+	defer azdClient.Close()
+
+	env := getExistingEnvironment(ctx, envName, azdClient)
+	if env == nil {
+		return ""
+	}
+
+	if agentName != "" {
+		if resp, err := azdClient.Environment().GetValue(ctx, &azdext.GetEnvRequest{
+			EnvName: env.Name,
+			Key:     optimizeJobIDKeyForAgent(agentName),
+		}); err == nil && resp != nil && resp.Value != "" {
+			return resp.Value
+		}
+	}
+
+	resp, err := azdClient.Environment().GetValue(ctx, &azdext.GetEnvRequest{
+		EnvName: env.Name,
+		Key:     optimizeLastJobIDKey,
+	})
+	if err != nil || resp == nil {
+		return ""
+	}
+	return resp.Value
+}
+
+// printOptimizePortalLink prints the Foundry portal URL for an optimization job.
+// Best-effort — silently skips if the portal prefix cannot be resolved.
+func printOptimizePortalLink(ctx context.Context, out io.Writer, agentName, operationID, envName string) {
+	azdClient, err := azdext.NewAzdClient()
+	if err != nil {
+		return
+	}
+	defer azdClient.Close()
+
+	env := getExistingEnvironment(ctx, envName, azdClient)
+	if env == nil {
+		return
+	}
+
+	printPortalLink(ctx, out, azdClient, env.Name, func(prefix *eval_api.PortalPrefix) string {
+		return prefix.OptimizationURL(agentName, operationID)
+	})
+}
+
+// isInAzdProject returns true if the current directory is inside an azd project.
+func isInAzdProject(ctx context.Context) bool {
+	azdClient, err := azdext.NewAzdClient()
+	if err != nil {
+		return false
+	}
+	defer azdClient.Close()
+
+	resp, err := azdClient.Project().Get(ctx, &azdext.EmptyRequest{})
+	return err == nil && resp != nil && resp.Project != nil
+}
+
+// buildCandidateEvalURLs returns a map of candidate name → Foundry portal eval URL
+// for candidates that have both EvalID and EvalRunID set.
+// Best-effort — returns nil on any failure and never panics.
+func buildCandidateEvalURLs(
+	ctx context.Context,
+	candidates []optimize_api.CandidateResult,
+	explicitEnvName string,
+) (result map[string]string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[debug] buildCandidateEvalURLs recovered from panic: %v", r)
+			result = nil
+		}
+	}()
+
+	azdClient, err := azdext.NewAzdClient()
+	if err != nil {
+		return nil
+	}
+	defer azdClient.Close()
+
+	env := getExistingEnvironment(ctx, explicitEnvName, azdClient)
+	if env == nil {
+		return nil
+	}
+	envName := env.Name
+
+	urls := make(map[string]string)
+	for _, c := range candidates {
+		url := buildEvalReportURL(ctx, azdClient, envName, c.EvalID, c.EvalRunID)
+		if url != "" {
+			urls[c.Name] = url
+		}
+	}
+	if len(urls) == 0 {
+		return nil
+	}
+	return urls
+}
+
+// terminalHyperlink formats a clickable hyperlink using the OSC 8 escape sequence.
+// Terminals that support it (Windows Terminal, iTerm2, etc.) render the text as
+// a clickable link; unsupported terminals display only the text.
+func terminalHyperlink(url, text string) string {
+	return fmt.Sprintf("\033]8;;%s\033\\%s\033]8;;\033\\", url, text)
+}
+
+// reportOptimizationDeployments reports optimization candidate deployments to the optimization service.
+// For each agent service, if AGENT_{KEY}_OPTIMIZATION_CANDIDATE_ID is set in
+// the azd environment, it calls the promote API, advances the local baseline config
+// to the promoted candidate, and then clears the env var.
+// This is best-effort — failures are logged but do not block the deploy.
+//
+// projectPath is the azd project root used to locate each service's local
+// .agent_configs directory; it may be empty when unavailable (e.g. in tests),
+// in which case baseline advancement is skipped.
+func reportOptimizationDeployments(
+	ctx context.Context,
+	azdClient *azdext.AzdClient,
+	agentServices []*azdext.ServiceConfig,
+	envName, projectEndpoint string, projectPath string,
+	newClient func(endpoint string) *optimize_api.OptimizeClient,
+) {
+	log.Printf("postdeploy: reporting optimization deployments for %d agent services", len(agentServices))
+
+	for _, svc := range agentServices {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("postdeploy: optimization reporting panicked for %s: %v", svc.Name, r)
+				}
+			}()
+			configsDir := baselineAdvancementDir(projectPath, svc)
+			reportSvcOptimizationDeployment(ctx, azdClient, svc, envName, projectEndpoint, configsDir, nil, newClient)
+		}()
+	}
+}
+
+// baselineAdvancementDir resolves the validated local .agent_configs directory
+// used for svc's baseline advancement, or "" when advancement must be skipped.
+//
+// It returns "" (skip, no error surfaced) when:
+//   - projectPath is empty (no local project on disk),
+//   - the service path cannot be safely resolved under the project root — for
+//     example a RelativePath from azure.yaml containing ".." that escapes the
+//     root.
+func baselineAdvancementDir(
+	projectPath string,
+	svc *azdext.ServiceConfig,
+) string {
+	if projectPath == "" {
+		return ""
+	}
+
+	configsDir, err := paths.JoinAllowRoot(
+		projectPath,
+		svc.GetRelativePath(),
+		opt_eval.AgentConfigsDir,
+	)
+	if err != nil {
+		log.Printf("postdeploy: skipping baseline advancement for %s: %v", svc.Name, err)
+		return ""
+	}
+
+	resolvedConfigsDir, err := filepath.EvalSymlinks(configsDir)
+	if err == nil {
+		return filepath.Clean(resolvedConfigsDir)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		log.Printf("postdeploy: skipping baseline advancement for %s: %v", svc.Name, err)
+		return ""
+	}
+
+	// .agent_configs may not exist yet. Canonicalize its existing service
+	// directory so aliases still share one lock key when the directory is created.
+	resolvedServiceDir, err := filepath.EvalSymlinks(filepath.Dir(configsDir))
+	if err == nil {
+		return filepath.Join(filepath.Clean(resolvedServiceDir), opt_eval.AgentConfigsDir)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		log.Printf("postdeploy: skipping baseline advancement for %s: %v", svc.Name, err)
+		return ""
+	}
+	return configsDir
+}
+
+var baselineAdvancementLocks sync.Map
+
+func baselineAdvancementLock(configsDir string) *sync.Mutex {
+	key := filepath.Clean(configsDir)
+	if runtime.GOOS == "windows" {
+		key = strings.ToLower(key)
+	}
+	lock, _ := baselineAdvancementLocks.LoadOrStore(key, &sync.Mutex{})
+	return lock.(*sync.Mutex)
+}
+
+// advanceBaselineToCandidate replaces the service's local baseline agent config
+// with the promoted candidate's config so the next optimization round starts
+// from the deployed configuration rather than the original. The previous
+// baseline is archived as baseline_<job-id> (rather than deleted) for
+// rollback/audit; when no usable jobID is available it is removed instead.
+//
+// It is a no-op when serviceDir or candidateID is empty, or when the candidate
+// config directory does not exist locally (e.g. remote-only deploy flows). The
+// candidate directory is copied (not moved) so the deploy pipeline can still
+// read it, and the swap is staged so a mid-copy failure leaves the existing
+// baseline intact.
+func advanceBaselineToCandidate(configsDir, candidateID, jobID string) error {
+	return advanceBaselineToCandidateWithOps(configsDir, candidateID, jobID, os.Rename, copyDirectory)
+}
+
+func advanceBaselineToCandidateWithOps(
+	configsDir, candidateID, jobID string,
+	rename func(string, string) error,
+	copyDir func(string, string) error,
+) error {
+	if configsDir == "" || candidateID == "" {
+		return nil
+	}
+
+	// The candidate ID is read from the azd environment; guard against path
+	// traversal before joining it into a filesystem path.
+	if !isSafePathSegment(candidateID) {
+		return fmt.Errorf("invalid candidate id %q", candidateID)
+	}
+
+	lock := baselineAdvancementLock(configsDir)
+	lock.Lock()
+	defer lock.Unlock()
+
+	candidateDir := filepath.Join(configsDir, candidateID)
+	baselineDir := filepath.Join(configsDir, opt_eval.BaselineDir)
+
+	// Only advance when the candidate config exists locally.
+	candidateExists, err := candidateConfigExists(candidateDir, os.Stat)
+	if err != nil {
+		return err
+	}
+	if !candidateExists {
+		return nil
+	}
+
+	// Stage the candidate config into a temp dir next to baseline, so a mid-copy
+	// failure leaves the existing baseline intact.
+	stageDir, err := os.MkdirTemp(configsDir, ".baseline-stage-*")
+	if err != nil {
+		return fmt.Errorf("staging baseline: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(stageDir) }()
+
+	if err := copyDir(candidateDir, stageDir); err != nil {
+		return fmt.Errorf("copying candidate config: %w", err)
+	}
+
+	archiveDir := ""
+	if jobID != "" && isSafePathSegment(jobID) {
+		archiveDir = filepath.Join(configsDir, opt_eval.BaselineDir+"_"+jobID)
+	}
+
+	archiveExists := false
+	if archiveDir != "" {
+		if _, err := os.Stat(archiveDir); err == nil {
+			archiveExists = true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("checking previous baseline archive: %w", err)
+		}
+	}
+
+	// Move the active baseline aside until the staged candidate is installed.
+	// This exact rollback copy is restored if installation fails, including on
+	// retries where an older archive for the same job already exists.
+	rollbackDir := ""
+	if _, err := os.Stat(baselineDir); err == nil {
+		rollbackDir, err = os.MkdirTemp(configsDir, ".baseline-rollback-*")
+		if err != nil {
+			return fmt.Errorf("creating baseline rollback path: %w", err)
+		}
+		if err := os.Remove(rollbackDir); err != nil {
+			return fmt.Errorf("preparing baseline rollback path: %w", err)
+		}
+		if err := rename(baselineDir, rollbackDir); err != nil {
+			return fmt.Errorf("retiring current baseline: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("checking current baseline: %w", err)
+	}
+
+	if err := rename(stageDir, baselineDir); err != nil {
+		if rollbackDir != "" {
+			if restoreErr := rename(rollbackDir, baselineDir); restoreErr != nil {
+				if copyErr := copyDir(rollbackDir, baselineDir); copyErr != nil {
+					if cleanupErr := os.RemoveAll(baselineDir); cleanupErr != nil {
+						log.Printf(
+							"warning: baseline restore and partial cleanup failed: rollback=%s baseline=%s error=%v",
+							rollbackDir,
+							baselineDir,
+							cleanupErr,
+						)
+						return fmt.Errorf(
+							"promoting baseline: %w; restoring rollback: %w; copying rollback: %w; "+
+								"removing partial baseline: %w",
+							err,
+							restoreErr,
+							copyErr,
+							cleanupErr,
+						)
+					}
+					log.Printf(
+						"warning: baseline restore failed; removed partial baseline and preserved rollback at %s",
+						rollbackDir,
+					)
+					return fmt.Errorf(
+						"promoting baseline: %w; restoring rollback: %w; copying rollback: %w; "+
+							"partial baseline removed",
+						err,
+						restoreErr,
+						copyErr,
+					)
+				}
+				if cleanupErr := os.RemoveAll(rollbackDir); cleanupErr != nil {
+					log.Printf(
+						"warning: restored baseline by copy but failed to remove rollback at %s: %v",
+						rollbackDir,
+						cleanupErr,
+					)
+				}
+			}
+		}
+		return fmt.Errorf("promoting baseline: %w", err)
+	}
+
+	if rollbackDir != "" {
+		if archiveDir != "" && !archiveExists {
+			if err := rename(rollbackDir, archiveDir); err != nil {
+				return fmt.Errorf("archiving previous baseline: %w", err)
+			}
+		} else if err := os.RemoveAll(rollbackDir); err != nil {
+			return fmt.Errorf("removing baseline rollback: %w", err)
+		}
+	}
+	return nil
+}
+
+func candidateConfigExists(
+	candidateDir string,
+	stat func(string) (os.FileInfo, error),
+) (bool, error) {
+	info, err := stat(candidateDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("accessing candidate config: %w", err)
+	}
+	if !info.IsDir() {
+		return false, fmt.Errorf("candidate config %q is not a directory", candidateDir)
+	}
+	return true, nil
+}
+
+// isSafePathSegment reports whether name is a single, non-traversing path
+// segment safe to join into a filesystem path.
+func isSafePathSegment(name string) bool {
+	return name != "" && name == filepath.Base(name) && name != "." && name != ".."
+}
+
+func warnBaselineAdvancementFailure(
+	writer io.Writer,
+	serviceName, candidateID string,
+	err error,
+) {
+	fmt.Fprintf(writer, "%s", output.WithWarningFormat(
+		"WARNING: candidate %q was promoted for service %q, but the local optimization baseline "+
+			"could not be updated: %v\n"+
+			"Before starting the next optimization round, set this candidate as its baseline by running:\n"+
+			"  azd ai agent optimize apply --agent %q --candidate %q\n"+
+			"  azd deploy %q\n",
+		candidateID,
+		serviceName,
+		err,
+		serviceName,
+		candidateID,
+		serviceName,
+	))
+}
+
+// reportSvcOptimizationDeployment reports a single service's optimization candidate.
+// configsDir is the validated local .agent_configs directory used for baseline
+// advancement, or "" to skip it (see baselineAdvancementDir). Services that
+// share this directory also share baseline state; their local swaps are
+// serialized to prevent interleaved filesystem mutations.
+func reportSvcOptimizationDeployment(
+	ctx context.Context,
+	azdClient *azdext.AzdClient,
+	svc *azdext.ServiceConfig,
+	envName, projectEndpoint string, configsDir string,
+	headers map[string]string,
+	newClient func(endpoint string) *optimize_api.OptimizeClient,
+) {
+	serviceKey := toServiceKey(svc.Name)
+	candidateKey := fmt.Sprintf("AGENT_%s_OPTIMIZATION_CANDIDATE_ID", serviceKey)
+
+	candidateResp, err := azdClient.Environment().GetValue(ctx, &azdext.GetEnvRequest{
+		EnvName: envName,
+		Key:     candidateKey,
+	})
+	if err != nil || candidateResp.Value == "" {
+		log.Printf("postdeploy: no optimization candidate for %s, skipping", svc.Name)
+		return
+	}
+
+	versionKey := fmt.Sprintf("AGENT_%s_VERSION", serviceKey)
+	versionResp, err := azdClient.Environment().GetValue(ctx, &azdext.GetEnvRequest{
+		EnvName: envName,
+		Key:     versionKey,
+	})
+	if err != nil || versionResp.Value == "" {
+		log.Printf("postdeploy: no version for %s, skipping", svc.Name)
+		return
+	}
+
+	log.Printf("postdeploy: promoting candidate %s for %s (version %s)",
+		candidateResp.Value, svc.Name, versionResp.Value)
+
+	// Candidate promotion is nested under the optimization job; resolve the
+	// per-agent job ID (AGENT_{KEY}_OPTIMIZATION_JOB_ID), falling back to the
+	// global last-job key.
+	jobIDKey := optimizeJobIDKeyForAgent(svc.Name)
+	jobID := ""
+	if jobResp, jobErr := azdClient.Environment().GetValue(ctx, &azdext.GetEnvRequest{
+		EnvName: envName,
+		Key:     jobIDKey,
+	}); jobErr == nil && jobResp != nil && jobResp.Value != "" {
+		jobID = jobResp.Value
+	} else if jobResp, jobErr := azdClient.Environment().GetValue(ctx, &azdext.GetEnvRequest{
+		EnvName: envName,
+		Key:     optimizeLastJobIDKey,
+	}); jobErr == nil && jobResp != nil {
+		jobID = jobResp.Value
+	}
+	if jobID == "" {
+		log.Printf("postdeploy: no optimization job ID for %s, skipping promotion", svc.Name)
+		return
+	}
+
+	optClient := newClient(projectEndpoint)
+	if err := optClient.ReportDeploymentWithHeaders(ctx, jobID, &optimize_api.DeploymentReport{
+		CandidateID:  candidateResp.Value,
+		AgentName:    svc.Name,
+		AgentVersion: versionResp.Value,
+	}, headers); err != nil {
+		log.Printf("postdeploy: failed to report optimization deployment for %s: %v", svc.Name, err)
+		return
+	}
+
+	log.Printf("postdeploy: successfully promoted candidate %s for %s", candidateResp.Value, svc.Name)
+
+	// Advance the local baseline config to the promoted candidate so a
+	// subsequent optimization round starts from the deployed configuration
+	// instead of the original. The previous baseline is archived as
+	// baseline_<job-id>. Best-effort; never blocks deploy.
+	if err := advanceBaselineToCandidate(configsDir, candidateResp.Value, jobID); err != nil {
+		warnBaselineAdvancementFailure(os.Stderr, svc.Name, candidateResp.Value, err)
+	} else if configsDir != "" {
+		log.Printf("postdeploy: advanced baseline to candidate %s for %s", candidateResp.Value, svc.Name)
+	}
+
+	// Clear the candidate ID after successful reporting.
+	if _, err := azdClient.Environment().SetValue(ctx, &azdext.SetEnvRequest{
+		EnvName: envName,
+		Key:     candidateKey,
+		Value:   "",
+	}); err != nil {
+		log.Printf("postdeploy: failed to clear %s: %v", candidateKey, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Candidate table rendering helpers
+// ---------------------------------------------------------------------------
+
+// candidateDisplayName returns the candidate name with a " ★" suffix when
+// isBest is true.
+func candidateDisplayName(name string, isBest bool) string {
+	if isBest {
+		return name + " ★"
+	}
+	return name
+}
+
+// candidateTableHeader returns the header and separator lines for a
+// candidate results table. When showEval/showStrategy are true the
+// respective columns are included.
+func candidateTableHeader(showEval, showStrategy bool) (header, sep string) {
+	header = fmt.Sprintf("  %-20s %8s", "Candidate", "Score")
+	sep = fmt.Sprintf("  %-20s %8s",
+		strings.Repeat("─", 20),
+		strings.Repeat("─", 8))
+	if showEval {
+		header += "  Eval"
+		sep += "  " + strings.Repeat("─", 4)
+	}
+	if showStrategy {
+		header += "  Strategy"
+		sep += "  " + strings.Repeat("─", 8)
+	}
+	return header, sep
+}
+
+// formatCandidateRow builds a formatted table row for a single candidate.
+// evalCell is the rendered eval link (or empty); strategyKeys is the list of
+// mutation attribute names (or nil). showEval/showStrategy control whether the
+// columns are included.
+func formatCandidateRow(
+	name string, score float64, evalCell string,
+	strategyKeys []string, showEval, showStrategy bool,
+) string {
+	line := fmt.Sprintf("  %-20s %8.3f", name, score)
+	if showEval {
+		if evalCell == "" {
+			evalCell = "-"
+		}
+		line += fmt.Sprintf("  %-4s", evalCell)
+	}
+	if showStrategy {
+		if len(strategyKeys) == 0 {
+			line += "  -"
+		} else {
+			line += "  " + strings.Join(strategyKeys, ", ")
+		}
+	}
+	return line
+}
+
+// writeCandidateRow writes a formatted candidate row to out, applying
+// green color when the candidate is the best.
+func writeCandidateRow(out io.Writer, line string, isBest bool) {
+	if isBest {
+		green := color.New(color.FgGreen)
+		_, _ = green.Fprintln(out, line)
+	} else {
+		fmt.Fprintln(out, line)
+	}
+}

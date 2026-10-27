@@ -1,0 +1,34 @@
+# yaml-language-server: $schema=../extension.schema.json
+id: azure.ai.skills
+namespace: ai.skill
+displayName: Foundry skills (Beta)
+description: Manage Microsoft Foundry skills (reusable agent behavioral guidelines) from your terminal. (Beta)
+usage: azd ai skill <command> [options]
+# NOTE: Make sure version.txt is in sync with this version.
+version: 1.0.0-beta.8
+requiredAzdVersion: ">=1.27.0"
+language: go
+capabilities:
+  - custom-commands
+  - service-target-provider
+  - metadata
+providers:
+  - name: azure.ai.skill
+    type: service-target
+    description: Upserts Foundry skills declared as azure.ai.skill services in azure.yaml
+tags:
+  - ai
+  - skill
+examples:
+  - name: add
+    description: Add a skill service to the current azure.yaml.
+    usage: azd ai skill add my-skill --file ./skills/my-skill
+  - name: list
+    description: List skills in the current Foundry project.
+    usage: azd ai skill list
+  - name: create
+    description: Create a skill from a SKILL.md file.
+    usage: azd ai skill create my-skill --file ./SKILL.md
+  - name: download
+    description: Download and extract a skill into ./.agents/skills/.
+    usage: azd ai skill download my-skill

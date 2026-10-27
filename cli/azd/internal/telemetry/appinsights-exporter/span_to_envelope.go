@@ -1,8 +1,12 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
 package appinsightsexporter
 
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"time"
 
 	"github.com/microsoft/ApplicationInsights-Go/appinsights/contracts"
@@ -28,9 +32,7 @@ func SpanToEnvelope(span trace.ReadOnlySpan) *contracts.Envelope {
 	envelope.Name = requestData.EnvelopeName("")
 	envelope.Tags[contracts.OperationName] = requestData.Name
 
-	for contextKey, contextVal := range contextTags {
-		envelope.Tags[contextKey] = contextVal
-	}
+	maps.Copy(envelope.Tags, contextTags)
 
 	// Sanitize.
 	for _, warn := range envelope.Sanitize() {
@@ -58,19 +60,18 @@ func spanToRequestData(span trace.ReadOnlySpan) (*contracts.RequestData, map[str
 	requestData.Properties = map[string]string{}
 	requestData.Measurements = map[string]float64{}
 
-	if span.Status().Code == codes.Error {
-		if len(span.Status().Description) > 0 {
-			requestData.ResponseCode = span.Status().Description
-		} else {
+	requestData.ResponseCode = span.Status().Description
+	if requestData.ResponseCode == "" {
+		if span.Status().Code == codes.Error {
 			requestData.ResponseCode = "UnknownFailure"
+		} else {
+			requestData.ResponseCode = "Success"
 		}
-	} else {
-		requestData.ResponseCode = "Success"
 	}
 
 	for _, resourceAttrib := range span.Resource().Attributes() {
 		if isResourceContextTagField(string(resourceAttrib.Key)) {
-			contextTags[string(resourceAttrib.Key)] = resourceAttrib.Value.Emit()
+			contextTags[string(resourceAttrib.Key)] = resourceAttrib.Value.String()
 		} else {
 			SetAttributeAsPropertyOrMeasurement(resourceAttrib, requestData.Properties, requestData.Measurements)
 		}
@@ -78,7 +79,7 @@ func spanToRequestData(span trace.ReadOnlySpan) (*contracts.RequestData, map[str
 
 	for _, attrib := range span.Attributes() {
 		if isAttributeContextTagField(string(attrib.Key)) {
-			contextTags[string(attrib.Key)] = attrib.Value.Emit()
+			contextTags[string(attrib.Key)] = attrib.Value.String()
 		} else {
 			SetAttributeAsPropertyOrMeasurement(attrib, requestData.Properties, requestData.Measurements)
 		}
@@ -116,13 +117,13 @@ func SetAttributeAsPropertyOrMeasurement(
 
 	switch kv.Value.Type() {
 	case attribute.BOOL, attribute.STRING:
-		properties[string(kv.Key)] = kv.Value.Emit()
+		properties[string(kv.Key)] = kv.Value.String()
 	case attribute.INT64:
 		measurements[string(kv.Key)] = float64(kv.Value.AsInt64())
 	case attribute.FLOAT64:
 		measurements[string(kv.Key)] = kv.Value.AsFloat64()
 	case attribute.BOOLSLICE, attribute.INT64SLICE, attribute.FLOAT64SLICE, attribute.STRINGSLICE:
-		arrayJson, err := json.Marshal(kv.Value)
+		arrayJson, err := json.Marshal(kv.Value.AsInterface())
 		if err != nil {
 			diagLog.Printf("Could not serialize slice of type '%s' as JSON array: %s", kv.Value.Type(), err.Error())
 			return

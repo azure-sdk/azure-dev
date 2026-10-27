@@ -1,0 +1,470 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package cmd
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"maps"
+	"path/filepath"
+	"regexp"
+	"strings"
+
+	"azure.ai.routines/internal/exterrors"
+	"azure.ai.routines/internal/pkg/routines"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/azure/azure-dev/cli/azd/pkg/azdext"
+	"github.com/azure/azure-dev/cli/azd/pkg/foundry"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/structpb"
+)
+
+// aiRoutineHost is the azure.yaml service host kind owned by this extension. A
+// `host: azure.ai.routine` service entry carries one Foundry routine, keyed by
+// the routine name, and is upserted at deploy time by routineServiceTarget. A
+// routine references an agent by name, so its service must declare uses: on the
+// azure.ai.agent service it invokes, which orders the agent ahead of it.
+const aiRoutineHost = "azure.ai.routine"
+
+var _ azdext.ServiceTargetProvider = (*routineServiceTarget)(nil)
+
+// routineServiceTarget upserts a Foundry routine declared as an azure.ai.routine
+// service. The entry's service-level keys are bound directly to the routine API
+// model (triggers, action, ...); the routine name is the service key. Package
+// and Publish are no-ops because a routine has no build artifact.
+type routineServiceTarget struct {
+	azdClient     *azdext.AzdClient
+	projectClient serviceConfigReader
+}
+
+// newRoutineServiceTarget creates the azure.ai.routine service-target provider.
+func newRoutineServiceTarget(
+	azdClient *azdext.AzdClient,
+) azdext.ServiceTargetProvider {
+	return &routineServiceTarget{
+		azdClient:     azdClient,
+		projectClient: azdClient.Project(),
+	}
+}
+
+// Initialize requires no setup.
+func (p *routineServiceTarget) Initialize(
+	_ context.Context,
+	_ *azdext.ServiceConfig,
+) error {
+	return nil
+}
+
+// Endpoints returns no endpoints; a routine service exposes none.
+func (p *routineServiceTarget) Endpoints(
+	ctx context.Context,
+	serviceConfig *azdext.ServiceConfig,
+	targetResource *azdext.TargetResource,
+) ([]string, error) {
+	return nil, nil
+}
+
+// GetTargetResource delegates to azd's default resolver and falls back to a
+// minimal target so the deploy pipeline can proceed; the routine upsert targets
+// the Foundry project endpoint, not an ARM resource.
+func (p *routineServiceTarget) GetTargetResource(
+	ctx context.Context,
+	subscriptionId string,
+	serviceConfig *azdext.ServiceConfig,
+	defaultResolver func() (*azdext.TargetResource, error),
+) (*azdext.TargetResource, error) {
+	if defaultResolver != nil {
+		if target, err := defaultResolver(); err == nil && target != nil {
+			return target, nil
+		}
+	}
+	return &azdext.TargetResource{SubscriptionId: subscriptionId}, nil
+}
+
+// Package is a no-op; a routine has nothing to build or stage.
+func (p *routineServiceTarget) Package(
+	ctx context.Context,
+	serviceConfig *azdext.ServiceConfig,
+	serviceContext *azdext.ServiceContext,
+	progress azdext.ProgressReporter,
+) (*azdext.ServicePackageResult, error) {
+	return &azdext.ServicePackageResult{}, nil
+}
+
+// Publish is a no-op; a routine has no artifact to publish.
+func (p *routineServiceTarget) Publish(
+	ctx context.Context,
+	serviceConfig *azdext.ServiceConfig,
+	serviceContext *azdext.ServiceContext,
+	targetResource *azdext.TargetResource,
+	publishOptions *azdext.PublishOptions,
+	progress azdext.ProgressReporter,
+) (*azdext.ServicePublishResult, error) {
+	return &azdext.ServicePublishResult{}, nil
+}
+
+// Deploy upserts the routine with an idempotent PUT. The service-level keys bind
+// directly to the routine API model, so the routine name is taken from the
+// service key and never from the body. Removing the service from azure.yaml
+// stops azd managing the routine but does not delete it (use
+// `azd ai routine delete`).
+func (p *routineServiceTarget) Deploy(
+	ctx context.Context,
+	serviceConfig *azdext.ServiceConfig,
+	serviceContext *azdext.ServiceContext,
+	targetResource *azdext.TargetResource,
+	progress azdext.ProgressReporter,
+) (*azdext.ServiceDeployResult, error) {
+	ctx = azdext.WithAccessToken(ctx)
+
+	projectRoot, err := routineProjectRoot(ctx, p.projectClient, serviceConfig)
+	if err != nil {
+		return nil, err
+	}
+	body, err := parseRoutineServiceConfig(serviceConfig, projectRoot)
+	if err != nil {
+		return nil, err
+	}
+	// The service key is the routine identity; ignore any name in the body.
+	body.Name = serviceConfig.GetName()
+
+	// Resolve ${VAR} against the service environment forwarded by azd.
+	if body.Action != nil {
+		environment, err := p.environmentValues(ctx, serviceConfig)
+		if err != nil {
+			return nil, err
+		}
+		body.Action.Input = expandRoutineValue(
+			body.Action.Input,
+			environment,
+		)
+	}
+
+	if progress != nil {
+		progress(fmt.Sprintf("Upserting routine %q", serviceConfig.GetName()))
+	}
+
+	client, err := p.newRoutineServiceClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := client.PutRoutine(ctx, body.Name, body); err != nil {
+		return nil, fmt.Errorf("upserting routine %q: %w", body.Name, err)
+	}
+
+	return &azdext.ServiceDeployResult{}, nil
+}
+
+// parseRoutineServiceConfig binds the service-level (inline) routine keys to the
+// routine API model, falling back to the deprecated config: shape for azure.yaml
+// files written before the per-resource service split.
+func parseRoutineServiceConfig(svc *azdext.ServiceConfig, projectRoot string) (*routines.Routine, error) {
+	props := routineConfigProperties(svc)
+	body := &routines.Routine{}
+	if props == nil {
+		return body, nil
+	}
+	values := props.AsMap()
+	if _, hasRef := values["$ref"]; hasRef {
+		resolved, err := resolveRoutineServiceRef(values, projectRoot)
+		if err != nil {
+			return nil, err
+		}
+		values = resolved
+	}
+	b, err := json.Marshal(values)
+	if err != nil {
+		return nil, fmt.Errorf("encoding routine service %q config: %w", svc.GetName(), err)
+	}
+	if err := json.Unmarshal(b, body); err != nil {
+		return nil, fmt.Errorf("parsing routine service %q config: %w", svc.GetName(), err)
+	}
+	return body, nil
+}
+
+// routineServiceHasRef reports whether the routine service uses a file
+// reference instead of inline configuration.
+func routineServiceHasRef(svc *azdext.ServiceConfig) bool {
+	props := routineConfigProperties(svc)
+	if props == nil {
+		return false
+	}
+	_, found := props.GetFields()["$ref"]
+	return found
+}
+
+func routineConfigProperties(svc *azdext.ServiceConfig) *structpb.Struct {
+	properties := svc.GetAdditionalProperties()
+	if properties != nil && len(properties.GetFields()) > 0 {
+		return properties
+	}
+	return svc.GetConfig()
+}
+
+func routineProjectRoot(
+	ctx context.Context,
+	projectClient serviceConfigReader,
+	service *azdext.ServiceConfig,
+) (string, error) {
+	if !routineServiceHasRef(service) {
+		return "", nil
+	}
+	projectResp, err := projectClient.Get(ctx, &azdext.EmptyRequest{})
+	if err != nil {
+		return "", fmt.Errorf("reading project for routine %q: %w", service.GetName(), err)
+	}
+	return projectResp.GetProject().GetPath(), nil
+}
+
+var remoteRoutineRefPattern = regexp.MustCompile(`(?i)^[a-z][a-z0-9+.-]*://`)
+
+func resolveRoutineServiceRef(values map[string]any, projectRoot string) (map[string]any, error) {
+	ref, ok := values["$ref"].(string)
+	if !ok || strings.TrimSpace(ref) == "" {
+		return nil, exterrors.Validation(
+			exterrors.CodeInvalidRoutineManifest,
+			"routine service $ref must be a non-empty string",
+			"set $ref to a local .yaml, .yml, or .json routine manifest",
+		)
+	}
+	refPath := strings.TrimSpace(ref)
+	if !filepath.IsAbs(refPath) {
+		if remoteRoutineRefPattern.MatchString(refPath) {
+			return nil, exterrors.Validation(
+				exterrors.CodeInvalidRoutineManifest,
+				"remote routine service $ref is not supported",
+				"set $ref to a local .yaml, .yml, or .json routine manifest",
+			)
+		}
+		if projectRoot == "" {
+			return nil, exterrors.Validation(
+				exterrors.CodeInvalidRoutineManifest,
+				"cannot resolve routine service $ref without an azure.yaml project path",
+				"run the command from an initialized azd project",
+			)
+		}
+		refPath = filepath.Join(projectRoot, refPath)
+	}
+	referenced, err := readRoutineManifest(refPath)
+	if err != nil {
+		return nil, err
+	}
+	data, err := json.Marshal(referenced)
+	if err != nil {
+		return nil, fmt.Errorf("encoding referenced routine service: %w", err)
+	}
+	resolved := map[string]any{}
+	if err := json.Unmarshal(data, &resolved); err != nil {
+		return nil, fmt.Errorf("decoding referenced routine service: %w", err)
+	}
+
+	overlay := maps.Clone(values)
+	delete(overlay, "$ref")
+	maps.Copy(resolved, overlay)
+	return resolved, nil
+}
+
+// newRoutineServiceClient resolves a project endpoint and developer
+// credential for deploy. Deploy attaches the extension token from
+// AZD_ACCESS_TOKEN to the outgoing azd context before making host
+// calls. The credential uses the active subscription's user-access
+// tenant for guest users.
+func (p *routineServiceTarget) newRoutineServiceClient(
+	ctx context.Context,
+) (*routines.Client, error) {
+	requestTimeout, err := routineHTTPTimeoutOverrideFromEnv()
+	if err != nil {
+		return nil, err
+	}
+
+	resolved, err := resolveProjectEndpoint(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+
+	tenantID, err := resolveRoutineServiceTenant(
+		ctx,
+		p.azdClient.Environment(),
+		p.azdClient.Account(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	cred, err := azidentity.NewAzureDeveloperCLICredential(&azidentity.AzureDeveloperCLICredentialOptions{
+		TenantID:                   tenantID,
+		AdditionallyAllowedTenants: []string{"*"},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Azure credential: %w", err)
+	}
+	return routines.NewClient(
+		resolved.Endpoint,
+		cred,
+		routineClientOptions(requestTimeout),
+	), nil
+}
+
+type routineEnvironmentReader interface {
+	GetCurrent(
+		ctx context.Context,
+		in *azdext.EmptyRequest,
+		opts ...grpc.CallOption,
+	) (*azdext.EnvironmentResponse, error)
+	GetValue(
+		ctx context.Context,
+		in *azdext.GetEnvRequest,
+		opts ...grpc.CallOption,
+	) (*azdext.KeyValueResponse, error)
+}
+
+type routineAccountReader interface {
+	LookupTenant(
+		ctx context.Context,
+		in *azdext.LookupTenantRequest,
+		opts ...grpc.CallOption,
+	) (*azdext.LookupTenantResponse, error)
+}
+
+// resolveRoutineServiceTenant returns the active subscription's
+// user-access tenant for guest-user deployments.
+func resolveRoutineServiceTenant(
+	ctx context.Context,
+	environment routineEnvironmentReader,
+	account routineAccountReader,
+) (string, error) {
+	current, err := environment.GetCurrent(ctx, &azdext.EmptyRequest{})
+	if err != nil {
+		return "", fmt.Errorf("resolving current azd environment: %w", err)
+	}
+	envName := current.GetEnvironment().GetName()
+	if envName == "" {
+		return "", fmt.Errorf("current azd environment has no name")
+	}
+
+	subscription, err := environment.GetValue(ctx, &azdext.GetEnvRequest{
+		EnvName: envName,
+		Key:     "AZURE_SUBSCRIPTION_ID",
+	})
+	if err != nil {
+		return "", fmt.Errorf("reading AZURE_SUBSCRIPTION_ID: %w", err)
+	}
+	if subscription.GetValue() == "" {
+		return "", fmt.Errorf("AZURE_SUBSCRIPTION_ID is required for routine deployment")
+	}
+
+	tenant, err := account.LookupTenant(ctx, &azdext.LookupTenantRequest{
+		SubscriptionId: subscription.GetValue(),
+	})
+	if err != nil {
+		return "", fmt.Errorf("resolving user access tenant: %w", err)
+	}
+	if tenant.GetTenantId() == "" {
+		return "", fmt.Errorf("user access tenant is empty")
+	}
+	return tenant.GetTenantId(), nil
+}
+
+// serviceConfigReader is the slice of azdext.ProjectServiceClient
+// this target uses. Depending on the interface rather than the
+// concrete *azdext.AzdClient lets tests supply a fake: the client's
+// project field is unexported and no option overrides it.
+type serviceConfigReader interface {
+	Get(
+		ctx context.Context,
+		in *azdext.EmptyRequest,
+		opts ...grpc.CallOption,
+	) (*azdext.GetProjectResponse, error)
+	GetServiceConfigValue(
+		ctx context.Context,
+		in *azdext.GetServiceConfigValueRequest,
+		opts ...grpc.CallOption,
+	) (*azdext.GetServiceConfigValueResponse, error)
+}
+
+func serviceEnvDeclared(
+	ctx context.Context,
+	projectClient serviceConfigReader,
+	serviceName string,
+) (bool, error) {
+	resp, err := projectClient.GetServiceConfigValue(ctx, &azdext.GetServiceConfigValueRequest{
+		ServiceName: serviceName,
+		Path:        "env",
+	})
+	if err != nil {
+		return false, fmt.Errorf("reading env for service %q: %w", serviceName, err)
+	}
+	return resp.GetFound(), nil
+}
+
+func (p *routineServiceTarget) environmentValues(
+	ctx context.Context,
+	serviceConfig *azdext.ServiceConfig,
+) (map[string]string, error) {
+	environment := serviceConfig.GetEnvironment()
+	if len(environment) > 0 {
+		return environment, nil
+	}
+	// An explicit empty env: {} declares an isolated scope.
+	// Core forwards it as an empty map, indistinguishable from
+	// an omitted env, so consult the raw config before falling
+	// back to the full azd environment.
+	declared, err := serviceEnvDeclared(ctx, p.projectClient, serviceConfig.GetName())
+	if err != nil {
+		return nil, err
+	}
+	if declared {
+		return environment, nil
+	}
+
+	current, err := p.azdClient.Environment().GetCurrent(
+		ctx,
+		&azdext.EmptyRequest{},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("resolving current azd environment: %w", err)
+	}
+	resp, err := p.azdClient.Environment().GetValues(
+		ctx,
+		&azdext.GetEnvironmentRequest{
+			Name: current.GetEnvironment().GetName(),
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("loading azd environment values: %w", err)
+	}
+	values := make(map[string]string, len(resp.GetKeyValues()))
+	for _, kv := range resp.GetKeyValues() {
+		values[kv.GetKey()] = kv.GetValue()
+	}
+	return values, nil
+}
+
+// expandRoutineValue expands ${VAR} in nested routine values.
+func expandRoutineValue(value any, env map[string]string) any {
+	switch typed := value.(type) {
+	case string:
+		resolved, err := foundry.ExpandEnv(typed, func(name string) string { return env[name] })
+		if err != nil {
+			return typed
+		}
+		return resolved
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for k, v := range typed {
+			out[k] = expandRoutineValue(v, env)
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, v := range typed {
+			out[i] = expandRoutineValue(v, env)
+		}
+		return out
+	default:
+		return value
+	}
+}

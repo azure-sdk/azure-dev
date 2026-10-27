@@ -1,0 +1,381 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package rzip_test
+
+import (
+	"archive/tar"
+	"archive/zip"
+	"compress/gzip"
+	"fmt"
+	"io"
+	"maps"
+	"os"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/azure/azure-dev/cli/azd/pkg/rzip"
+	"github.com/stretchr/testify/require"
+)
+
+// symlinkAvailable reports whether the OS supports creating symlinks.
+// On Windows without Developer Mode, os.Symlink fails with a privilege error.
+func symlinkAvailable(t *testing.T) bool {
+	t.Helper()
+	tmp := t.TempDir()
+	err := os.Symlink(".", filepath.Join(tmp, "testlink"))
+	return err == nil
+}
+
+func TestCreateFromDirectory(t *testing.T) {
+	require := require.New(t)
+	tempDir := t.TempDir()
+	hasSymlinks := symlinkAvailable(t)
+
+	files := map[string]string{
+		"file1.txt":        "Content of file1",
+		"subdir/file2.txt": "Content of file2",
+		"subdir/file3.txt": "Content of file3",
+		"a/b/c/d/deep.txt": "Content of deep",
+	}
+
+	for path, content := range files {
+		fullPath := filepath.Join(tempDir, path)
+		err := os.MkdirAll(filepath.Dir(fullPath), 0755)
+		require.NoError(err)
+		err = os.WriteFile(fullPath, []byte(content), 0600)
+		require.NoError(err)
+	}
+
+	// Create empty directory
+	err := os.Mkdir(filepath.Join(tempDir, "empty"), 0755)
+	require.NoError(err)
+
+	// Create symlinks when available -- both relative and absolute links.
+	if hasSymlinks {
+		err = os.Symlink(filepath.Join(".", "file1.txt"), filepath.Join(tempDir, "symlink_to_file1.txt"))
+		require.NoError(err)
+		//nolint:lll
+		err = os.Symlink(
+			filepath.Join(tempDir, "symlink_to_file1.txt"),
+			filepath.Join(tempDir, "symlink_to_symlink_to_file1.txt"),
+		)
+		require.NoError(err)
+		err = os.Symlink(filepath.Join(".", "subdir"), filepath.Join(tempDir, "symlink_to_subdir"))
+		require.NoError(err)
+		err = os.Symlink(
+			filepath.Join(tempDir, "symlink_to_subdir"),
+			filepath.Join(tempDir, "symlink_to_symlink_to_subdir"),
+		)
+		require.NoError(err)
+	}
+
+	// Create zip file
+	zipFile, err := os.CreateTemp("", "test_archive_*.zip")
+	require.NoError(err, "failed to create temp zip file")
+	defer os.Remove(zipFile.Name())
+	defer zipFile.Close()
+
+	// zip the directory
+	err = rzip.CreateFromDirectory(tempDir, zipFile, nil)
+	require.NoError(err)
+
+	// Check zip contents — expected files depend on symlink availability.
+	expectedFiles := map[string]string{
+		"file1.txt":        "Content of file1",
+		"a/b/c/d/deep.txt": "Content of deep",
+		"subdir/file2.txt": "Content of file2",
+		"subdir/file3.txt": "Content of file3",
+	}
+	if hasSymlinks {
+		expectedFiles["symlink_to_file1.txt"] = "Content of file1"
+		expectedFiles["symlink_to_symlink_to_file1.txt"] = "Content of file1"
+		expectedFiles["symlink_to_subdir/file2.txt"] = "Content of file2"
+		expectedFiles["symlink_to_subdir/file3.txt"] = "Content of file3"
+		expectedFiles["symlink_to_symlink_to_subdir/file2.txt"] = "Content of file2"
+		expectedFiles["symlink_to_symlink_to_subdir/file3.txt"] = "Content of file3"
+	}
+
+	checkFiles(t, expectedFiles, zipFile)
+
+	// Test with filter callback — skip specific files and directories.
+	onZip := func(src string, info os.FileInfo) (bool, error) {
+		name := info.Name()
+		isDir := info.IsDir()
+
+		// resolve symlink if needed
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Stat(src)
+			if err != nil {
+				return false, err
+			}
+			isDir = target.IsDir()
+		}
+
+		// exclude a file
+		if !isDir && name == "deep.txt" {
+			return false, nil
+		}
+
+		// exclude a directory
+		if isDir && name == "symlink_to_subdir" {
+			return false, nil
+		}
+
+		return true, nil
+	}
+
+	zipFile.Truncate(0)
+	zipFile.Seek(0, 0)
+	err = rzip.CreateFromDirectory(tempDir, zipFile, onZip)
+	require.NoError(err)
+
+	// Check zip contents with filter applied.
+	expectedFiles = map[string]string{
+		"file1.txt":        "Content of file1",
+		"subdir/file2.txt": "Content of file2",
+		"subdir/file3.txt": "Content of file3",
+	}
+	if hasSymlinks {
+		expectedFiles["symlink_to_file1.txt"] = "Content of file1"
+		expectedFiles["symlink_to_symlink_to_file1.txt"] = "Content of file1"
+		expectedFiles["symlink_to_symlink_to_subdir/file2.txt"] = "Content of file2"
+		expectedFiles["symlink_to_symlink_to_subdir/file3.txt"] = "Content of file3"
+	}
+
+	checkFiles(t, expectedFiles, zipFile)
+}
+
+func checkFiles(
+	t *testing.T,
+	expectedFiles map[string]string,
+	zipFile *os.File) {
+	_, err := zipFile.Seek(0, 0)
+	require.NoError(t, err, "failed to seek to start of zip file")
+	zipInfo, err := zipFile.Stat()
+	require.NoError(t, err, "failed to get zip file info")
+	zipReader, err := zip.NewReader(zipFile, zipInfo.Size())
+	require.NoError(t, err, "failed to open zip for reading")
+
+	for _, zipFile := range zipReader.File {
+		expectedContent, exists := expectedFiles[zipFile.Name]
+		if !exists {
+			t.Errorf("unexpected file in zip: %s", zipFile.Name)
+			continue
+		}
+
+		rc, err := zipFile.Open()
+		if err != nil {
+			panic(err)
+		}
+
+		content, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			panic(err)
+		}
+
+		if expectedContent != string(content) {
+			t.Errorf("incorrect content for %s", zipFile.Name)
+		}
+
+		delete(expectedFiles, zipFile.Name)
+	}
+
+	if len(expectedFiles) > 0 {
+		t.Errorf("missing files:\n%v", formatFiles(expectedFiles))
+	}
+}
+
+func TestCreateFromDirectory_SymlinkRecursive(t *testing.T) {
+	tmp := t.TempDir()
+
+	err := os.Mkdir(filepath.Join(tmp, "dir"), 0755)
+	require.NoError(t, err)
+
+	// When symlinks are available, verify that a recursive symlink (dir →
+	// parent) doesn't cause infinite recursion during zip creation.
+	// When symlinks aren't available (e.g. Windows without Developer Mode),
+	// still verify that a plain directory zips correctly.
+	if symlinkAvailable(t) {
+		err = os.Symlink("../", filepath.Join(tmp, "dir", "dir_symlink"))
+		require.NoError(t, err)
+	}
+
+	// Create zip file
+	zipFile, err := os.CreateTemp("", "test_archive_*.zip")
+	require.NoError(t, err, "failed to create temp zip file")
+	defer os.Remove(zipFile.Name())
+	defer zipFile.Close()
+
+	// zip the directory — must not hang or error regardless of symlink support
+	err = rzip.CreateFromDirectory(tmp, zipFile, nil)
+	require.NoError(t, err)
+}
+
+func formatFiles(files map[string]string) string {
+	var sb strings.Builder
+	keys := slices.Collect(maps.Keys(files))
+	slices.Sort(keys)
+	for _, path := range keys {
+		sb.WriteString(fmt.Sprintf("- %s\n", path))
+	}
+	return sb.String()
+}
+
+func TestExtractTarGzToDirectory(t *testing.T) {
+	require := require.New(t)
+	tempDir := t.TempDir()
+
+	// Create a simple tar.gz file for testing
+	tarGzPath := filepath.Join(tempDir, "test.tar.gz")
+	extractDir := filepath.Join(tempDir, "extracted")
+
+	// Create test content
+	testFiles := map[string]string{
+		"file1.txt":        "Content of file1",
+		"subdir/file2.txt": "Content of file2",
+	}
+
+	// Create tar.gz file
+	file, err := os.Create(tarGzPath)
+	require.NoError(err)
+	defer file.Close()
+
+	gzWriter := gzip.NewWriter(file)
+	defer gzWriter.Close()
+
+	tarWriter := tar.NewWriter(gzWriter)
+	defer tarWriter.Close()
+
+	for path, content := range testFiles {
+		// Add file to tar
+		header := &tar.Header{
+			Name:     path,
+			Mode:     0600,
+			Size:     int64(len(content)),
+			Typeflag: tar.TypeReg,
+		}
+
+		err = tarWriter.WriteHeader(header)
+		require.NoError(err)
+
+		_, err = tarWriter.Write([]byte(content))
+		require.NoError(err)
+	}
+
+	// Close writers to ensure data is written
+	tarWriter.Close()
+	gzWriter.Close()
+	file.Close()
+
+	// Extract the tar.gz file
+	err = rzip.ExtractTarGzToDirectory(tarGzPath, extractDir)
+	require.NoError(err)
+
+	// Verify extracted files
+	for path, expectedContent := range testFiles {
+		extractedPath := filepath.Join(extractDir, path)
+		content, err := os.ReadFile(extractedPath)
+		require.NoError(err)
+		require.Equal(expectedContent, string(content))
+	}
+}
+
+// TestCreateFromDirectory_ExecutableMatcher verifies that WithExecutableMatcher
+// marks only the matched entries as executable, while leaving other files untouched.
+// This is the cross-platform path Go function deploys rely on (on Windows the
+// filesystem does not track Unix execute bits).
+func TestCreateFromDirectory_ExecutableMatcher(t *testing.T) {
+	require := require.New(t)
+
+	srcDir := t.TempDir()
+
+	// Binary that must end up executable. Write without the execute bit so the
+	// matcher is solely responsible for setting it (mirrors the Windows case).
+	binaryPath := filepath.Join(srcDir, "app")
+	require.NoError(os.WriteFile(binaryPath, []byte("binary-content"), 0600))
+
+	// Regular file that must NOT be made executable.
+	configPath := filepath.Join(srcDir, "host.json")
+	require.NoError(os.WriteFile(configPath, []byte("{}"), 0600))
+
+	zipPath := filepath.Join(t.TempDir(), "test.zip")
+	zipFile, err := os.Create(zipPath)
+	require.NoError(err)
+
+	matcher := func(src string, info os.FileInfo) bool {
+		return !info.IsDir() && info.Name() == "app"
+	}
+	err = rzip.CreateFromDirectory(srcDir, zipFile, nil, rzip.WithExecutableMatcher(matcher))
+	require.NoError(err)
+	require.NoError(zipFile.Close())
+
+	reader, err := zip.OpenReader(zipPath)
+	require.NoError(err)
+	defer reader.Close()
+
+	modes := make(map[string]os.FileMode)
+	for _, f := range reader.File {
+		modes[f.Name] = f.Mode()
+	}
+
+	appMode, ok := modes["app"]
+	require.True(ok, "app should exist in zip")
+	require.NotZero(appMode&0111, "matched binary should have execute bits, got %o", appMode)
+
+	configMode, ok := modes["host.json"]
+	require.True(ok, "host.json should exist in zip")
+	require.Zero(configMode&0111, "unmatched file should not have execute bits, got %o", configMode)
+}
+
+func TestCreateFromDirectory_PreservesUnixPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits are not reliably preserved on Windows filesystems")
+	}
+	require := require.New(t)
+
+	srcDir := t.TempDir()
+
+	// Create a file with execute permission (like a compiled binary)
+	executablePath := filepath.Join(srcDir, "app")
+	err := os.WriteFile(executablePath, []byte("binary-content"), 0600) //#nosec G306
+	require.NoError(err)
+	require.NoError(os.Chmod(executablePath, 0755))
+
+	// Create a regular file without execute permission
+	regularPath := filepath.Join(srcDir, "config.json")
+	err = os.WriteFile(regularPath, []byte("{}"), 0600)
+	require.NoError(err)
+
+	// Create zip
+	zipPath := filepath.Join(t.TempDir(), "test.zip")
+	zipFile, err := os.Create(zipPath)
+	require.NoError(err)
+	err = rzip.CreateFromDirectory(srcDir, zipFile, nil)
+	require.NoError(err)
+	require.NoError(zipFile.Close())
+
+	// Read the zip and verify file modes
+	reader, err := zip.OpenReader(zipPath)
+	require.NoError(err)
+	defer reader.Close()
+
+	modes := make(map[string]os.FileMode)
+	for _, f := range reader.File {
+		modes[f.Name] = f.Mode()
+	}
+
+	// Verify executable has execute bit set
+	appMode, ok := modes["app"]
+	require.True(ok, "app should exist in zip")
+	require.NotZero(appMode&0111, "app should have execute permission bits set, got %o", appMode)
+
+	// Verify regular file does not have execute bit set
+	configMode, ok := modes["config.json"]
+	require.True(ok, "config.json should exist in zip")
+	require.Zero(configMode&0111, "config.json should not have execute permission bits, got %o", configMode)
+}

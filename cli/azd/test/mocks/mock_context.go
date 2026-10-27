@@ -1,43 +1,94 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
 package mocks
 
 import (
 	"context"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/azure/azure-dev/cli/azd/internal"
+	"github.com/azure/azure-dev/cli/azd/pkg/alpha"
+	"github.com/azure/azure-dev/cli/azd/pkg/config"
 	"github.com/azure/azure-dev/cli/azd/pkg/exec"
-	"github.com/azure/azure-dev/cli/azd/pkg/httputil"
 	"github.com/azure/azure-dev/cli/azd/pkg/input"
-	mockconsole "github.com/azure/azure-dev/cli/azd/test/mocks/console"
-	mockexec "github.com/azure/azure-dev/cli/azd/test/mocks/exec"
-	mockhttp "github.com/azure/azure-dev/cli/azd/test/mocks/httputil"
+	"github.com/azure/azure-dev/cli/azd/pkg/ioc"
+	"github.com/azure/azure-dev/cli/azd/test/mocks/mockconfig"
+	"github.com/azure/azure-dev/cli/azd/test/mocks/mockexec"
+	"github.com/azure/azure-dev/cli/azd/test/mocks/mockhttp"
+	"github.com/azure/azure-dev/cli/azd/test/mocks/mockinput"
+	"github.com/benbjohnson/clock"
 )
 
 type MockContext struct {
-	Context       *context.Context
-	Console       *mockconsole.MockConsole
-	HttpClient    *mockhttp.MockHttpClient
-	CommandRunner *mockexec.MockCommandRunner
+	Credentials                    *MockCredentials
+	Context                        *context.Context
+	Console                        *mockinput.MockConsole
+	HttpClient                     *mockhttp.MockHttpClient
+	CoreClientOptions              *azcore.ClientOptions
+	ArmClientOptions               *arm.ClientOptions
+	CommandRunner                  *mockexec.MockCommandRunner
+	ConfigManager                  *mockconfig.MockConfigManager
+	Container                      *ioc.NestedContainer
+	AlphaFeaturesManager           *alpha.FeatureManager
+	SubscriptionCredentialProvider *MockSubscriptionCredentialProvider
+	MultiTenantCredentialProvider  *MockMultiTenantCredentialProvider
+	Config                         config.Config
+	Clock                          *clock.Mock
 }
 
 func NewMockContext(ctx context.Context) *MockContext {
-	mockConsole := mockconsole.NewMockConsole()
-	commandRunner := mockexec.NewMockCommandRunner()
-	http := mockhttp.NewMockHttpUtil()
+	httpClient := mockhttp.NewMockHttpUtil()
+	configManager := mockconfig.NewMockConfigManager()
+	config := config.NewEmptyConfig()
 
-	mockexec.AddAzLoginMocks(commandRunner)
-	commandRunner.AddDefaultMocks()
-
-	ctx = internal.WithCommandOptions(ctx, internal.GlobalCommandOptions{})
-	ctx = input.WithConsole(ctx, mockConsole)
-	ctx = exec.WithCommandRunner(ctx, commandRunner)
-	ctx = httputil.WithHttpClient(ctx, http)
+	clientOptions := azcore.ClientOptions{
+		Transport:       httpClient,
+		PerCallPolicies: []policy.Policy{NewMockUserAgentPolicy(internal.UserAgent())},
+	}
+	armOptions := arm.ClientOptions{ClientOptions: clientOptions}
 
 	mockContext := &MockContext{
-		Context:       &ctx,
-		Console:       mockConsole,
-		CommandRunner: commandRunner,
-		HttpClient:    http,
+		Credentials:                    &MockCredentials{},
+		Context:                        &ctx,
+		Console:                        mockinput.NewMockConsole(),
+		CommandRunner:                  mockexec.NewMockCommandRunner(),
+		HttpClient:                     httpClient,
+		CoreClientOptions:              &clientOptions,
+		ArmClientOptions:               &armOptions,
+		ConfigManager:                  configManager,
+		SubscriptionCredentialProvider: &MockSubscriptionCredentialProvider{},
+		MultiTenantCredentialProvider:  &MockMultiTenantCredentialProvider{},
+		Container:                      ioc.NewNestedContainer(nil),
+		Config:                         config,
+		AlphaFeaturesManager:           alpha.NewFeaturesManagerWithConfig(config),
+		Clock:                          clock.NewMock(),
 	}
 
+	registerCommonMocks(mockContext)
+
 	return mockContext
+}
+
+func registerCommonMocks(mockContext *MockContext) {
+	mockContext.Container.MustRegisterSingleton(func() ioc.ServiceLocator {
+		return mockContext.Container
+	})
+	mockContext.Container.MustRegisterSingleton(func() policy.Transporter {
+		return mockContext.HttpClient
+	})
+	mockContext.Container.MustRegisterSingleton(func() exec.CommandRunner {
+		return mockContext.CommandRunner
+	})
+	mockContext.Container.MustRegisterSingleton(func() input.Console {
+		return mockContext.Console
+	})
+	mockContext.Container.MustRegisterSingleton(func() config.FileConfigManager {
+		return mockContext.ConfigManager
+	})
+	mockContext.Container.MustRegisterSingleton(func() *alpha.FeatureManager {
+		return mockContext.AlphaFeaturesManager
+	})
 }

@@ -1,0 +1,130 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package agentkind
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"azureaiagent/internal/exterrors"
+
+	"github.com/azure/azure-dev/cli/azd/pkg/azdext"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/structpb"
+)
+
+func mustStruct(t *testing.T, m map[string]any) *structpb.Struct {
+	t.Helper()
+	s, err := structpb.NewStruct(m)
+	require.NoError(t, err)
+	return s
+}
+
+func TestKind_InlineOnEntry(t *testing.T) {
+	t.Parallel()
+	svc := &azdext.ServiceConfig{
+		Name:                 "voice",
+		AdditionalProperties: mustStruct(t, map[string]any{"kind": "prompt-voice"}),
+	}
+	isVoice, err := IsPromptVoice(svc, t.TempDir())
+	require.NoError(t, err)
+	assert.True(t, isVoice)
+}
+
+func TestKind_RejectsNestedConfig(t *testing.T) {
+	svc := &azdext.ServiceConfig{
+		Name:   "voice",
+		Host:   "azure.ai.agent",
+		Config: mustStruct(t, map[string]any{"kind": "prompt-voice"}),
+	}
+	_, err := IsPromptVoice(svc, t.TempDir())
+	localErr, ok := errors.AsType[*azdext.LocalError](err)
+	require.True(t, ok)
+	assert.Equal(t, exterrors.CodeDeprecatedAgentServiceConfig, localErr.Code)
+}
+
+func TestKind_DoesNotProbeServiceDirectory(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	svcDir := filepath.Join(root, "svc")
+	require.NoError(t, os.MkdirAll(svcDir, 0o750))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(svcDir, "agent.yaml"),
+		[]byte("kind: prompt-voice\nname: concierge\n"), 0o600))
+
+	svc := &azdext.ServiceConfig{Name: "voice", RelativePath: "svc"}
+	isVoice, err := IsPromptVoice(svc, root)
+	require.NoError(t, err)
+	assert.False(t, isVoice)
+}
+
+func TestKind_RejectsAgentDefinitionPath(t *testing.T) {
+	root := t.TempDir()
+	override := filepath.Join(root, "custom-def.yaml")
+	require.NoError(t, os.WriteFile(override, []byte("kind: prompt-voice\n"), 0o600))
+	t.Setenv("AGENT_DEFINITION_PATH", override)
+
+	svc := &azdext.ServiceConfig{
+		Name:                 "voice",
+		Host:                 "azure.ai.agent",
+		AdditionalProperties: mustStruct(t, map[string]any{"kind": "hosted"}),
+	}
+	_, err := IsPromptVoice(svc, root)
+	localErr, ok := errors.AsType[*azdext.LocalError](err)
+	require.True(t, ok)
+	assert.Equal(t, exterrors.CodeUnsupportedAgentDefinitionPath, localErr.Code)
+	assert.Equal(t,
+		"unset AGENT_DEFINITION_PATH, then move the agent definition to the azure.ai.agent service in azure.yaml, "+
+			"or add an explicit root $ref on the service entry to a direct agent definition",
+		localErr.Suggestion,
+	)
+}
+
+func TestKind_ExplicitRootRef(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "agent.yaml"),
+		[]byte("kind: prompt-voice\nname: concierge\n"), 0o600))
+	svc := &azdext.ServiceConfig{
+		Name:                 "voice",
+		AdditionalProperties: mustStruct(t, map[string]any{"$ref": "agent.yaml"}),
+	}
+	isVoice, err := IsPromptVoice(svc, root)
+	require.NoError(t, err)
+	assert.True(t, isVoice)
+}
+
+func TestKind_HostedIsNotVoice(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	svcDir := filepath.Join(root, "svc")
+	require.NoError(t, os.MkdirAll(svcDir, 0o750))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(svcDir, "agent.yaml"),
+		[]byte("kind: hosted\nname: worker\n"), 0o600))
+
+	svc := &azdext.ServiceConfig{
+		Name:                 "worker",
+		RelativePath:         "svc",
+		AdditionalProperties: mustStruct(t, map[string]any{"kind": "hosted"}),
+	}
+	isVoice, err := IsPromptVoice(svc, root)
+	require.NoError(t, err)
+	assert.False(t, isVoice)
+	isHosted, err := IsHosted(svc, root)
+	require.NoError(t, err)
+	assert.True(t, isHosted)
+}
+
+func TestKind_AbsentReturnsEmpty(t *testing.T) {
+	t.Parallel()
+	svc := &azdext.ServiceConfig{Name: "worker", RelativePath: "svc"}
+	kind, err := Kind(svc, t.TempDir())
+	require.NoError(t, err)
+	assert.Empty(t, kind)
+}
